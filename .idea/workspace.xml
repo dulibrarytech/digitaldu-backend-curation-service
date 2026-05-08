@@ -4,7 +4,10 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="db87c24d-d355-486e-bb42-4ea066bbc041" name="Changes" comment="" />
+    <list default="true" id="db87c24d-d355-486e-bb42-4ea066bbc041" name="Changes" comment="">
+      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/deploy/curation-api.service" beforeDir="false" afterPath="$PROJECT_DIR$/deploy/curation-api.service" afterDir="false" />
+    </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
     <option name="HIGHLIGHT_NON_ACTIVE_CHANGELIST" value="false" />
@@ -86,11 +89,14 @@
       <option name="number" value="Default" />
       <option name="presentableId" value="Default" />
       <updated>1778199684280</updated>
-      <workItem from="1778199685288" duration="7595000" />
+      <workItem from="1778199685288" duration="9422000" />
     </task>
     <servers />
   </component>
   <component name="TypeScriptGeneratedFilesManager">
     <option name="version" value="3" />
+  </component>
+  <component name="UnknownFeatures">
+    <option featureType="com.intellij.fileTypeFactory" implementationName="*.service" />
   </component>
 </project>

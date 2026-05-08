@@ -20,9 +20,9 @@ After=network.target
 Type=simple
 User=curation
 Group=curation
-WorkingDirectory=/opt/curation-api
+WorkingDirectory=/library/lib-sftp/digitaldu-backend-curation-service
 EnvironmentFile=/etc/curation-api/env
-ExecStart=/opt/curation-api/.venv/bin/gunicorn \
+ExecStart=/library/lib-sftp/digitaldu-backend-curation-service/.venv/bin/gunicorn \
   --bind 127.0.0.1:8185 \
   --workers 4 \
   --timeout 3700 \
