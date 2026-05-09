@@ -14,6 +14,10 @@
 
 """
 Archivematica staging operations.
+
+Renamed from `digitaldu-backend-qa/qa_lib.py`. SFTP backend changed from the
+abandoned pysftp library to paramiko (well-maintained). Logging changed from
+logger.info() to a module logger.
 """
 
 import logging
@@ -46,7 +50,7 @@ gid = config.GID
 errors_file = config.ERRORS_FILE
 
 
-# --- paramiko helpers --
+# --- paramiko helpers (replacing pysftp's put_r / walktree / cd / execute) --
 
 def _open_sftp():
     """Open a paramiko SSH+SFTP session. Caller must close both."""
@@ -96,7 +100,7 @@ def _sftp_put_r(sftp, local_dir, remote_dir, preserve_mtime=True):
 
 
 def _sftp_walk(sftp, remote_dir, on_file=None, on_dir=None, on_other=None):
-    """Recursive walk over a remote directory."""
+    """Recursive walk over a remote directory (replaces pysftp.walktree)."""
     for entry in sftp.listdir_attr(remote_dir):
         full_path = posixpath.join(remote_dir, entry.filename)
         if stat.S_ISDIR(entry.st_mode):
@@ -112,7 +116,7 @@ def _sftp_walk(sftp, remote_dir, on_file=None, on_dir=None, on_other=None):
 
 
 def _ssh_exec(client, command):
-    """Run a shell command over SSH and return decoded stdout."""
+    """Run a shell command over SSH and return decoded stdout (replaces pysftp.execute)."""
     stdin, stdout, stderr = client.exec_command(command)
     return stdout.read().decode('utf-8', errors='replace')
 
@@ -511,6 +515,70 @@ def move_to_ingest(uuid, folder, package):
         result = 'packages_not_moved_to_ingested_folder.'
 
     return dict(result=result, errors=errors)
+
+
+def move_from_ingest_to_ready(uuid, folder, package):
+    '''
+    Inverse of move_to_ingest. Moves a single package from
+    002-ingest/<uuid>/<package> back to 001-ready/<folder>/<package>.
+    Used by the ingest service's pre-ingest rollback endpoint when
+    staff rolls a package back before any Archivematica activity.
+
+    Behavior:
+      * If the package directory exists in 002-ingest, it is moved back.
+      * If the destination batch folder in 001-ready does not exist, it
+        is created.
+      * If the 002-ingest/<uuid>/ directory becomes empty after the move,
+        it is removed (matches move_to_ingest's per-uuid pattern).
+      * Idempotent: if the package is already in 001-ready (already
+        rolled back) and not in 002-ingest, this returns success.
+
+    @param: uuid
+    @param: folder
+    @param: package
+    @returns: Dictionary
+    '''
+
+    errors = []
+    src_dir = ingest_path + uuid
+    src_pkg = src_dir + '/' + package
+    dst_batch = ready_path + folder
+    dst_pkg = dst_batch + '/' + package
+
+    # Idempotency: nothing to do if the package is already back in ready.
+    if not os.path.exists(src_pkg):
+        if os.path.exists(dst_pkg):
+            logger.info('move_from_ingest_to_ready: %s already in 001-ready', package)
+            return dict(result='already_in_ready', errors=[])
+        errors.append('ERROR: Source package not found in 002-ingest (move_from_ingest_to_ready)')
+        return dict(result='source_not_found', errors=errors)
+
+    # Ensure the destination batch folder exists in 001-ready.
+    if not os.path.exists(dst_batch):
+        try:
+            os.mkdir(dst_batch, 0o777)
+        except Exception as e:
+            logger.info(e)
+            errors.append('ERROR: Unable to create destination batch folder (move_from_ingest_to_ready)')
+            return dict(result='destination_create_failed', errors=errors)
+
+    # Move the package back.
+    try:
+        shutil.move(src_pkg, dst_batch + '/')
+    except Exception as e:
+        logger.info(e)
+        errors.append('ERROR: Unable to move folder (move_from_ingest_to_ready)')
+        return dict(result='move_failed', errors=errors)
+
+    # Clean up the now-empty 002-ingest/<uuid>/ directory if applicable.
+    try:
+        if os.path.exists(src_dir) and not os.listdir(src_dir):
+            os.rmdir(src_dir)
+    except Exception as e:
+        # Non-fatal; the package is back, just log and move on.
+        logger.info('move_from_ingest_to_ready: cleanup failed (non-fatal): %s', e)
+
+    return dict(result='packages_moved_back_to_ready.', errors=[])
 
 
 def move_to_sftp(pid):

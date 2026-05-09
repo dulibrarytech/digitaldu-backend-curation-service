@@ -13,7 +13,11 @@
 # limitations under the License.
 
 """
-Archivematica staging routes
+Archivematica staging routes (legacy: digitaldu-backend-qa).
+
+URL prefix preserved as /api/v2/qa/ so the ingest service does not need code
+changes during cutover. Response shapes preserved verbatim from the legacy
+service — Stage 4 will normalize them to {result, errors}.
 """
 
 import json
@@ -139,6 +143,27 @@ def move_to_ingest():
     if folder is None:
         return json.dumps(['Bad Request: Missing folder param.']), 400
     results = ops.move_to_ingest(uuid, folder, package)
+    return json.dumps(results), 200
+
+
+@qa_bp.route('/move-from-ingest-to-ready', methods=['GET'])
+@require_api_key_qa
+def move_from_ingest_to_ready():
+    """
+    Rollback inverse of /move-to-ingest. Used by the ingest service's
+    pre-ingest rollback endpoint to return a package from 002-ingest
+    to 001-ready before any Archivematica activity has occurred.
+    """
+    uuid = request.args.get('uuid')
+    folder = request.args.get('folder')
+    package = request.args.get('package')
+    if uuid is None:
+        return json.dumps(['Bad Request: Missing uuid param.']), 400
+    if folder is None:
+        return json.dumps(['Bad Request: Missing folder param.']), 400
+    if package is None:
+        return json.dumps(['Bad Request: Missing package param.']), 400
+    results = ops.move_from_ingest_to_ready(uuid, folder, package)
     return json.dumps(results), 200
 
 
