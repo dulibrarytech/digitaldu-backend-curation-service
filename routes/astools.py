@@ -13,7 +13,12 @@
 # limitations under the License.
 
 """
-ArchivesSpace metadata routes
+ArchivesSpace metadata routes (legacy: astools-web_v2).
+
+URL prefix preserved as /api/v1/astools/ so the ingest service does not need
+code changes during cutover. Helpers (`_validate_*`, `_build_cli_arguments`,
+`_write_serialized_files`) stay co-located with the make_digital_objects
+endpoint that owns them.
 """
 
 import json
@@ -1015,3 +1020,130 @@ def make_digital_objects():
                 logger.debug(f'Cleaned up temporary directory: {temp_dir}')
             except Exception as e:
                 logger.warning(f'Failed to clean up temporary directory: {str(e)}')
+
+
+@astools_bp.route('/api/v1/astools/revert-to-make-digital-objects', methods=['POST'])
+@require_api_key_astools
+def revert_to_make_digital_objects():
+    """
+    Reverts a batch folder back to the "Make Digital Objects" state by
+    removing the uri.txt file from each package directory.
+
+    Used by the dashboard's ASpace QA and Packaging and Ingesting views
+    when staff need to rebuild a package after MDO has already run.
+    Idempotent — packages without uri.txt are reported as not_present
+    rather than treated as errors.
+
+    Only removes uri.txt. The original source files (TIFFs etc.) are
+    untouched, so re-running Make Digital Objects on the same folder
+    will regenerate uri.txt against the same packages.
+
+    @body data: {folder: "<batch_folder_name>"}
+    @return: JSON {result: {folder, removed: [...], not_present: [...], failed: [{package, error}]}, errors: []}
+    """
+    try:
+        logger.info('POST /api/v1/astools/revert-to-make-digital-objects - Processing request')
+
+        workspace = os.getenv('WORKSPACE')
+        if not workspace:
+            logger.error('WORKSPACE environment variable not configured')
+            return jsonify({
+                'result': None,
+                'errors': ['Server configuration error']
+            }), 500
+
+        try:
+            data = request.get_json(force=False, silent=False)
+        except Exception as e:
+            logger.warning(f'Invalid JSON in request: {str(e)}')
+            return jsonify({
+                'result': None,
+                'errors': ['Invalid JSON in request body']
+            }), 400
+
+        if not isinstance(data, dict):
+            return jsonify({
+                'result': None,
+                'errors': ['Request body must be a JSON object']
+            }), 400
+
+        folder = (data.get('folder') or '').strip()
+        if not folder:
+            return jsonify({
+                'result': None,
+                'errors': ['Bad request: Missing folder parameter']
+            }), 400
+
+        batch_path, path_error = _validate_and_resolve_path(folder, workspace)
+        if path_error:
+            logger.warning(f'Invalid folder path: {path_error}')
+            return jsonify({
+                'result': None,
+                'errors': [path_error]
+            }), 403
+
+        if not batch_path.exists():
+            logger.warning(f'Batch folder not found: {folder}')
+            return jsonify({
+                'result': None,
+                'errors': [f'Batch folder not found: {folder}']
+            }), 404
+
+        if not batch_path.is_dir():
+            return jsonify({
+                'result': None,
+                'errors': [f'Path is not a directory: {folder}']
+            }), 400
+
+        removed = []
+        not_present = []
+        failed = []
+
+        for package_dir in sorted(batch_path.iterdir(), key=lambda p: p.name):
+            if not package_dir.is_dir() or package_dir.name.startswith('.'):
+                continue
+            uri_txt = package_dir / 'uri.txt'
+            try:
+                if uri_txt.exists():
+                    uri_txt.unlink()
+                    removed.append(package_dir.name)
+                else:
+                    not_present.append(package_dir.name)
+            except (OSError, PermissionError) as e:
+                logger.error(f'Failed to remove {uri_txt}: {str(e)}')
+                failed.append({'package': package_dir.name, 'error': str(e)})
+
+        logger.info(
+            f'Revert complete for {folder}: removed={len(removed)} '
+            f'not_present={len(not_present)} failed={len(failed)}'
+        )
+
+        # 207 (Multi-Status) when some succeeded and some failed; 200 otherwise.
+        # The Node side keys off the body's `failed` list rather than HTTP status.
+        status_code = 207 if failed and (removed or not_present) else 200
+        if failed and not removed and not not_present:
+            status_code = 500
+
+        return jsonify({
+            'result': {
+                'folder': folder,
+                'removed': removed,
+                'not_present': not_present,
+                'failed': failed
+            },
+            'errors': [f'{len(failed)} package(s) failed'] if failed else []
+        }), status_code
+
+    except PermissionError as e:
+        logger.error(f'Permission error: {str(e)}')
+        return jsonify({
+            'result': None,
+            'errors': ['Permission denied accessing folder']
+        }), 500
+
+    except Exception as e:
+        logger.error(f'Unexpected error in revert_to_make_digital_objects: {str(e)}', exc_info=True)
+        return jsonify({
+            'result': None,
+            'errors': ['Internal server error']
+        }), 500
