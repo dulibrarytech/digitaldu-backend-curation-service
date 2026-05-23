@@ -1008,20 +1008,56 @@ def move_to_s3(source, folder):
 
 def clean_up_sftp(pid, archival_package):
     """
-    Deletes collection folder from ingest folder and sftp server.
-    :param pid
-    :param archival_package
-    :return void
+    Remove a package's files AND its parent directories from the
+    Archivematica SFTP staging area.
+
+    Layout cleaned up:
+        <sftp_path>/<pid>/<archival_package>/<files>   ← files removed
+        <sftp_path>/<pid>/<archival_package>/          ← directory removed
+        <sftp_path>/<pid>/                              ← removed IF empty
+                                                        (rmdir silently
+                                                         no-ops if other
+                                                         sibling packages
+                                                         still live here,
+                                                         e.g. concurrent
+                                                         batch ingest)
+
+    2026-05-23 patch: previously only the FILES inside the package
+    directory were deleted (legacy `cd <target> && rm <pkg>/*`),
+    leaving empty `<pid>/<package>/` and `<pid>/` directories behind.
+    Staff saw orphaned "0" / "q-N" folders on the AM SFTP host after
+    every cancel + return-to-packaging cycle. The new chained command
+    removes the package tree entirely and best-effort prunes the
+    `<pid>` parent.
+
+    :param pid              curation-API per-ingest identifier (the
+                            qa_uuid the worker passes to move_to_sftp
+                            earlier; appears as the top-level directory
+                            under sftp_path)
+    :param archival_package package directory inside <pid>
     """
 
     logger.info('clean_up_sftp pid=%s archival_package=%s', pid, archival_package)
 
     client, sftp = _open_sftp()
     try:
-        # paramiko.exec_command runs each call in its own shell, so the
-        # legacy 3-call sequence (cd path; cd pid; rm pkg/*) needs to be one chained command.
+        # paramiko exec_command runs each call in its own shell, so we
+        # chain everything into one command. Using absolute paths
+        # throughout — we don't `cd` into <target> because then we
+        # can't rmdir it (a process's cwd can't be removed on most
+        # POSIX systems).
+        #
+        # rm -rf removes the package directory + all its contents.
+        # rmdir on <target> succeeds only if no sibling packages
+        # remain — otherwise it errors and we swallow it with the
+        # trailing `; true` so the overall exit code is 0.
         target = sftp_path + '/' + pid
-        _ssh_exec(client, 'cd ' + target + ' && rm ' + archival_package + '/*')
+        cmd = (
+            'rm -rf ' + target + '/' + archival_package
+            + '; rmdir ' + target + ' 2>/dev/null'
+            + '; true'
+        )
+        _ssh_exec(client, cmd)
     finally:
         sftp.close()
         client.close()
