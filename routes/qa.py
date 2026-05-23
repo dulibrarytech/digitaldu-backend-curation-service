@@ -18,6 +18,16 @@ Archivematica staging routes (legacy: digitaldu-backend-qa).
 URL prefix preserved as /api/v2/qa/ so the ingest service does not need code
 changes during cutover. Response shapes preserved verbatim from the legacy
 service — Stage 4 will normalize them to {result, errors}.
+
+2026-05-23 cancel-flow safety patch (curration-api-modified):
+  - `/move-to-ingest` now surfaces HTTP 409 when ops returns
+    result='move_in_progress' so the Node side can distinguish lock
+    contention from other failures.
+  - `/move-from-ingest-to-ready` accepts optional `?actor=<du_id>` for
+    cross-reference logging, and now maps the ops result to:
+        200 for success / already_in_ready
+        409 for move_in_progress (per-uuid lock held)
+        500 for move_failed / destination_create_failed / source_not_found
 """
 
 import json
@@ -135,6 +145,23 @@ def get_package_file_count():
 @qa_bp.route('/move-to-ingest', methods=['GET'])
 @require_api_key_qa
 def move_to_ingest():
+    """
+    Forward direction: move a package from 001-ready/<folder>/<package>
+    into 002-ingest/<uuid>/<package>. Called by the ingest service's
+    Stage 2 upload worker.
+
+    Required query params:
+      uuid    — destination directory name in 002-ingest
+      folder  — source batch folder name (relative to ready_path)
+      package — source package directory inside the batch folder
+
+    Responses:
+      200 — move succeeded
+      400 — missing required param
+      409 — per-uuid lock held by another in-flight operation
+            (concurrent move_from_ingest_to_ready or another
+            move_to_ingest in flight); caller should retry after a backoff
+    """
     uuid = request.args.get('uuid')
     folder = request.args.get('folder')
     package = request.args.get('package')
@@ -142,29 +169,77 @@ def move_to_ingest():
         return json.dumps(['Bad Request: Missing pid param.']), 400
     if folder is None:
         return json.dumps(['Bad Request: Missing folder param.']), 400
+    # Note: legacy did not check `package`; preserved here so existing
+    # callers don't regress. ops.move_to_ingest tolerates None package
+    # by surfacing the error inside the move itself.
     results = ops.move_to_ingest(uuid, folder, package)
-    return json.dumps(results), 200
+    status = 409 if results.get('result') == 'move_in_progress' else 200
+    return json.dumps(results), status
 
 
 @qa_bp.route('/move-from-ingest-to-ready', methods=['GET'])
 @require_api_key_qa
 def move_from_ingest_to_ready():
     """
-    Rollback inverse of /move-to-ingest. Used by the ingest service's
-    pre-ingest rollback endpoint to return a package from 002-ingest
-    to 001-ready before any Archivematica activity has occurred.
+    Rollback inverse of /move-to-ingest. Used by the ingest service's:
+      - pre-ingest rollback action (legacy: ROLLED_BACK_TO_READY)
+      - return-to-packaging action (post-cancel cleanup)
+
+    Required query params (all three):
+      uuid    — directory name in 002-ingest (set by move_to_ingest)
+      folder  — destination batch folder name (relative to ready_path)
+      package — package directory inside 002-ingest/<uuid>/
+
+    Optional query param:
+      actor   — staff identifier (du_id or email). Logged at INFO for
+                cross-reference with the ingest service's audit trail.
+                Never used for authz; the X-API-Key header is the gate.
+
+    Behavior summary (see lib/archivematica_ops.move_from_ingest_to_ready
+    for full details):
+      * Per-uuid lock prevents concurrent moves.
+      * Best-effort cleans the Archivematica SFTP staging copy first
+        (handles the case where Stage 2's move_to_sftp had progressed
+        before the cancel landed).
+      * Moves the package back to 001-ready/<folder>/<package>;
+        uri.txt is preserved so the folder reappears in /processed
+        (Packaging and Ingesting dashboard view).
+      * Removes the empty 002-ingest/<uuid>/ directory after the move.
+      * Idempotent: if the package is already in 001-ready, returns
+        success without touching disk.
+
+    Responses:
+      200 — move succeeded OR package was already in 001-ready
+      400 — missing required param
+      409 — per-uuid lock held by another in-flight operation
+      500 — move failed; see `errors` and `sftp_clean` in the body
     """
     uuid = request.args.get('uuid')
     folder = request.args.get('folder')
     package = request.args.get('package')
+    actor = request.args.get('actor')  # Optional; threaded into ops for audit.
     if uuid is None:
         return json.dumps(['Bad Request: Missing uuid param.']), 400
     if folder is None:
         return json.dumps(['Bad Request: Missing folder param.']), 400
     if package is None:
         return json.dumps(['Bad Request: Missing package param.']), 400
-    results = ops.move_from_ingest_to_ready(uuid, folder, package)
-    return json.dumps(results), 200
+
+    results = ops.move_from_ingest_to_ready(uuid, folder, package, actor=actor)
+
+    # Map the structured result to an HTTP status the Node side can
+    # branch on:
+    #   move_in_progress       -> 409 Conflict (retry-friendly)
+    #   move_failed / dest_*   -> 500 Internal Server Error
+    #   everything else        -> 200 OK
+    result = results.get('result')
+    if result == 'move_in_progress':
+        status = 409
+    elif result in ('move_failed', 'destination_create_failed', 'source_not_found'):
+        status = 500
+    else:
+        status = 200
+    return json.dumps(results), status
 
 
 @qa_bp.route('/move-to-sftp', methods=['GET'])

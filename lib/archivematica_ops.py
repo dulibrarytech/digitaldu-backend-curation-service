@@ -18,6 +18,21 @@ Archivematica staging operations.
 Renamed from `digitaldu-backend-qa/qa_lib.py`. SFTP backend changed from the
 abandoned pysftp library to paramiko (well-maintained). Logging changed from
 logger.info() to a module logger.
+
+2026-05-23 cancel-flow safety patch (curration-api-modified):
+  - Per-uuid lock file added (`_lock_uuid` / `_unlock_uuid` / `_is_locked`)
+    so concurrent move operations on the same uuid can't corrupt state.
+  - `move_to_ingest` and `move_from_ingest_to_ready` now take/release the
+    lock around their disk work. Lock contention returns
+    result='move_in_progress' with no disk side effects.
+  - `move_from_ingest_to_ready` now best-effort calls clean_up_sftp BEFORE
+    the local move (closes the orphaned-SFTP-copy gap for post-cancel
+    rollback when Stage 2's move_to_sftp had already run). SFTP failure
+    is non-fatal — outcome recorded in `sftp_clean` field of the return.
+  - `move_from_ingest_to_ready` now accepts an optional `actor` kwarg
+    (the authenticated staff identifier, threaded in from the route)
+    and logs it at INFO for cross-reference with the ingest service's
+    tbl_ingest_events audit trail.
 """
 
 import logging
@@ -119,6 +134,102 @@ def _ssh_exec(client, command):
     """Run a shell command over SSH and return decoded stdout (replaces pysftp.execute)."""
     stdin, stdout, stderr = client.exec_command(command)
     return stdout.read().decode('utf-8', errors='replace')
+
+
+# --- per-uuid lockfile (added 2026-05-23 for cancel-flow safety) -----------
+
+# Module-level threading lock guarding access to the disk-side lockfile
+# create/remove below. The lockfile itself is the durable cross-process
+# guard; this threading.Lock is just defensive against an in-process race
+# between the stat() and the open() inside _lock_uuid.
+_lock_table_lock = threading.Lock()
+
+
+def _lockfile_path(uuid):
+    """Where the per-uuid .lock file lives on disk.
+
+    Lives inside 002-ingest/<uuid>/.lock so it travels with the directory:
+    if the directory is removed (e.g. last package moved out by
+    move_from_ingest_to_ready's cleanup step), the lock evaporates with it.
+    """
+    return os.path.join(ingest_path + uuid, '.lock')
+
+
+def _lock_uuid(uuid, owner):
+    """Acquire the per-uuid lock.
+
+    Returns True if the lock was acquired (caller MUST release in finally).
+    Returns False if another operation already holds it — caller should
+    surface 'move_in_progress' to the client.
+
+    The lockfile contains the owner name (e.g. 'move_to_ingest') so logs
+    can tell you what stole the lock if a release was missed.
+    """
+    with _lock_table_lock:
+        # The 002-ingest/<uuid>/ directory may not exist yet (move_to_ingest
+        # creates it). Create it before the lockfile.
+        try:
+            os.makedirs(ingest_path + uuid, mode=0o777, exist_ok=True)
+        except OSError as e:
+            logger.warning('_lock_uuid: makedirs failed uuid=%s err=%s', uuid, e)
+            return False
+
+        path = _lockfile_path(uuid)
+        if os.path.exists(path):
+            try:
+                with open(path, 'r') as f:
+                    held_by = f.read().strip() or '<unknown>'
+            except OSError:
+                held_by = '<unreadable>'
+            logger.info(
+                '_lock_uuid: BUSY uuid=%s requested_by=%s held_by=%s',
+                uuid, owner, held_by,
+            )
+            return False
+
+        try:
+            # O_CREAT | O_EXCL — atomic create-if-absent.
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+            try:
+                os.write(fd, owner.encode('utf-8'))
+            finally:
+                os.close(fd)
+            logger.info('_lock_uuid: ACQUIRED uuid=%s owner=%s', uuid, owner)
+            return True
+        except FileExistsError:
+            # Race between the exists() check above and the open() — another
+            # caller won. Treat as busy.
+            logger.info(
+                '_lock_uuid: race-lost uuid=%s owner=%s', uuid, owner,
+            )
+            return False
+
+
+def _unlock_uuid(uuid, owner):
+    """Release the per-uuid lock. Best-effort, never throws.
+
+    Always called in a `finally` so a partial move doesn't leave a stale
+    lock that blocks future operations forever. If the lockfile is missing
+    (already removed by a cleanup step), that's not an error.
+    """
+    path = _lockfile_path(uuid)
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+            logger.info('_unlock_uuid: RELEASED uuid=%s owner=%s', uuid, owner)
+    except OSError as e:
+        # Most common cause: the 002-ingest/<uuid>/ dir was already cleaned
+        # up by the move's cleanup branch. Harmless.
+        logger.info(
+            '_unlock_uuid: cleanup-only uuid=%s owner=%s err=%s',
+            uuid, owner, e,
+        )
+
+
+def _is_locked(uuid):
+    """Caller-friendly check (read-only). Used by tests and diagnostics."""
+    return os.path.exists(_lockfile_path(uuid))
+
 
 # ---------------------------------------------------------------------------
 
@@ -486,52 +597,11 @@ def get_package_file_count(collection_folder, package):
 
 def move_to_ingest(uuid, folder, package):
     '''
-    Moves folder from ready to ingest folder and renames it using pid
-    @param: pid
-    @param: folder
-    @returns: Dictionary
-    '''
+    Moves folder from ready to ingest folder and renames it using pid.
 
-    errors = []
-    mode = 0o777
-
-    # create collection uuid folder in 002-ingest folder
-    try:
-        os.mkdir(ingest_path + uuid, mode)
-    except Exception as e:
-        logger.info(e)
-        errors.append('ERROR: Unable to create folder (move_to_ingest)')
-
-    # move package to new uuid folder in 002-ingest
-    try:
-        shutil.move(ready_path + folder + '/' + package, ingest_path + uuid)
-    except Exception as e:
-        logger.info(e)
-        errors.append('ERROR: Unable to move folder (move_to_ingest)')
-
-    if len(errors) == 0:
-        result = 'packages_moved_to_ingested_folder.'
-    else:
-        result = 'packages_not_moved_to_ingested_folder.'
-
-    return dict(result=result, errors=errors)
-
-
-def move_from_ingest_to_ready(uuid, folder, package):
-    '''
-    Inverse of move_to_ingest. Moves a single package from
-    002-ingest/<uuid>/<package> back to 001-ready/<folder>/<package>.
-    Used by the ingest service's pre-ingest rollback endpoint when
-    staff rolls a package back before any Archivematica activity.
-
-    Behavior:
-      * If the package directory exists in 002-ingest, it is moved back.
-      * If the destination batch folder in 001-ready does not exist, it
-        is created.
-      * If the 002-ingest/<uuid>/ directory becomes empty after the move,
-        it is removed (matches move_to_ingest's per-uuid pattern).
-      * Idempotent: if the package is already in 001-ready (already
-        rolled back) and not in 002-ingest, this returns success.
+    Protected by the per-uuid lock (added 2026-05-23) — if another op
+    (e.g. an in-flight move_from_ingest_to_ready cancel rollback)
+    holds the lock, returns `move_in_progress` without touching disk.
 
     @param: uuid
     @param: folder
@@ -540,45 +610,214 @@ def move_from_ingest_to_ready(uuid, folder, package):
     '''
 
     errors = []
-    src_dir = ingest_path + uuid
-    src_pkg = src_dir + '/' + package
-    dst_batch = ready_path + folder
-    dst_pkg = dst_batch + '/' + package
+    mode = 0o777
 
-    # Idempotency: nothing to do if the package is already back in ready.
-    if not os.path.exists(src_pkg):
-        if os.path.exists(dst_pkg):
-            logger.info('move_from_ingest_to_ready: %s already in 001-ready', package)
-            return dict(result='already_in_ready', errors=[])
-        errors.append('ERROR: Source package not found in 002-ingest (move_from_ingest_to_ready)')
-        return dict(result='source_not_found', errors=errors)
+    if not _lock_uuid(uuid, owner='move_to_ingest'):
+        errors.append('move_in_progress: another operation holds the lock')
+        return dict(result='move_in_progress', errors=errors)
 
-    # Ensure the destination batch folder exists in 001-ready.
-    if not os.path.exists(dst_batch):
+    try:
+        # create collection uuid folder in 002-ingest folder
+        # (the lock helper already created the dir if needed, but the
+        # legacy behavior is to create with mode=0o777 explicitly —
+        # preserve it.)
         try:
-            os.mkdir(dst_batch, 0o777)
+            if not os.path.exists(ingest_path + uuid):
+                os.mkdir(ingest_path + uuid, mode)
         except Exception as e:
             logger.info(e)
-            errors.append('ERROR: Unable to create destination batch folder (move_from_ingest_to_ready)')
-            return dict(result='destination_create_failed', errors=errors)
+            errors.append('ERROR: Unable to create folder (move_to_ingest)')
 
-    # Move the package back.
+        # move package to new uuid folder in 002-ingest
+        try:
+            shutil.move(ready_path + folder + '/' + package, ingest_path + uuid)
+        except Exception as e:
+            logger.info(e)
+            errors.append('ERROR: Unable to move folder (move_to_ingest)')
+
+        if len(errors) == 0:
+            result = 'packages_moved_to_ingested_folder.'
+        else:
+            result = 'packages_not_moved_to_ingested_folder.'
+
+        return dict(result=result, errors=errors)
+    finally:
+        _unlock_uuid(uuid, owner='move_to_ingest')
+
+
+def move_from_ingest_to_ready(uuid, folder, package, actor=None):
+    '''
+    Inverse of move_to_ingest. Moves a single package from
+    002-ingest/<uuid>/<package> back to 001-ready/<folder>/<package>.
+    Used by the ingest service's pre-ingest rollback AND post-cancel
+    return-to-packaging endpoints to undo a Stage 2 move.
+
+    Behavior:
+      * Acquires a per-uuid lock to prevent concurrent moves (e.g. a
+        cancel that races against Stage 2 move_to_sftp still copying).
+        On contention, returns 'move_in_progress' without touching disk.
+      * Best-effort cleans up the Archivematica SFTP staging copy
+        BEFORE the local move. The SFTP copy may or may not exist
+        (depends on which sub-state Stage 2 was in when staff
+        cancelled); failures are logged + recorded in `sftp_clean`
+        but DON'T block the local move.
+      * If the package directory exists in 002-ingest, it is moved back.
+      * If the destination batch folder in 001-ready does not exist, it
+        is created.
+      * If the 002-ingest/<uuid>/ directory becomes empty after the
+        move, it is removed (matches move_to_ingest's per-uuid pattern).
+      * Idempotent: if the package is already in 001-ready (already
+        rolled back) and not in 002-ingest, this returns success.
+      * uri.txt files travel with the package — they are preserved
+        through shutil.move and reappear in 001-ready, which means
+        the folder reappears in /processed (Packaging and Ingesting
+        view) for re-submit.
+
+    Audit:
+      * `actor` (optional) is logged at INFO. Pass the authenticated
+        staff identifier so this entry can be correlated with the
+        ingest service's tbl_ingest_events audit trail. The query
+        param is consumed by the route handler and threaded through
+        here; never trust it for authz (the X-API-Key header is
+        the gate).
+
+    @param: uuid
+    @param: folder
+    @param: package
+    @param: actor (optional)
+    @returns: Dictionary with keys:
+        result    — one of: packages_moved_back_to_ready.,
+                            already_in_ready,
+                            move_in_progress,
+                            source_not_found,
+                            destination_create_failed,
+                            move_failed
+        errors    — list of error strings (empty on success)
+        sftp_clean — dict(attempted: bool, ok: bool, err: str|None)
+    '''
+
+    logger.info(
+        'move_from_ingest_to_ready: BEGIN uuid=%s folder=%s package=%s actor=%s',
+        uuid, folder, package, actor or '<unset>',
+    )
+
+    errors = []
+    sftp_clean = {'attempted': False, 'ok': False, 'err': None}
+
+    if not _lock_uuid(uuid, owner='move_from_ingest_to_ready'):
+        errors.append('move_in_progress: another operation holds the lock')
+        logger.info(
+            'move_from_ingest_to_ready: BUSY uuid=%s actor=%s',
+            uuid, actor or '<unset>',
+        )
+        return dict(result='move_in_progress', errors=errors, sftp_clean=sftp_clean)
+
     try:
-        shutil.move(src_pkg, dst_batch + '/')
-    except Exception as e:
-        logger.info(e)
-        errors.append('ERROR: Unable to move folder (move_from_ingest_to_ready)')
-        return dict(result='move_failed', errors=errors)
+        src_dir = ingest_path + uuid
+        src_pkg = src_dir + '/' + package
+        dst_batch = ready_path + folder
+        dst_pkg = dst_batch + '/' + package
 
-    # Clean up the now-empty 002-ingest/<uuid>/ directory if applicable.
-    try:
-        if os.path.exists(src_dir) and not os.listdir(src_dir):
-            os.rmdir(src_dir)
-    except Exception as e:
-        # Non-fatal; the package is back, just log and move on.
-        logger.info('move_from_ingest_to_ready: cleanup failed (non-fatal): %s', e)
+        # ---- Idempotency check ----
+        # If the source package isn't in 002-ingest, either:
+        #   (a) the destination already has it — already rolled back, success.
+        #   (b) neither has it — something is wrong, surface an error.
+        if not os.path.exists(src_pkg):
+            if os.path.exists(dst_pkg):
+                logger.info(
+                    'move_from_ingest_to_ready: ALREADY_IN_READY uuid=%s package=%s actor=%s',
+                    uuid, package, actor or '<unset>',
+                )
+                return dict(result='already_in_ready', errors=[], sftp_clean=sftp_clean)
+            errors.append(
+                'ERROR: Source package not found in 002-ingest (move_from_ingest_to_ready)'
+            )
+            logger.info(
+                'move_from_ingest_to_ready: SOURCE_NOT_FOUND uuid=%s package=%s actor=%s',
+                uuid, package, actor or '<unset>',
+            )
+            return dict(result='source_not_found', errors=errors, sftp_clean=sftp_clean)
 
-    return dict(result='packages_moved_back_to_ready.', errors=[])
+        # ---- Best-effort SFTP cleanup ----
+        # Clean up the Archivematica SFTP staging copy first. If the worker
+        # had progressed past Stage 2's move_to_sftp, a partial (or
+        # complete) copy exists on the AM side; if we don't clean it up
+        # here, staff have to delete it manually. The cleanup is
+        # best-effort — failure is logged + recorded in the result but
+        # never blocks the local move.
+        try:
+            sftp_clean['attempted'] = True
+            clean_up_sftp(uuid, package)
+            sftp_clean['ok'] = True
+            logger.info(
+                'move_from_ingest_to_ready: SFTP_CLEAN_OK uuid=%s package=%s',
+                uuid, package,
+            )
+        except Exception as e:
+            sftp_clean['err'] = str(e)
+            logger.warning(
+                'move_from_ingest_to_ready: SFTP_CLEAN_FAILED (non-fatal) '
+                'uuid=%s package=%s err=%s',
+                uuid, package, e,
+            )
+
+        # ---- Ensure destination batch folder exists ----
+        if not os.path.exists(dst_batch):
+            try:
+                os.mkdir(dst_batch, 0o777)
+            except Exception as e:
+                logger.info(e)
+                errors.append(
+                    'ERROR: Unable to create destination batch folder '
+                    '(move_from_ingest_to_ready)'
+                )
+                return dict(
+                    result='destination_create_failed',
+                    errors=errors,
+                    sftp_clean=sftp_clean,
+                )
+
+        # ---- Move the package back ----
+        try:
+            shutil.move(src_pkg, dst_batch + '/')
+        except Exception as e:
+            logger.info(e)
+            errors.append('ERROR: Unable to move folder (move_from_ingest_to_ready)')
+            return dict(result='move_failed', errors=errors, sftp_clean=sftp_clean)
+
+        # ---- Clean up empty 002-ingest/<uuid>/ ----
+        # The lockfile lives inside this directory; release it BEFORE the
+        # rmdir so the directory is genuinely empty. The finally below
+        # will be a no-op (path missing → branch in _unlock_uuid skips).
+        _unlock_uuid(uuid, owner='move_from_ingest_to_ready')
+        try:
+            if os.path.exists(src_dir) and not os.listdir(src_dir):
+                os.rmdir(src_dir)
+                logger.info(
+                    'move_from_ingest_to_ready: CLEANED uuid_dir uuid=%s', uuid,
+                )
+        except Exception as e:
+            # Non-fatal; the package is back, just log and move on.
+            logger.info(
+                'move_from_ingest_to_ready: cleanup failed (non-fatal) '
+                'uuid=%s err=%s',
+                uuid, e,
+            )
+
+        logger.info(
+            'move_from_ingest_to_ready: SUCCESS uuid=%s folder=%s package=%s actor=%s',
+            uuid, folder, package, actor or '<unset>',
+        )
+        return dict(
+            result='packages_moved_back_to_ready.',
+            errors=[],
+            sftp_clean=sftp_clean,
+        )
+    finally:
+        # Defensive — if we returned early without releasing (e.g. exception
+        # in an unexpected place), make sure the lock is gone. _unlock_uuid
+        # is a no-op when the file is already removed.
+        _unlock_uuid(uuid, owner='move_from_ingest_to_ready')
 
 
 def move_to_sftp(pid):
@@ -690,7 +929,7 @@ def move_to_ingested(uuid, folder):
                 errors.append('ERROR: Unable to move packages to wasabi s3')
             else:
                 shutil.rmtree(ingest_path + folder.replace('new_', ''))
-            
+
             os.system('rm -R ' + ingest_path + folder)
         except Exception as e:
             logger.info(e)
@@ -786,4 +1025,3 @@ def clean_up_sftp(pid, archival_package):
     finally:
         sftp.close()
         client.close()
-
