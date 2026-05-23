@@ -20,6 +20,7 @@ Run:
 """
 
 import os
+import stat
 import tempfile
 import threading
 import time
@@ -292,6 +293,224 @@ class MoveToIngestLockTests(unittest.TestCase):
             )
         finally:
             ops._unlock_uuid('uuid-contention', owner='test_other')
+
+
+class _FakeSftpAttr:
+    """Stand-in for paramiko.SFTPAttributes used by listdir_attr."""
+
+    def __init__(self, name, is_dir, size=0):
+        self.filename = name
+        self.st_mode = stat.S_IFDIR if is_dir else stat.S_IFREG
+        self.st_size = None if is_dir else size
+
+
+class _FakeSftpServer:
+    """In-memory SFTP server stub. Mimics the subset of paramiko's
+    SFTPClient interface that archivematica_ops uses: listdir_attr,
+    stat, remove, rmdir, close. Tracks calls + raises IOError where
+    real SFTP would (missing path, non-empty rmdir)."""
+
+    def __init__(self, tree):
+        # tree: dict[abs_path] -> list[_FakeSftpAttr]. Files live as
+        # entries inside their parent's list; the dict only carries
+        # directory paths.
+        self.tree = dict(tree)
+        self.removed_files = []
+        self.removed_dirs = []
+
+    def listdir_attr(self, path):
+        if path not in self.tree:
+            raise IOError('not a directory: ' + path)
+        return list(self.tree[path])
+
+    def stat(self, path):
+        if path in self.tree:
+            return _FakeSftpAttr('', True)
+        for parent, kids in self.tree.items():
+            for k in kids:
+                if path == parent + '/' + k.filename:
+                    return k
+        raise IOError('not found: ' + path)
+
+    def remove(self, path):
+        parent = path.rsplit('/', 1)[0]
+        if parent not in self.tree:
+            raise IOError('parent not found: ' + parent)
+        kids = self.tree[parent]
+        name = path.rsplit('/', 1)[1]
+        match = next((k for k in kids if k.filename == name), None)
+        if match is None:
+            raise IOError('not found: ' + path)
+        self.tree[parent] = [k for k in kids if k.filename != name]
+        self.removed_files.append(path)
+
+    def rmdir(self, path):
+        if path not in self.tree:
+            raise IOError('not found: ' + path)
+        if self.tree[path]:
+            raise IOError('directory not empty: ' + path)
+        del self.tree[path]
+        parent = path.rsplit('/', 1)[0]
+        if parent in self.tree:
+            name = path.rsplit('/', 1)[1]
+            self.tree[parent] = [k for k in self.tree[parent] if k.filename != name]
+        self.removed_dirs.append(path)
+
+    def close(self):
+        pass
+
+
+class _FakeSshClient:
+    """Confirms exec_command is NEVER called by the pure-SFTP path."""
+
+    def __init__(self):
+        self.exec_calls = []
+
+    def exec_command(self, cmd):
+        self.exec_calls.append(cmd)
+        # Mimic internal-sftp: open succeeds but stdout is empty.
+        class _StdOut:
+            def read(_self):
+                return b''
+        return None, _StdOut(), None
+
+    def close(self):
+        pass
+
+
+class CleanUpSftpTests(unittest.TestCase):
+    """Verify the pure-SFTP rewrite of clean_up_sftp:
+
+      - Uses sftp.remove + sftp.rmdir (NEVER exec_command, which
+        silently no-ops on the production internal-sftp host).
+      - Removes the full package tree + the empty <pid> parent.
+      - Leaves the <pid> parent alone when sibling packages exist.
+      - No-op when the package path is already gone."""
+
+    def setUp(self):
+        self._sftp_path_patch = patch.object(ops, 'sftp_path', '/sftp')
+        self._sftp_path_patch.start()
+        self.fake_client = None
+        self.fake_sftp = None
+
+        def fake_open():
+            self.fake_client = _FakeSshClient()
+            return self.fake_client, self.fake_sftp
+
+        self._open_patch = patch.object(ops, '_open_sftp', fake_open)
+        self._open_patch.start()
+
+    def tearDown(self):
+        self._open_patch.stop()
+        self._sftp_path_patch.stop()
+
+    def _set_tree(self, tree):
+        self.fake_sftp = _FakeSftpServer(tree)
+
+    def test_removes_package_tree_recursively(self):
+        self._set_tree({
+            '/sftp/uuid-X': [
+                _FakeSftpAttr('pkg-A', True),
+            ],
+            '/sftp/uuid-X/pkg-A': [
+                _FakeSftpAttr('uri.txt', False, 12),
+                _FakeSftpAttr('sub', True),
+            ],
+            '/sftp/uuid-X/pkg-A/sub': [
+                _FakeSftpAttr('img1.tif', False, 1024 * 1024),
+                _FakeSftpAttr('img2.tif', False, 2 * 1024 * 1024),
+            ],
+        })
+        ops.clean_up_sftp('uuid-X', 'pkg-A')
+        # Every regular file under the package was removed.
+        self.assertIn('/sftp/uuid-X/pkg-A/uri.txt', self.fake_sftp.removed_files)
+        self.assertIn('/sftp/uuid-X/pkg-A/sub/img1.tif', self.fake_sftp.removed_files)
+        self.assertIn('/sftp/uuid-X/pkg-A/sub/img2.tif', self.fake_sftp.removed_files)
+        # Subdir was removed before its parent (deepest-first).
+        sub_idx = self.fake_sftp.removed_dirs.index('/sftp/uuid-X/pkg-A/sub')
+        pkg_idx = self.fake_sftp.removed_dirs.index('/sftp/uuid-X/pkg-A')
+        self.assertLess(sub_idx, pkg_idx)
+        # uuid parent now empty → also removed.
+        self.assertIn('/sftp/uuid-X', self.fake_sftp.removed_dirs)
+
+    def test_leaves_parent_when_sibling_package_exists(self):
+        # uuid-X has TWO packages. Removing pkg-A must not touch pkg-B.
+        self._set_tree({
+            '/sftp/uuid-X': [
+                _FakeSftpAttr('pkg-A', True),
+                _FakeSftpAttr('pkg-B', True),
+            ],
+            '/sftp/uuid-X/pkg-A': [_FakeSftpAttr('uri.txt', False, 12)],
+            '/sftp/uuid-X/pkg-B': [_FakeSftpAttr('other.tif', False, 500)],
+        })
+        ops.clean_up_sftp('uuid-X', 'pkg-A')
+        # pkg-A is gone.
+        self.assertIn('/sftp/uuid-X/pkg-A', self.fake_sftp.removed_dirs)
+        # uuid parent NOT removed (sibling still lives there).
+        self.assertNotIn('/sftp/uuid-X', self.fake_sftp.removed_dirs)
+        self.assertIn('/sftp/uuid-X', self.fake_sftp.tree)
+        # pkg-B is untouched.
+        self.assertIn('/sftp/uuid-X/pkg-B', self.fake_sftp.tree)
+
+    def test_idempotent_when_package_path_missing(self):
+        # Nothing on disk — clean_up_sftp should bail without touching
+        # remove/rmdir.
+        self._set_tree({})
+        ops.clean_up_sftp('uuid-MISSING', 'pkg-X')
+        self.assertEqual(self.fake_sftp.removed_files, [])
+        self.assertEqual(self.fake_sftp.removed_dirs, [])
+
+    def test_never_calls_exec_command(self):
+        """The hard part of the bug: the production AM SFTP host is
+        internal-sftp (no shell). paramiko exec_command returns
+        b'' silently — every shell command we used to send was a
+        no-op. This test pins that we never use exec_command at all.
+        """
+        self._set_tree({
+            '/sftp/uuid-X': [_FakeSftpAttr('pkg-A', True)],
+            '/sftp/uuid-X/pkg-A': [_FakeSftpAttr('uri.txt', False, 12)],
+        })
+        ops.clean_up_sftp('uuid-X', 'pkg-A')
+        self.assertEqual(
+            self.fake_client.exec_calls, [],
+            'clean_up_sftp must use pure SFTP — never exec_command',
+        )
+
+    def test_rmtree_helper_handles_symlink_and_device_entries(self):
+        """_sftp_walk classifies symlinks / devices as 'other'.
+        _sftp_rmtree treats those as files (best-effort sftp.remove).
+        The tree should still be fully cleaned."""
+        weird = _FakeSftpAttr('link', False, 0)
+        weird.st_mode = stat.S_IFLNK  # symlink, not regular file
+        self._set_tree({
+            '/sftp/uuid-X': [_FakeSftpAttr('pkg-A', True)],
+            '/sftp/uuid-X/pkg-A': [weird, _FakeSftpAttr('real.tif', False, 100)],
+        })
+        ops.clean_up_sftp('uuid-X', 'pkg-A')
+        # Both the symlink and the regular file went through remove.
+        self.assertIn('/sftp/uuid-X/pkg-A/link', self.fake_sftp.removed_files)
+        self.assertIn('/sftp/uuid-X/pkg-A/real.tif', self.fake_sftp.removed_files)
+
+
+class HumanSizeTests(unittest.TestCase):
+    """The pure-SFTP rewrite computes byte-size during the walk and
+    formats with _human_size (replaces the broken `du -h -s` shell
+    call). Pin the formatter contract here."""
+
+    def test_zero(self):
+        self.assertEqual(ops._human_size(0), '0')
+
+    def test_bytes_under_kib(self):
+        self.assertEqual(ops._human_size(500), '500B')
+
+    def test_kib(self):
+        self.assertEqual(ops._human_size(2048), '2.0K')
+
+    def test_mib(self):
+        self.assertEqual(ops._human_size(3 * 1024 * 1024), '3.0M')
+
+    def test_gib(self):
+        self.assertEqual(ops._human_size(int(1.5 * 1024**3)), '1.5G')
 
 
 if __name__ == '__main__':

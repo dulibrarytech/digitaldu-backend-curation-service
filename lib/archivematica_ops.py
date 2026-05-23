@@ -131,9 +131,144 @@ def _sftp_walk(sftp, remote_dir, on_file=None, on_dir=None, on_other=None):
 
 
 def _ssh_exec(client, command):
-    """Run a shell command over SSH and return decoded stdout (replaces pysftp.execute)."""
+    """Run a shell command over SSH and return decoded stdout (replaces pysftp.execute).
+
+    DEPRECATED (2026-05-23): the production Archivematica SFTP host
+    runs OpenSSH `internal-sftp` Subsystem — a restricted SFTP-only
+    sandbox with NO shell. paramiko's exec_command opens the channel,
+    the server immediately closes it, and stdout.read() returns b''
+    with NO exception raised. The result: callers think the command
+    succeeded; nothing actually ran.
+
+    Two callers used to depend on this: clean_up_sftp (rm -rf) and
+    check_sftp (du -h -s). Both have been rewritten to use pure SFTP
+    operations (sftp.remove, sftp.rmdir, sftp.stat). Helper retained
+    only for one-off diagnostic scripts that target a shell-enabled
+    host. Do NOT add new callers — see _sftp_rmtree below for the
+    correct pattern.
+    """
     stdin, stdout, stderr = client.exec_command(command)
     return stdout.read().decode('utf-8', errors='replace')
+
+
+def _sftp_rmtree(sftp, remote_dir):
+    """Pure-SFTP recursive remove. Analogue to shutil.rmtree.
+
+    Why pure SFTP and not exec_command('rm -rf'): the production AM
+    SFTP host runs `internal-sftp` (no shell). See _ssh_exec docstring.
+    sftp.remove (SSH_FXP_REMOVE) and sftp.rmdir (SSH_FXP_RMDIR) are
+    part of the SFTP protocol itself and work against internal-sftp.
+
+    Algorithm:
+      1. Walk the tree once, recording every file + directory path
+         under `remote_dir` (uses the existing _sftp_walk helper).
+      2. Remove all files first (rmdir refuses non-empty dirs).
+      3. Remove all directories deepest-first (sorted by path depth)
+         so children are gone before their parents.
+      4. Finally remove `remote_dir` itself.
+
+    Every individual remove is best-effort — an IOError on one entry
+    (permission / vanished / etc.) is logged at INFO and the walk
+    continues. The caller's contract is "leave the tree maximally
+    cleaned"; a single stuck file doesn't block the rest. The final
+    sftp.rmdir of `remote_dir` is also best-effort — if a leftover
+    entry remains, the parent stays and ops gets a chance to inspect.
+
+    Non-recursive entry types (symlinks, devices, FIFOs) get the
+    `on_other` branch from _sftp_walk and are treated as files: we
+    try sftp.remove on them. Pure SFTP doesn't traverse symlink
+    targets, which is safer than `rm -rf`'s default follow-symlinks
+    behavior on broken trees.
+
+    No return value — best-effort throughout. Caller can sftp.stat
+    after to confirm the tree is gone if they care.
+    """
+    # 1. Walk + collect.
+    files = []
+    dirs = []
+    try:
+        _sftp_walk(
+            sftp,
+            remote_dir,
+            on_file=files.append,
+            on_dir=dirs.append,
+            on_other=files.append,  # symlinks / devices: try sftp.remove
+        )
+    except IOError as e:
+        # The top-level directory doesn't exist, or perms denied the
+        # walk. Either way nothing to remove. Surface as INFO so ops
+        # can see why we bailed.
+        logger.info('_sftp_rmtree: walk failed for %s: %s', remote_dir, e)
+        return
+
+    # 2. Files first.
+    for f in files:
+        try:
+            sftp.remove(f)
+        except IOError as e:
+            logger.info('_sftp_rmtree: remove(%s) failed: %s', f, e)
+
+    # 3. Directories deepest-first. Counting `/` is a cheap proxy
+    #    for path depth in the walked tree (all paths share the
+    #    `remote_dir` prefix, so deeper paths have more slashes).
+    dirs.sort(key=lambda d: d.count('/'), reverse=True)
+    for d in dirs:
+        try:
+            sftp.rmdir(d)
+        except IOError as e:
+            logger.info('_sftp_rmtree: rmdir(%s) failed: %s', d, e)
+
+    # 4. The top-level dir itself.
+    try:
+        sftp.rmdir(remote_dir)
+    except IOError as e:
+        logger.info('_sftp_rmtree: rmdir(%s) [root] failed: %s', remote_dir, e)
+
+
+def _sftp_dir_size(sftp, remote_dir):
+    """Pure-SFTP recursive byte-sum analogue to `du -s`.
+
+    Walks the tree once via _sftp_walk and sums each regular file's
+    st_size (already returned by listdir_attr — no extra round trip).
+    Returns the sum in bytes. Returns 0 on any walk failure (caller
+    treats as "size unknown"; the field isn't surfaced to staff
+    today, just logged).
+    """
+    total = [0]
+
+    def add_size(_path, entry):
+        # entry is the paramiko SFTPAttributes from listdir_attr.
+        # st_size is None for some non-regular entries; treat as 0.
+        if entry.st_size:
+            total[0] += entry.st_size
+
+    try:
+        _sftp_walk_with_attrs(sftp, remote_dir, on_file=add_size)
+    except IOError as e:
+        logger.info('_sftp_dir_size: walk failed for %s: %s', remote_dir, e)
+        return 0
+    return total[0]
+
+
+def _sftp_walk_with_attrs(sftp, remote_dir, on_file=None, on_dir=None):
+    """Variant of _sftp_walk that passes the SFTPAttributes object to
+    the callbacks alongside the full path. Used by _sftp_dir_size so
+    we can sum sizes without an extra round trip per file.
+
+    Kept separate from _sftp_walk so the original signature (callback
+    takes only the path) stays stable for existing callers.
+    """
+    for entry in sftp.listdir_attr(remote_dir):
+        full_path = posixpath.join(remote_dir, entry.filename)
+        if stat.S_ISDIR(entry.st_mode):
+            if on_dir:
+                on_dir(full_path, entry)
+            _sftp_walk_with_attrs(sftp, full_path, on_file, on_dir)
+        elif stat.S_ISREG(entry.st_mode):
+            if on_file:
+                on_file(full_path, entry)
+        # Skip non-file non-dir entries (symlinks, devices) — not
+        # counted in `du`-equivalent size either.
 
 
 # --- per-uuid lockfile (added 2026-05-23 for cancel-flow safety) -----------
@@ -868,11 +1003,14 @@ def check_sftp(uuid, local_file_count):
         _sftp_walk(sftp, remote_package, on_file=store_files_name, on_dir=store_dir_name, on_other=store_other_file_types)
         remote_file_count = len(file_names)
 
-        # `du` runs in the SSH session's default cwd; cd into the package first.
-        # NOTE: uuid is interpolated into a shell command as in the legacy code.
-        # Caller (ingest service) sends sanitized UUIDs; harden in a follow-up if needed.
-        du_output = _ssh_exec(client, 'cd ' + remote_package + ' && du -h -s')
-        remote_package_size = du_output.strip().replace('\t', '')
+        # Sum file sizes via pure SFTP. The legacy `du -h -s` call
+        # was broken on the production AM SFTP host (internal-sftp
+        # rejects exec_command — see _ssh_exec docstring), so the
+        # `remote_package_size` field was silently empty. The Node
+        # side doesn't surface this to staff today, but the
+        # accurate byte sum is useful for logs + future use.
+        remote_package_size_bytes = _sftp_dir_size(sftp, remote_package)
+        remote_package_size = _human_size(remote_package_size_bytes)
 
         if int(local_file_count) == remote_file_count:
             return dict(message='upload_complete', data=[file_names, remote_file_count])
@@ -883,6 +1021,26 @@ def check_sftp(uuid, local_file_count):
     finally:
         sftp.close()
         client.close()
+
+
+def _human_size(num_bytes):
+    """Format a byte count to a `du -h`-style short string.
+
+    Matches the legacy contract: short ASCII (e.g. "12K", "3.4M",
+    "1.2G", "8B"). Single decimal place for >= 1 KiB to match GNU
+    du's default. Returns "0" for 0 (du's output for empty).
+    """
+    if not num_bytes:
+        return '0'
+    units = ('B', 'K', 'M', 'G', 'T', 'P')
+    size = float(num_bytes)
+    for unit in units:
+        if size < 1024 or unit == units[-1]:
+            if unit == 'B':
+                return '%d%s' % (int(size), unit)
+            return '%.1f%s' % (size, unit)
+        size /= 1024
+    return '%.1f%s' % (size, units[-1])
 
 
 def move_to_ingested(uuid, folder):
@@ -1041,23 +1199,43 @@ def clean_up_sftp(pid, archival_package):
 
     client, sftp = _open_sftp()
     try:
-        # paramiko exec_command runs each call in its own shell, so we
-        # chain everything into one command. Using absolute paths
-        # throughout — we don't `cd` into <target> because then we
-        # can't rmdir it (a process's cwd can't be removed on most
-        # POSIX systems).
-        #
-        # rm -rf removes the package directory + all its contents.
-        # rmdir on <target> succeeds only if no sibling packages
-        # remain — otherwise it errors and we swallow it with the
-        # trailing `; true` so the overall exit code is 0.
         target = sftp_path + '/' + pid
-        cmd = (
-            'rm -rf ' + target + '/' + archival_package
-            + '; rmdir ' + target + ' 2>/dev/null'
-            + '; true'
-        )
-        _ssh_exec(client, cmd)
+        pkg_path = target + '/' + archival_package
+
+        # Idempotency: if the package path doesn't exist on the
+        # server (already cleaned up, or never uploaded), nothing
+        # to do. sftp.stat raises IOError when the path is missing.
+        try:
+            sftp.stat(pkg_path)
+        except IOError:
+            logger.info(
+                'clean_up_sftp: nothing to remove pid=%s package=%s',
+                pid, archival_package,
+            )
+            return
+
+        # Recursive remove of the package tree (files + subdirs +
+        # the package dir itself). Pure SFTP — see _sftp_rmtree
+        # for why we don't use shell exec.
+        _sftp_rmtree(sftp, pkg_path)
+
+        # Best-effort prune of the empty <pid> parent. sftp.rmdir
+        # raises IOError if the directory still has sibling packages
+        # (e.g. a concurrent batch ingest under the same collection
+        # uuid). That's the right behavior — leave the parent for
+        # the active siblings to use. The legacy shell version
+        # achieved this with `rmdir; 2>/dev/null`; same semantics,
+        # just plumbed through the SFTP error code.
+        try:
+            sftp.rmdir(target)
+            logger.info(
+                'clean_up_sftp: pruned empty parent uuid=%s', pid,
+            )
+        except IOError as e:
+            logger.info(
+                'clean_up_sftp: parent has siblings, kept uuid=%s err=%s',
+                pid, e,
+            )
     finally:
         sftp.close()
         client.close()
