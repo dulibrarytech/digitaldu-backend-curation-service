@@ -142,16 +142,20 @@ def _make_client():
 
 def _client_from_keys():
     """
-    Build a Session from explicit access-key + secret. See
-    _PROFILE_ENV_VARS comment for why we pop those env vars around
-    the Session construction.
+    Build an S3 client from explicit access-key + secret. See
+    _PROFILE_ENV_VARS comment for why we pop those env vars
+    AROUND BOTH `boto3.Session()` AND `session.client()`.
 
-    The pop is scoped to THIS process's os.environ; we restore the
-    original values in `finally` so other code that depends on them
-    (e.g. for unrelated boto3 clients in the same process) sees no
-    side effect. The Session object captures the creds it needs at
-    construction time — once it's built, the env vars no longer
-    affect it.
+    Earlier iterations only popped during Session() and restored
+    before client() — botocore's `create_client` then hit
+    `get_config_variable('ca_bundle')`, which goes through the same
+    `get_scoped_config()` machinery and triggered the same
+    ProfileNotFound. Keep the pop in effect through BOTH calls;
+    Python's `try/return/finally` runs `finally` after the return
+    value is computed but before control hands back to the caller,
+    so by the time upload_file() runs the env vars are restored
+    and the constructed client doesn't need them anyway (its
+    credentials are baked in at construction time).
     """
     session_kwargs = {
         'aws_access_key_id': config.AWS_ACCESS_KEY_ID,
@@ -163,14 +167,13 @@ def _client_from_keys():
     saved = {k: os.environ.pop(k) for k in _PROFILE_ENV_VARS if k in os.environ}
     try:
         session = boto3.Session(**session_kwargs)
+        return session.client(
+            's3',
+            endpoint_url=config.WASABI_ENDPOINT,
+            config=_RETRY_CONFIG,
+        )
     finally:
         os.environ.update(saved)
-
-    return session.client(
-        's3',
-        endpoint_url=config.WASABI_ENDPOINT,
-        config=_RETRY_CONFIG,
-    )
 
 
 def _client_from_profile():

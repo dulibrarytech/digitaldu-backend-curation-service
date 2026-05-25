@@ -254,33 +254,39 @@ class MakeClientCredentialResolutionTest(unittest.TestCase):
         self.assertEqual(call_kwargs.get('profile_name'), 'fallback')
         self.assertNotIn('aws_access_key_id', call_kwargs)
 
-    def test_pops_profile_env_vars_during_session_construction(self):
+    def test_pops_profile_env_vars_through_both_session_and_client(self):
         """
-        boto3.Session() reads AWS_PROFILE and AWS_DEFAULT_PROFILE
-        from os.environ during _setup_loader, EVEN WHEN explicit
-        access keys are passed. If the named profile isn't in
-        ~/.aws/config it raises ProfileNotFound before we can use
-        the keys we just passed. _client_from_keys must pop those
-        env vars for the call and restore them after.
+        boto3.Session() AND session.client() both read AWS_PROFILE /
+        AWS_DEFAULT_PROFILE from os.environ during init, via the
+        same get_scoped_config() path. If the named profile isn't
+        in ~/.aws/config either call raises ProfileNotFound.
 
-        This test was added after a live regression where the .env
-        on the curation host had AWS_DEFAULT_PROFILE=fernando.reyes
-        alongside the actual access keys; recovery scripts crashed
-        with ProfileNotFound until this pop was added.
+        _client_from_keys must keep the pop in effect through BOTH
+        calls — popping only during Session() leaves client() to
+        crash on `get_config_variable('ca_bundle')`.
+
+        This regression bit twice on the live curation host: the
+        first pop fixed Session(), then client() failed at the
+        ca_bundle config lookup. Pin both points here.
         """
-        captured = {}
+        captured_at_session = {}
+        captured_at_client = {}
 
-        def capture_env_during_construction(**kwargs):
-            captured['AWS_PROFILE'] = os.environ.get('AWS_PROFILE')
-            captured['AWS_DEFAULT_PROFILE'] = os.environ.get('AWS_DEFAULT_PROFILE')
-            client_mock = MagicMock()
+        def capture_env_at_session(**kwargs):
+            captured_at_session['AWS_PROFILE'] = os.environ.get('AWS_PROFILE')
+            captured_at_session['AWS_DEFAULT_PROFILE'] = os.environ.get('AWS_DEFAULT_PROFILE')
+
+            def capture_env_at_client(*c_args, **c_kwargs):
+                captured_at_client['AWS_PROFILE'] = os.environ.get('AWS_PROFILE')
+                captured_at_client['AWS_DEFAULT_PROFILE'] = os.environ.get('AWS_DEFAULT_PROFILE')
+                return MagicMock()
+
             sess = MagicMock()
-            sess.client.return_value = client_mock
+            sess.client.side_effect = capture_env_at_client
             return sess
 
-        self.boto3_mock.Session.side_effect = capture_env_during_construction
+        self.boto3_mock.Session.side_effect = capture_env_at_session
 
-        # Seed both profile env vars to simulate the live deploy.
         with patch.object(config, 'AWS_ACCESS_KEY_ID', 'ak-env'), \
              patch.object(config, 'AWS_SECRET_ACCESS_KEY', 'sk-env'), \
              patch.dict(os.environ, {
@@ -288,10 +294,12 @@ class MakeClientCredentialResolutionTest(unittest.TestCase):
                  'AWS_DEFAULT_PROFILE': 'fernando.reyes',
              }, clear=False):
             wasabi._make_client()
-            # During Session construction, both vars must be invisible.
-            self.assertIsNone(captured['AWS_PROFILE'])
-            self.assertIsNone(captured['AWS_DEFAULT_PROFILE'])
-            # After the call returns, both restored exactly.
+            # Both Session() and client() must see the env vars popped.
+            self.assertIsNone(captured_at_session['AWS_PROFILE'])
+            self.assertIsNone(captured_at_session['AWS_DEFAULT_PROFILE'])
+            self.assertIsNone(captured_at_client['AWS_PROFILE'])
+            self.assertIsNone(captured_at_client['AWS_DEFAULT_PROFILE'])
+            # And restored on return.
             self.assertEqual(os.environ['AWS_PROFILE'], 'fernando.reyes')
             self.assertEqual(os.environ['AWS_DEFAULT_PROFILE'], 'fernando.reyes')
 
