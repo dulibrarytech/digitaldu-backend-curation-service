@@ -173,6 +173,88 @@ class UploadDirectoryTest(unittest.TestCase):
         )
 
 
+class MakeClientCredentialResolutionTest(unittest.TestCase):
+    """
+    Pins the credential-resolution priority in `_make_client`:
+      1. Env-based access key + secret (the v1 deploy shape)
+      2. Named profile (legacy ~/.aws/config path)
+      3. Loud failure if neither is set
+
+    Without this, a host that has WASABI_PROFILE set but no actual
+    ~/.aws/config for the user (the original bug — interactive
+    `sudo -u curation` leaving HOME=/root) raises ProfileNotFound
+    deep inside boto3 instead of using the env-based keys that ARE
+    available.
+    """
+
+    def setUp(self):
+        # boto3.Session itself is what we're testing the call shape of.
+        # Patch the class so we can assert the kwargs without actually
+        # making AWS calls.
+        self.session_patcher = patch.object(wasabi, 'boto3')
+        self.boto3_mock = self.session_patcher.start()
+        # Default to a sensible client return so chained .client(...)
+        # in _make_client doesn't AttributeError.
+        self.boto3_mock.Session.return_value.client.return_value = MagicMock()
+
+    def tearDown(self):
+        self.session_patcher.stop()
+
+    def test_prefers_env_credentials_over_profile(self):
+        # Both env keys AND a profile are set — env keys should win.
+        # This is the v1 deploy shape: .env has both.
+        with patch.object(config, 'AWS_ACCESS_KEY_ID', 'ak-env'), \
+             patch.object(config, 'AWS_SECRET_ACCESS_KEY', 'sk-env'), \
+             patch.object(config, 'AWS_DEFAULT_REGION', 'us-east-1'), \
+             patch.object(config, 'WASABI_PROFILE', 'fernando.reyes'):
+            wasabi._make_client()
+        call_kwargs = self.boto3_mock.Session.call_args.kwargs
+        self.assertEqual(call_kwargs.get('aws_access_key_id'), 'ak-env')
+        self.assertEqual(call_kwargs.get('aws_secret_access_key'), 'sk-env')
+        self.assertEqual(call_kwargs.get('region_name'), 'us-east-1')
+        # CRITICAL: profile_name MUST NOT be passed — that would
+        # short-circuit env creds and fail with ProfileNotFound on
+        # hosts where ~/.aws/config doesn't have the profile.
+        self.assertNotIn('profile_name', call_kwargs)
+
+    def test_falls_back_to_profile_when_env_keys_missing(self):
+        with patch.object(config, 'AWS_ACCESS_KEY_ID', ''), \
+             patch.object(config, 'AWS_SECRET_ACCESS_KEY', ''), \
+             patch.object(config, 'WASABI_PROFILE', 'wasabi-prod'):
+            wasabi._make_client()
+        call_kwargs = self.boto3_mock.Session.call_args.kwargs
+        self.assertEqual(call_kwargs.get('profile_name'), 'wasabi-prod')
+        self.assertNotIn('aws_access_key_id', call_kwargs)
+
+    def test_raises_when_neither_creds_nor_profile_configured(self):
+        with patch.object(config, 'AWS_ACCESS_KEY_ID', ''), \
+             patch.object(config, 'AWS_SECRET_ACCESS_KEY', ''), \
+             patch.object(config, 'WASABI_PROFILE', ''):
+            with self.assertRaises(RuntimeError) as ctx:
+                wasabi._make_client()
+            # The error names BOTH env vars and profile so staff
+            # know what to set.
+            self.assertIn('AWS_ACCESS_KEY_ID', str(ctx.exception))
+            self.assertIn('WASABI_PROFILE', str(ctx.exception))
+
+    def test_raises_when_endpoint_missing(self):
+        with patch.object(config, 'WASABI_ENDPOINT', ''):
+            with self.assertRaises(RuntimeError) as ctx:
+                wasabi._make_client()
+            self.assertIn('WASABI_ENDPOINT', str(ctx.exception))
+
+    def test_only_partial_env_creds_falls_through_to_profile(self):
+        # AWS_ACCESS_KEY_ID without AWS_SECRET_ACCESS_KEY — don't try
+        # to use a half-set env, fall back to the profile.
+        with patch.object(config, 'AWS_ACCESS_KEY_ID', 'ak'), \
+             patch.object(config, 'AWS_SECRET_ACCESS_KEY', ''), \
+             patch.object(config, 'WASABI_PROFILE', 'fallback'):
+            wasabi._make_client()
+        call_kwargs = self.boto3_mock.Session.call_args.kwargs
+        self.assertEqual(call_kwargs.get('profile_name'), 'fallback')
+        self.assertNotIn('aws_access_key_id', call_kwargs)
+
+
 class HealthCheckTest(unittest.TestCase):
 
     def test_ok_when_head_bucket_succeeds(self):

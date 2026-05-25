@@ -96,18 +96,47 @@ def _make_client():
     """
     Build a boto3 S3 client against the configured Wasabi endpoint.
 
-    Uses the named profile in `~/.aws/config` for credentials — same
-    profile the AWS CLI used. We deliberately do NOT fall through to
-    the env-level AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY pair even
-    when those are set: production runs on the profile, and reading
-    env vars here would mask "profile broken" failures by quietly
-    using a different cred set. Raise loudly if the profile is missing.
+    Three credential paths, in priority order:
+
+      1. Explicit env vars — AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY
+         (with optional AWS_DEFAULT_REGION). This is the v1 deployment
+         shape: keys live in `.env`, loaded by systemd's
+         EnvironmentFile= directive. Preferred because it does NOT
+         depend on `~/.aws/config` being present for whatever user
+         the process happens to run as (interactive `sudo -u curation`
+         vs systemd's `User=curation` can differ on HOME, which boto3
+         uses to locate the profile file).
+
+      2. Named profile — `WASABI_PROFILE` from `~/.aws/config`. Same
+         file the AWS CLI uses. Used only if env vars above are unset.
+
+      3. boto3's default credential chain — anything else it can
+         find (instance metadata, container creds, etc.). Used only
+         if neither of the above is set.
+
+    Raises RuntimeError if no usable credentials are configured at
+    all, so the failure mode is loud rather than "uses some random
+    creds that happen to be on the host".
     """
-    if not config.WASABI_PROFILE:
-        raise RuntimeError('WASABI_PROFILE is not configured')
     if not config.WASABI_ENDPOINT:
         raise RuntimeError('WASABI_ENDPOINT is not configured')
-    session = boto3.Session(profile_name=config.WASABI_PROFILE)
+
+    session_kwargs = {}
+    if config.AWS_ACCESS_KEY_ID and config.AWS_SECRET_ACCESS_KEY:
+        session_kwargs['aws_access_key_id'] = config.AWS_ACCESS_KEY_ID
+        session_kwargs['aws_secret_access_key'] = config.AWS_SECRET_ACCESS_KEY
+        if config.AWS_DEFAULT_REGION:
+            session_kwargs['region_name'] = config.AWS_DEFAULT_REGION
+    elif config.WASABI_PROFILE:
+        session_kwargs['profile_name'] = config.WASABI_PROFILE
+    else:
+        raise RuntimeError(
+            'No Wasabi credentials configured. Set AWS_ACCESS_KEY_ID + '
+            'AWS_SECRET_ACCESS_KEY (preferred) or WASABI_PROFILE in '
+            'the service env.'
+        )
+
+    session = boto3.Session(**session_kwargs)
     return session.client(
         's3',
         endpoint_url=config.WASABI_ENDPOINT,
