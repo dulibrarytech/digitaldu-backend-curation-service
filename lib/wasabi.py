@@ -92,6 +92,18 @@ def _parse_bucket(raw):
     return bucket, prefix.strip('/') + '/'
 
 
+# AWS_PROFILE / AWS_DEFAULT_PROFILE env vars cause boto3.Session() to
+# load a named profile from `~/.aws/config` during _setup_loader() —
+# EVEN WHEN aws_access_key_id + aws_secret_access_key are passed
+# explicitly. If the env-var-named profile isn't in the config file,
+# the constructor raises ProfileNotFound before we ever get a chance
+# to use the explicit credentials. The .env shape on the curation
+# host sets AWS_DEFAULT_PROFILE alongside the actual access keys, so
+# this trips for every recovery / cron / interactive invocation
+# unless we strip those env vars during Session construction.
+_PROFILE_ENV_VARS = ('AWS_PROFILE', 'AWS_DEFAULT_PROFILE')
+
+
 def _make_client():
     """
     Build a boto3 S3 client against the configured Wasabi endpoint.
@@ -103,16 +115,12 @@ def _make_client():
          shape: keys live in `.env`, loaded by systemd's
          EnvironmentFile= directive. Preferred because it does NOT
          depend on `~/.aws/config` being present for whatever user
-         the process happens to run as (interactive `sudo -u curation`
-         vs systemd's `User=curation` can differ on HOME, which boto3
-         uses to locate the profile file).
+         the process happens to run as.
 
       2. Named profile — `WASABI_PROFILE` from `~/.aws/config`. Same
          file the AWS CLI uses. Used only if env vars above are unset.
 
-      3. boto3's default credential chain — anything else it can
-         find (instance metadata, container creds, etc.). Used only
-         if neither of the above is set.
+      3. None — RuntimeError. No silent fallback to instance metadata.
 
     Raises RuntimeError if no usable credentials are configured at
     all, so the failure mode is loud rather than "uses some random
@@ -121,22 +129,53 @@ def _make_client():
     if not config.WASABI_ENDPOINT:
         raise RuntimeError('WASABI_ENDPOINT is not configured')
 
-    session_kwargs = {}
     if config.AWS_ACCESS_KEY_ID and config.AWS_SECRET_ACCESS_KEY:
-        session_kwargs['aws_access_key_id'] = config.AWS_ACCESS_KEY_ID
-        session_kwargs['aws_secret_access_key'] = config.AWS_SECRET_ACCESS_KEY
-        if config.AWS_DEFAULT_REGION:
-            session_kwargs['region_name'] = config.AWS_DEFAULT_REGION
-    elif config.WASABI_PROFILE:
-        session_kwargs['profile_name'] = config.WASABI_PROFILE
-    else:
-        raise RuntimeError(
-            'No Wasabi credentials configured. Set AWS_ACCESS_KEY_ID + '
-            'AWS_SECRET_ACCESS_KEY (preferred) or WASABI_PROFILE in '
-            'the service env.'
-        )
+        return _client_from_keys()
+    if config.WASABI_PROFILE:
+        return _client_from_profile()
+    raise RuntimeError(
+        'No Wasabi credentials configured. Set AWS_ACCESS_KEY_ID + '
+        'AWS_SECRET_ACCESS_KEY (preferred) or WASABI_PROFILE in '
+        'the service env.'
+    )
 
-    session = boto3.Session(**session_kwargs)
+
+def _client_from_keys():
+    """
+    Build a Session from explicit access-key + secret. See
+    _PROFILE_ENV_VARS comment for why we pop those env vars around
+    the Session construction.
+
+    The pop is scoped to THIS process's os.environ; we restore the
+    original values in `finally` so other code that depends on them
+    (e.g. for unrelated boto3 clients in the same process) sees no
+    side effect. The Session object captures the creds it needs at
+    construction time — once it's built, the env vars no longer
+    affect it.
+    """
+    session_kwargs = {
+        'aws_access_key_id': config.AWS_ACCESS_KEY_ID,
+        'aws_secret_access_key': config.AWS_SECRET_ACCESS_KEY,
+    }
+    if config.AWS_DEFAULT_REGION:
+        session_kwargs['region_name'] = config.AWS_DEFAULT_REGION
+
+    saved = {k: os.environ.pop(k) for k in _PROFILE_ENV_VARS if k in os.environ}
+    try:
+        session = boto3.Session(**session_kwargs)
+    finally:
+        os.environ.update(saved)
+
+    return session.client(
+        's3',
+        endpoint_url=config.WASABI_ENDPOINT,
+        config=_RETRY_CONFIG,
+    )
+
+
+def _client_from_profile():
+    """Build a Session from a named profile in ~/.aws/config."""
+    session = boto3.Session(profile_name=config.WASABI_PROFILE)
     return session.client(
         's3',
         endpoint_url=config.WASABI_ENDPOINT,

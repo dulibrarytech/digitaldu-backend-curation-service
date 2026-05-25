@@ -254,6 +254,67 @@ class MakeClientCredentialResolutionTest(unittest.TestCase):
         self.assertEqual(call_kwargs.get('profile_name'), 'fallback')
         self.assertNotIn('aws_access_key_id', call_kwargs)
 
+    def test_pops_profile_env_vars_during_session_construction(self):
+        """
+        boto3.Session() reads AWS_PROFILE and AWS_DEFAULT_PROFILE
+        from os.environ during _setup_loader, EVEN WHEN explicit
+        access keys are passed. If the named profile isn't in
+        ~/.aws/config it raises ProfileNotFound before we can use
+        the keys we just passed. _client_from_keys must pop those
+        env vars for the call and restore them after.
+
+        This test was added after a live regression where the .env
+        on the curation host had AWS_DEFAULT_PROFILE=fernando.reyes
+        alongside the actual access keys; recovery scripts crashed
+        with ProfileNotFound until this pop was added.
+        """
+        captured = {}
+
+        def capture_env_during_construction(**kwargs):
+            captured['AWS_PROFILE'] = os.environ.get('AWS_PROFILE')
+            captured['AWS_DEFAULT_PROFILE'] = os.environ.get('AWS_DEFAULT_PROFILE')
+            client_mock = MagicMock()
+            sess = MagicMock()
+            sess.client.return_value = client_mock
+            return sess
+
+        self.boto3_mock.Session.side_effect = capture_env_during_construction
+
+        # Seed both profile env vars to simulate the live deploy.
+        with patch.object(config, 'AWS_ACCESS_KEY_ID', 'ak-env'), \
+             patch.object(config, 'AWS_SECRET_ACCESS_KEY', 'sk-env'), \
+             patch.dict(os.environ, {
+                 'AWS_PROFILE': 'fernando.reyes',
+                 'AWS_DEFAULT_PROFILE': 'fernando.reyes',
+             }, clear=False):
+            wasabi._make_client()
+            # During Session construction, both vars must be invisible.
+            self.assertIsNone(captured['AWS_PROFILE'])
+            self.assertIsNone(captured['AWS_DEFAULT_PROFILE'])
+            # After the call returns, both restored exactly.
+            self.assertEqual(os.environ['AWS_PROFILE'], 'fernando.reyes')
+            self.assertEqual(os.environ['AWS_DEFAULT_PROFILE'], 'fernando.reyes')
+
+    def test_does_not_pop_profile_env_when_using_profile_branch(self):
+        """The profile branch SHOULD see AWS_PROFILE / AWS_DEFAULT_PROFILE.
+        We only pop them on the env-keys branch (where they'd cause a
+        false ProfileNotFound on a Session we're constructing with
+        explicit creds anyway)."""
+        captured = {}
+
+        def capture_env(**kwargs):
+            captured['AWS_PROFILE'] = os.environ.get('AWS_PROFILE')
+            return MagicMock()
+
+        self.boto3_mock.Session.side_effect = capture_env
+
+        with patch.object(config, 'AWS_ACCESS_KEY_ID', ''), \
+             patch.object(config, 'AWS_SECRET_ACCESS_KEY', ''), \
+             patch.object(config, 'WASABI_PROFILE', 'wasabi-prod'), \
+             patch.dict(os.environ, {'AWS_PROFILE': 'unrelated'}, clear=False):
+            wasabi._make_client()
+        self.assertEqual(captured['AWS_PROFILE'], 'unrelated')
+
 
 class HealthCheckTest(unittest.TestCase):
 
