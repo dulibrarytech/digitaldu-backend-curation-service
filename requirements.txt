@@ -27,6 +27,9 @@ python-dotenv==1.0.1
 # Archivematica side
 paramiko==3.5.0           # replaces unmaintained pysftp
 
+# Wasabi S3 (replaces `aws s3 cp` shellout in lib/wasabi.py)
+boto3==1.35.49            # pulls botocore + s3transfer + jmespath
+
 # ArchivesSpace side
 ArchivesSnake==0.9.1      # verify latest compatible release before deploy
 python-magic==0.4.27

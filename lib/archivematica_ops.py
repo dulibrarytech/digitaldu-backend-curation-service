@@ -45,6 +45,7 @@ import threading
 import paramiko
 
 import config
+from lib import wasabi
 
 logger = logging.getLogger(__name__)
 
@@ -1067,8 +1068,15 @@ def move_to_ingested(uuid, folder):
                 os.system('cp -R ' + os.path.join(ingest_path + uuid, file_name) + ' ' + ingested)
 
             source = ingest_path + uuid + '/'
+            # 2026-05-24 data-loss fix: the prior check was
+            # `if move_result == 1` against the raw os.system return,
+            # which never matched an actual AWS CLI failure
+            # (os.system encodes exit code 1 as 256). The shutil.rmtree
+            # then ran on a failed S3 upload, silently destroying the
+            # local source. The new move_to_s3 returns 0 on success
+            # and a non-zero value on failure; rmtree ONLY runs on 0.
             move_result = move_to_s3(source, folder.replace('new_', ''))
-            if move_result == 1:
+            if move_result != 0:
                 errors.append('ERROR: Unable to move packages to wasabi s3')
             else:
                 shutil.rmtree(source)
@@ -1083,7 +1091,9 @@ def move_to_ingested(uuid, folder):
             os.system('cp -R ' + ingest_path + folder.replace('new_', '') + ' ' + ingested)
             source = ingest_path
             move_result = move_to_s3(source, '')
-            if move_result == 1:
+            # See data-loss fix comment above. Same invariant: only
+            # rmtree the local copy after the S3 upload confirms.
+            if move_result != 0:
                 errors.append('ERROR: Unable to move packages to wasabi s3')
             else:
                 shutil.rmtree(ingest_path + folder.replace('new_', ''))
@@ -1133,35 +1143,44 @@ def reset_permissions(folder):
 
 def move_to_s3(source, folder):
     """
-    Moves packages to Wasabi S3 bucket
-    @param: source
-    @param: folder
-    @returns: void
+    Upload a local directory tree to the configured Wasabi S3 bucket.
+
+    Replaces the prior `os.system('aws s3 cp ...')` shellout. The new
+    implementation lives in `lib/wasabi.py` and uses boto3 directly
+    against the same WASABI_PROFILE / WASABI_ENDPOINT / WASABI_BUCKET
+    env vars — auth is unchanged from the CLI version.
+
+    Two improvements over the shellout:
+      - Every upload logs start, per-file size + key, per-file 25/50/
+        75/100% milestones for large files, and an END summary with
+        elapsed_ms and byte total. Staff can audit any upload via
+        `journalctl -u curation-service | grep wasabi`.
+      - The return code is a clean 0/1: 0 on full success, 1 on any
+        per-file failure or transport error. Fixes the prior data-loss
+        bug where os.system's encoded shell status was misinterpreted
+        and the caller deleted the local source even on a failed upload.
+
+    @param  source — local directory to upload (recursive walk).
+    @param  folder — S3 key prefix segment for this batch.
+    @returns int   — 0 success, 1 failure. Maintains the legacy 0/1
+                     contract the caller (`move_to_ingested`) expects.
     """
-
-    errors = []
-    aws_exec = '/usr/local/bin/aws s3 cp'
-    aws_endpoint = '--endpoint-url=' + wasabi_endpoint
-    aws_bucket = wasabi_bucket
-    aws_args = '--recursive --profile ' + wasabi_profile
-    result = 1
-
-    if folder != '':
-        try:
-            aws_cmd = aws_exec + ' ' + source + ' ' + aws_endpoint + ' ' + aws_bucket + folder + ' ' + aws_args
-            result = os.system(aws_cmd)
-        except Exception as e:
-            logger.info(e)
-            errors.append('error')
-    else:
-        try:
-            aws_cmd = aws_exec + ' ' + source + ' ' + aws_endpoint + ' ' + aws_bucket + ' ' + aws_args
-            result = os.system(aws_cmd)
-        except Exception as e:
-            logger.info(e)
-            errors.append('error')
-
-    return result
+    try:
+        result = wasabi.upload_directory(source, folder)
+    except RuntimeError as e:
+        # Config-level error (missing WASABI_PROFILE etc). Surface
+        # cleanly without crashing the route handler — the caller's
+        # `if move_result != 0` branch records it in the errors[]
+        # response.
+        logger.error('move_to_s3: configuration error: %s', e)
+        return 1
+    if result['ok']:
+        return 0
+    logger.error(
+        'move_to_s3: upload not OK uploaded=%d failed=%d errors=%s',
+        result['uploaded'], result['failed'], result['errors'],
+    )
+    return 1
 
 
 def clean_up_sftp(pid, archival_package):
