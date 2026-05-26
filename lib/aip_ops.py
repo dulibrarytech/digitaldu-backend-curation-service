@@ -146,6 +146,35 @@ def copy_aip_to_wasabi(aip_uuid, repo_uuid):
         )
         return out
 
+    # Refuse if AM Storage Service env values are missing. The same
+    # philosophy: an unhandled AttributeError (or worse, a 401 from
+    # AM on every call) is harder to triage than a clean error
+    # string surfaced in the v2 AIPs dashboard. The three values
+    # are required as a set — if any is missing, AM authentication
+    # would fail. Listing each missing var in the error helps the
+    # operator know exactly what to add to the .env.
+    missing_am_env = [
+        name for name, val in (
+            ('ARCHIVEMATICA_STORAGE_API', config.ARCHIVEMATICA_STORAGE_API),
+            ('ARCHIVEMATICA_STORAGE_USERNAME', config.ARCHIVEMATICA_STORAGE_USERNAME),
+            ('ARCHIVEMATICA_STORAGE_API_KEY', config.ARCHIVEMATICA_STORAGE_API_KEY),
+        ) if not val
+    ]
+    if missing_am_env:
+        out['elapsed_ms'] = int((time.monotonic() - started) * 1000)
+        out['error'] = (
+            'Archivematica Storage Service is not configured. Missing '
+            'curation-service .env vars: ' + ', '.join(missing_am_env) + '. '
+            'These are the same values v2 uses for ARCHIVEMATICA_STORAGE_*; '
+            'copy them into the curation service .env and restart.'
+        )
+        logger.error(
+            'copy_aip_to_wasabi REFUSED - missing AM env: %s '
+            'aip_uuid=%s repo_uuid=%s',
+            ', '.join(missing_am_env), aip_uuid, repo_uuid,
+        )
+        return out
+
     # --- Step 1: AM metadata lookup -------------------------------------
     try:
         meta_res = requests.get(

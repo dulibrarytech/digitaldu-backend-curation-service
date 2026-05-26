@@ -72,6 +72,28 @@ AWS_ACCESS_KEY_ID = os.getenv('AWS_ACCESS_KEY_ID')
 AWS_SECRET_ACCESS_KEY = os.getenv('AWS_SECRET_ACCESS_KEY')
 AWS_DEFAULT_REGION = os.getenv('AWS_DEFAULT_REGION')
 
+# --- Archivematica Storage Service (AIP retrieval) ---------------------------
+# Used by lib/aip_ops.py to fetch AM-produced AIPs and pipe them to
+# Wasabi (Stage 6 + backfill). NOT used by the existing
+# archivematica_ops.py — that one handles filesystem moves, not API
+# calls. These values are conventionally the same as the v2 ingest
+# worker's ARCHIVEMATICA_STORAGE_* env values (the AM Storage Service
+# only has one set of credentials per instance), so the simplest
+# setup is to copy them from repo-backend-v2's .env into the
+# curation service's .env.
+#
+# Auth scheme is the AM Storage Service's ApiKey header:
+#   Authorization: ApiKey <username>:<api_key>
+#
+# All three are REQUIRED for the AIP endpoints (/api/v2/aip/*). If
+# any is unset, aip_ops.copy_aip_to_wasabi fails on the first HTTP
+# call with an auth/transport error rather than at import time, so
+# the failure surfaces in the v2 AIPs dashboard as a per-row error
+# string rather than crashing the worker.
+ARCHIVEMATICA_STORAGE_API = os.getenv('ARCHIVEMATICA_STORAGE_API')
+ARCHIVEMATICA_STORAGE_USERNAME = os.getenv('ARCHIVEMATICA_STORAGE_USERNAME')
+ARCHIVEMATICA_STORAGE_API_KEY = os.getenv('ARCHIVEMATICA_STORAGE_API_KEY')
+
 # --- ArchivesSpace ---------------------
 WORKSPACE = os.getenv('WORKSPACE')
 ASPACE_USERNAME = os.getenv('ASPACE_USERNAME')
