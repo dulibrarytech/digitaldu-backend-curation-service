@@ -25,6 +25,7 @@ import config
 from lib import wasabi
 from routes.qa import qa_bp
 from routes.astools import astools_bp
+from routes.aip import aip_bp
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +49,7 @@ def create_app():
 
     app.register_blueprint(qa_bp)
     app.register_blueprint(astools_bp)
+    app.register_blueprint(aip_bp)
 
     @app.route('/')
     def index():

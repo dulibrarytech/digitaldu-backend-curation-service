@@ -347,6 +347,140 @@ def upload_directory(source_dir, folder):
     }
 
 
+def upload_fileobj(file_obj, key, expected_bytes=None):
+    """
+    Stream-upload a file-like object to Wasabi at <bucket>/<base_prefix><key>.
+
+    Used by aip_ops.copy_aip_to_wasabi to pipe AM Storage Service's
+    download response straight into Wasabi without writing the
+    intermediate bytes to local disk. boto3's upload_fileobj does
+    multipart automatically once the body exceeds the configured
+    threshold (8 MB default) so multi-GB AIPs work cleanly.
+
+    Args:
+        file_obj:        file-like with .read() (e.g. requests.Response.raw)
+        key:             Wasabi object key (no bucket prefix; this fn
+                         applies the WASABI_BUCKET base_prefix)
+        expected_bytes:  optional int — used only for progress logging.
+                         If unknown, pass None and the callback skips
+                         milestone logs.
+
+    Returns:
+        {'bucket': str, 'key': str, 'bytes': int | None}
+
+        Bytes value is best-effort — for a streamed upload boto3
+        doesn't return the final count, so we report expected_bytes
+        when provided and None otherwise. Callers that need the
+        authoritative size should head_object() after the upload.
+    """
+    bucket, base_prefix = _parse_bucket(config.WASABI_BUCKET)
+    full_key = (base_prefix + key) if base_prefix else key
+    client = _make_client()
+
+    callback = (
+        _FileProgress(full_key, expected_bytes) if expected_bytes else None
+    )
+
+    logger.info(
+        'wasabi upload_fileobj START key=%s expected_bytes=%s',
+        full_key, expected_bytes,
+    )
+    client.upload_fileobj(file_obj, bucket, full_key, Callback=callback)
+    logger.info('wasabi upload_fileobj END key=%s', full_key)
+    return {
+        'bucket': bucket,
+        'key': full_key,
+        'bytes': expected_bytes,
+    }
+
+
+def head_object(key):
+    """
+    HEAD a Wasabi object. Returns:
+        {'exists': bool, 'bucket': str, 'key': str,
+         'content_length': int | None}
+
+    Used by aip_ops as the idempotency probe before a copy — a key
+    that already exists at the expected size means we can skip the
+    upload entirely.
+
+    Distinguishes "not there" (returns exists=False, no raise) from
+    transport / auth errors (raises). 403 Forbidden is treated as
+    "exists but not accessible" → exists=True with content_length=None
+    so the caller can choose to skip or warn rather than re-upload.
+    """
+    bucket, base_prefix = _parse_bucket(config.WASABI_BUCKET)
+    full_key = (base_prefix + key) if base_prefix else key
+    client = _make_client()
+    try:
+        res = client.head_object(Bucket=bucket, Key=full_key)
+        return {
+            'exists': True,
+            'bucket': bucket,
+            'key': full_key,
+            'content_length': res.get('ContentLength'),
+        }
+    except ClientError as e:
+        code = e.response.get('Error', {}).get('Code')
+        # 404 (NoSuchKey) on head_object surfaces with Error.Code='404'
+        # in Wasabi/boto3. Treat as a clean "not there".
+        if code in ('404', 'NoSuchKey', 'NotFound'):
+            return {
+                'exists': False,
+                'bucket': bucket,
+                'key': full_key,
+                'content_length': None,
+            }
+        # 403 — bucket policy issue or temporary auth glitch. We
+        # surface the assertion that something IS there (defensive
+        # default) but with no size info; the caller can decide
+        # whether that's enough to skip the upload.
+        if code == '403':
+            return {
+                'exists': True,
+                'bucket': bucket,
+                'key': full_key,
+                'content_length': None,
+            }
+        raise
+
+
+def delete_object(key):
+    """
+    Delete a Wasabi object. Used by aip_ops to clear a partial /
+    size-mismatched object before re-uploading. Idempotent — Wasabi
+    returns 204 whether or not the key was actually there.
+    """
+    bucket, base_prefix = _parse_bucket(config.WASABI_BUCKET)
+    full_key = (base_prefix + key) if base_prefix else key
+    client = _make_client()
+    client.delete_object(Bucket=bucket, Key=full_key)
+    logger.info('wasabi delete_object key=%s', full_key)
+
+
+def generate_presigned_url(key, ttl_seconds=900):
+    """
+    Mint a presigned GET URL for a Wasabi key. Used by the dashboard
+    download flow — the browser is 302-redirected to the returned URL
+    and downloads bytes directly from Wasabi.
+
+    ttl_seconds is clamped at the route layer to [60, 3600]; here we
+    just pass it through to boto3 so a misconfigured caller from a
+    different surface still works.
+
+    Returns the URL string. Raises on any cred / config failure so
+    the caller (the route) can return ok=false with the message.
+    """
+    bucket, base_prefix = _parse_bucket(config.WASABI_BUCKET)
+    full_key = (base_prefix + key) if base_prefix else key
+    client = _make_client()
+    return client.generate_presigned_url(
+        'get_object',
+        Params={'Bucket': bucket, 'Key': full_key},
+        ExpiresIn=ttl_seconds,
+    )
+
+
 def health_check():
     """
     Probe Wasabi reachability + bucket auth. Called once at app

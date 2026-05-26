@@ -1,0 +1,149 @@
+# Copyright 2026 University of Denver
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""
+AIP-store routes — v2 ingest Stage 6 entry points.
+
+The repo-backend-v2 ingester calls these two endpoints to copy AM-
+produced AIP packages from Archivematica Storage Service to Wasabi S3
+(replacing the one-time DuraCloud → Wasabi migration that produced
+tbl_aip_store's ~20k legacy rows). The Node side stays language-
+agnostic; all Wasabi credential handling + boto3 work stays here.
+
+Endpoints:
+
+    POST /api/v2/aip/copy-to-wasabi
+        Body: {"aip_uuid": "<am-uuid>", "repo_uuid": "<repo-pid>"}
+        Returns: 200 with {ok, bucket, key, bytes, elapsed_ms, error?}
+
+        Synchronous. Downloads the AIP from AM Storage Service via
+        /api/v2/file/<aip_uuid>/download/ and streams to Wasabi via
+        boto3 upload_fileobj. Idempotent: a second call for an
+        aip_uuid whose key already exists in Wasabi at the expected
+        size is a no-op that still returns ok=true with the existing
+        metadata. This makes Stage 6 retries safe.
+
+    POST /api/v2/aip/presigned-url
+        Body: {"key": "<wasabi-object-key>", "ttl_seconds": 900}
+        Returns: 200 with {ok, url, expires_at, error?}
+
+        Mints a short-lived presigned GET URL. The dashboard
+        download flow 302-redirects the browser to this URL so the
+        actual AIP bytes never transit repo-backend-v2 or the curation
+        service.
+
+Auth: shared X-API-Key (same scheme as /api/v2/qa/).
+"""
+
+import logging
+import time
+from datetime import datetime, timezone, timedelta
+
+from flask import Blueprint, jsonify, request
+
+from auth import require_api_key_qa
+from lib import wasabi
+from lib import aip_ops
+
+logger = logging.getLogger(__name__)
+
+aip_bp = Blueprint('aip', __name__, url_prefix='/api/v2/aip')
+
+
+@aip_bp.route('/copy-to-wasabi', methods=['POST'])
+@require_api_key_qa
+def copy_to_wasabi():
+    """
+    Copy a single AM-produced AIP from Archivematica Storage Service
+    into Wasabi. See module docstring for the wire contract.
+
+    Errors return 200 with ok=false rather than non-2xx so the Node
+    side can distinguish "your call was bad" (400) from "we tried and
+    it didn't work" (200 + ok=false). This matches the response
+    shape the existing health/wasabi endpoint already uses.
+    """
+    body = request.get_json(silent=True) or {}
+    aip_uuid = (body.get('aip_uuid') or '').strip()
+    repo_uuid = (body.get('repo_uuid') or '').strip()
+    if not aip_uuid:
+        return jsonify({'ok': False, 'error': 'aip_uuid is required'}), 400
+    if not repo_uuid:
+        return jsonify({'ok': False, 'error': 'repo_uuid is required'}), 400
+
+    started = time.monotonic()
+    try:
+        result = aip_ops.copy_aip_to_wasabi(aip_uuid=aip_uuid, repo_uuid=repo_uuid)
+    except Exception as e:
+        # aip_ops.copy_aip_to_wasabi catches all expected failure
+        # modes and returns a result dict; if something unexpected
+        # blows up we still want to return 200 + ok=false so the
+        # Node side records the row as failed (rather than 500-ing
+        # and pushing the ingester into a transport-error retry
+        # loop).
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        logger.exception(
+            'copy_to_wasabi: unhandled exception aip_uuid=%s repo_uuid=%s',
+            aip_uuid, repo_uuid,
+        )
+        return jsonify({
+            'ok': False,
+            'bucket': None,
+            'key': None,
+            'bytes': None,
+            'elapsed_ms': elapsed_ms,
+            'error': f'unhandled: {e}',
+        }), 200
+
+    return jsonify(result), 200
+
+
+@aip_bp.route('/presigned-url', methods=['POST'])
+@require_api_key_qa
+def presigned_url():
+    """
+    Mint a presigned GET URL for an AIP key in Wasabi. The dashboard
+    download flow 302-redirects to this URL; the browser pulls the
+    bytes directly from Wasabi without transiting either service.
+
+    `ttl_seconds` is clamped to the [60, 3600] range. The Node config
+    default is 900 (15 min) — short enough that a leaked URL has
+    minimal blast radius but long enough for a staff member to
+    actually click the download link.
+    """
+    body = request.get_json(silent=True) or {}
+    key = (body.get('key') or '').strip()
+    ttl_seconds_raw = body.get('ttl_seconds') or 900
+    try:
+        ttl_seconds = int(ttl_seconds_raw)
+    except (TypeError, ValueError):
+        return jsonify({'ok': False, 'error': 'ttl_seconds must be an integer'}), 400
+    ttl_seconds = max(60, min(3600, ttl_seconds))
+
+    if not key:
+        return jsonify({'ok': False, 'error': 'key is required'}), 400
+
+    try:
+        url = wasabi.generate_presigned_url(key, ttl_seconds=ttl_seconds)
+    except Exception as e:
+        logger.exception('presigned_url: failed for key=%s', key)
+        return jsonify({'ok': False, 'error': str(e)}), 200
+
+    expires_at = (
+        datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds)
+    ).isoformat()
+    return jsonify({
+        'ok': True,
+        'url': url,
+        'expires_at': expires_at,
+    }), 200
