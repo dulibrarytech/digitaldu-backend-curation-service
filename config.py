@@ -46,6 +46,22 @@ SFTP_PWD = os.getenv('SFTP_PWD')
 SFTP_REMOTE_PATH = os.getenv('SFTP_REMOTE_PATH')
 WASABI_ENDPOINT = os.getenv('WASABI_ENDPOINT')
 WASABI_BUCKET = os.getenv('WASABI_BUCKET')
+# Separate bucket for AIP-store operations (see lib/aip_ops.py +
+# routes/aip.py). DU's deployment uses TWO Wasabi buckets:
+#
+#   WASABI_BUCKET     → SFTP-staging archive (move_to_ingested writes
+#                       here; staff `<package>/` folders land at the
+#                       configured base prefix).
+#   WASABI_AIP_BUCKET → AM-produced AIP packages (Stage 6 writes here;
+#                       legacy migration's ~20k rows already live here).
+#
+# Conventional value in prod:
+#   WASABI_AIP_BUCKET=s3://library-repository/aip-store/
+#
+# Required for /api/v2/aip/* endpoints. If unset, those routes
+# refuse with ok=false rather than silently routing AIPs to the
+# SFTP-staging bucket.
+WASABI_AIP_BUCKET = os.getenv('WASABI_AIP_BUCKET')
 WASABI_PROFILE = os.getenv('WASABI_PROFILE')
 UID = os.getenv('UID')
 GID = os.getenv('GID')

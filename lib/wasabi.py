@@ -347,7 +347,27 @@ def upload_directory(source_dir, folder):
     }
 
 
-def upload_fileobj(file_obj, key, expected_bytes=None):
+def _resolve_bucket(bucket_config):
+    """
+    Resolve which raw WASABI_BUCKET-style value to parse.
+
+    bucket_config is the caller-supplied override (typically
+    config.WASABI_AIP_BUCKET for AIP-store operations). When None
+    or empty, we fall back to config.WASABI_BUCKET for backward
+    compatibility — historic callers (upload_directory,
+    health_check) don't pass an override and keep targeting the
+    SFTP-staging bucket they always have.
+
+    The hard requirement is "_parse_bucket gets a non-empty
+    string"; the choice of WHICH string is the routing decision.
+    Centralizing this here keeps the four AIP-touching functions
+    from each re-implementing the same fallback rule.
+    """
+    raw = bucket_config if bucket_config else config.WASABI_BUCKET
+    return _parse_bucket(raw)
+
+
+def upload_fileobj(file_obj, key, expected_bytes=None, bucket_config=None):
     """
     Stream-upload a file-like object to Wasabi at <bucket>/<base_prefix><key>.
 
@@ -360,10 +380,16 @@ def upload_fileobj(file_obj, key, expected_bytes=None):
     Args:
         file_obj:        file-like with .read() (e.g. requests.Response.raw)
         key:             Wasabi object key (no bucket prefix; this fn
-                         applies the WASABI_BUCKET base_prefix)
+                         applies the resolved base_prefix)
         expected_bytes:  optional int — used only for progress logging.
                          If unknown, pass None and the callback skips
                          milestone logs.
+        bucket_config:   optional override of which WASABI_*BUCKET env
+                         value to use. AIP callers pass
+                         config.WASABI_AIP_BUCKET so AIPs route to the
+                         right bucket; legacy callers (none — kept for
+                         symmetry) leave it None to target
+                         config.WASABI_BUCKET.
 
     Returns:
         {'bucket': str, 'key': str, 'bytes': int | None}
@@ -373,7 +399,7 @@ def upload_fileobj(file_obj, key, expected_bytes=None):
         when provided and None otherwise. Callers that need the
         authoritative size should head_object() after the upload.
     """
-    bucket, base_prefix = _parse_bucket(config.WASABI_BUCKET)
+    bucket, base_prefix = _resolve_bucket(bucket_config)
     full_key = (base_prefix + key) if base_prefix else key
     client = _make_client()
 
@@ -394,7 +420,7 @@ def upload_fileobj(file_obj, key, expected_bytes=None):
     }
 
 
-def head_object(key):
+def head_object(key, bucket_config=None):
     """
     HEAD a Wasabi object. Returns:
         {'exists': bool, 'bucket': str, 'key': str,
@@ -408,8 +434,12 @@ def head_object(key):
     transport / auth errors (raises). 403 Forbidden is treated as
     "exists but not accessible" → exists=True with content_length=None
     so the caller can choose to skip or warn rather than re-upload.
+
+    `bucket_config` mirrors upload_fileobj — AIP callers pass
+    config.WASABI_AIP_BUCKET; otherwise we fall back to
+    config.WASABI_BUCKET.
     """
-    bucket, base_prefix = _parse_bucket(config.WASABI_BUCKET)
+    bucket, base_prefix = _resolve_bucket(bucket_config)
     full_key = (base_prefix + key) if base_prefix else key
     client = _make_client()
     try:
@@ -445,20 +475,22 @@ def head_object(key):
         raise
 
 
-def delete_object(key):
+def delete_object(key, bucket_config=None):
     """
     Delete a Wasabi object. Used by aip_ops to clear a partial /
     size-mismatched object before re-uploading. Idempotent — Wasabi
     returns 204 whether or not the key was actually there.
+
+    `bucket_config` mirrors upload_fileobj.
     """
-    bucket, base_prefix = _parse_bucket(config.WASABI_BUCKET)
+    bucket, base_prefix = _resolve_bucket(bucket_config)
     full_key = (base_prefix + key) if base_prefix else key
     client = _make_client()
     client.delete_object(Bucket=bucket, Key=full_key)
     logger.info('wasabi delete_object key=%s', full_key)
 
 
-def generate_presigned_url(key, ttl_seconds=900):
+def generate_presigned_url(key, ttl_seconds=900, bucket_config=None):
     """
     Mint a presigned GET URL for a Wasabi key. Used by the dashboard
     download flow — the browser is 302-redirected to the returned URL
@@ -468,10 +500,14 @@ def generate_presigned_url(key, ttl_seconds=900):
     just pass it through to boto3 so a misconfigured caller from a
     different surface still works.
 
+    `bucket_config` mirrors upload_fileobj — AIP callers pass
+    config.WASABI_AIP_BUCKET so the presigned URL points at the
+    same bucket Stage 6 uploaded to.
+
     Returns the URL string. Raises on any cred / config failure so
     the caller (the route) can return ok=false with the message.
     """
-    bucket, base_prefix = _parse_bucket(config.WASABI_BUCKET)
+    bucket, base_prefix = _resolve_bucket(bucket_config)
     full_key = (base_prefix + key) if base_prefix else key
     client = _make_client()
     return client.generate_presigned_url(

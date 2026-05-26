@@ -127,6 +127,25 @@ def copy_aip_to_wasabi(aip_uuid, repo_uuid):
         'repo_uuid': repo_uuid,
     }
 
+    # Refuse if the AIP-store bucket isn't configured. Falling back
+    # to WASABI_BUCKET here would silently route AIPs into the SFTP-
+    # staging archive (the curation host has BOTH buckets in play and
+    # they target different storage tiers). Better to fail loudly so
+    # the operator sets WASABI_AIP_BUCKET than to spend a multi-GB
+    # upload writing to the wrong place.
+    if not config.WASABI_AIP_BUCKET:
+        out['elapsed_ms'] = int((time.monotonic() - started) * 1000)
+        out['error'] = (
+            'WASABI_AIP_BUCKET is not configured. Set it in the curation '
+            'service .env (e.g. s3://library-repository/aip-store/) and '
+            'restart before running Stage 6 / the backfill.'
+        )
+        logger.error(
+            'copy_aip_to_wasabi REFUSED — WASABI_AIP_BUCKET unset '
+            'aip_uuid=%s repo_uuid=%s', aip_uuid, repo_uuid,
+        )
+        return out
+
     # --- Step 1: AM metadata lookup -------------------------------------
     try:
         meta_res = requests.get(
@@ -183,9 +202,10 @@ def copy_aip_to_wasabi(aip_uuid, repo_uuid):
     # --- Step 2: Idempotency probe --------------------------------------
     # If the object already exists at the expected size, short-circuit.
     # This makes Stage 6 retries safe (a crashed mid-upload comes back
-    # here and no-ops).
+    # here and no-ops). bucket_config pins this to WASABI_AIP_BUCKET so
+    # we're checking the AIP-store bucket, not the SFTP-staging bucket.
     try:
-        head = wasabi.head_object(key)
+        head = wasabi.head_object(key, bucket_config=config.WASABI_AIP_BUCKET)
     except Exception as e:
         out['elapsed_ms'] = int((time.monotonic() - started) * 1000)
         out['error'] = f'wasabi head_object failed: {e}'
@@ -221,7 +241,7 @@ def copy_aip_to_wasabi(aip_uuid, repo_uuid):
             key, existing_size, expected_bytes,
         )
         try:
-            wasabi.delete_object(key)
+            wasabi.delete_object(key, bucket_config=config.WASABI_AIP_BUCKET)
         except Exception as e:
             out['elapsed_ms'] = int((time.monotonic() - started) * 1000)
             out['error'] = f'wasabi delete of stale object failed: {e}'
@@ -243,6 +263,7 @@ def copy_aip_to_wasabi(aip_uuid, repo_uuid):
                 uploaded = wasabi.upload_fileobj(
                     dl.raw, key,
                     expected_bytes=expected_bytes,
+                    bucket_config=config.WASABI_AIP_BUCKET,
                 )
             except ClientError as e:
                 code = e.response.get('Error', {}).get('Code', 'unknown')

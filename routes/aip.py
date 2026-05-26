@@ -52,6 +52,8 @@ from datetime import datetime, timezone, timedelta
 
 from flask import Blueprint, jsonify, request
 
+import config
+
 from auth import require_api_key_qa
 from lib import wasabi
 from lib import aip_ops
@@ -133,8 +135,25 @@ def presigned_url():
     if not key:
         return jsonify({'ok': False, 'error': 'key is required'}), 400
 
+    # AIP presigned URLs must point at the AIP-store bucket, not the
+    # SFTP-staging bucket. Refuse cleanly if the operator hasn't set
+    # WASABI_AIP_BUCKET — same gate aip_ops.copy_aip_to_wasabi uses.
+    if not config.WASABI_AIP_BUCKET:
+        return jsonify({
+            'ok': False,
+            'error': (
+                'WASABI_AIP_BUCKET is not configured. Set it in the '
+                'curation service .env and restart before issuing '
+                'AIP download URLs.'
+            ),
+        }), 200
+
     try:
-        url = wasabi.generate_presigned_url(key, ttl_seconds=ttl_seconds)
+        url = wasabi.generate_presigned_url(
+            key,
+            ttl_seconds=ttl_seconds,
+            bucket_config=config.WASABI_AIP_BUCKET,
+        )
     except Exception as e:
         logger.exception('presigned_url: failed for key=%s', key)
         return jsonify({'ok': False, 'error': str(e)}), 200

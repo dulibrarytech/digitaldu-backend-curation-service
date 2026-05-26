@@ -324,6 +324,107 @@ class MakeClientCredentialResolutionTest(unittest.TestCase):
         self.assertEqual(captured['AWS_PROFILE'], 'unrelated')
 
 
+class BucketRoutingTest(unittest.TestCase):
+    """
+    Pins the dual-bucket routing introduced by curration-api-modified-5:
+    AIP operations target WASABI_AIP_BUCKET; the legacy upload_directory
+    + health_check paths still target WASABI_BUCKET.
+
+    Without this contract, AIP uploads would silently land in the
+    SFTP-staging bucket on deployments that configure both buckets.
+    """
+
+    def setUp(self):
+        # Three distinct values so we can tell which bucket each call
+        # routed to by inspecting the bucket arg boto3 received.
+        self._aip_raw = 's3://aip-bucket/aip-store/'
+        self._staging_raw = 's3://staging-bucket/'
+
+    def _fake_client(self):
+        c = MagicMock()
+        c.upload_fileobj = MagicMock()
+        c.head_object = MagicMock(return_value={'ContentLength': 0})
+        c.delete_object = MagicMock()
+        c.generate_presigned_url = MagicMock(return_value='https://signed.example/')
+        return c
+
+    def test_upload_fileobj_routes_to_bucket_config_when_set(self):
+        client = self._fake_client()
+        with patch.object(config, 'WASABI_BUCKET', self._staging_raw):
+            with patch.object(wasabi, '_make_client', return_value=client):
+                wasabi.upload_fileobj(
+                    MagicMock(),
+                    'thing.7z',
+                    bucket_config=self._aip_raw,
+                )
+        # boto3.upload_fileobj(file, bucket, key, ...) — second arg is
+        # the bucket, third is the key.
+        args = client.upload_fileobj.call_args
+        self.assertEqual(args.args[1], 'aip-bucket')
+        self.assertEqual(args.args[2], 'aip-store/thing.7z')
+
+    def test_upload_fileobj_falls_back_to_wasabi_bucket_when_override_is_none(self):
+        # Backward compat: legacy callers that don't pass bucket_config
+        # keep targeting WASABI_BUCKET exactly as they did before.
+        client = self._fake_client()
+        with patch.object(config, 'WASABI_BUCKET', self._staging_raw):
+            with patch.object(wasabi, '_make_client', return_value=client):
+                wasabi.upload_fileobj(MagicMock(), 'thing.7z')
+        self.assertEqual(client.upload_fileobj.call_args.args[1], 'staging-bucket')
+
+    def test_head_object_honors_bucket_config(self):
+        client = self._fake_client()
+        with patch.object(config, 'WASABI_BUCKET', self._staging_raw):
+            with patch.object(wasabi, '_make_client', return_value=client):
+                wasabi.head_object('thing.7z', bucket_config=self._aip_raw)
+        call = client.head_object.call_args
+        self.assertEqual(call.kwargs['Bucket'], 'aip-bucket')
+        self.assertEqual(call.kwargs['Key'], 'aip-store/thing.7z')
+
+    def test_delete_object_honors_bucket_config(self):
+        client = self._fake_client()
+        with patch.object(config, 'WASABI_BUCKET', self._staging_raw):
+            with patch.object(wasabi, '_make_client', return_value=client):
+                wasabi.delete_object('thing.7z', bucket_config=self._aip_raw)
+        call = client.delete_object.call_args
+        self.assertEqual(call.kwargs['Bucket'], 'aip-bucket')
+        self.assertEqual(call.kwargs['Key'], 'aip-store/thing.7z')
+
+    def test_presigned_url_honors_bucket_config(self):
+        client = self._fake_client()
+        with patch.object(config, 'WASABI_BUCKET', self._staging_raw):
+            with patch.object(wasabi, '_make_client', return_value=client):
+                wasabi.generate_presigned_url(
+                    'thing.7z',
+                    ttl_seconds=120,
+                    bucket_config=self._aip_raw,
+                )
+        call = client.generate_presigned_url.call_args
+        self.assertEqual(call.kwargs['Params']['Bucket'], 'aip-bucket')
+        self.assertEqual(call.kwargs['Params']['Key'], 'aip-store/thing.7z')
+        self.assertEqual(call.kwargs['ExpiresIn'], 120)
+
+    def test_upload_directory_continues_to_use_wasabi_bucket(self):
+        # Regression: the legacy SFTP-staging path must NOT pick up the
+        # AIP bucket. upload_directory has no bucket_config param at
+        # all; it reads config.WASABI_BUCKET directly.
+        import tempfile, shutil
+        tmp = tempfile.mkdtemp()
+        try:
+            with open(os.path.join(tmp, 'a.txt'), 'w') as f:
+                f.write('hello')
+            client = self._fake_client()
+            client.upload_file = MagicMock()
+            with patch.object(config, 'WASABI_BUCKET', self._staging_raw):
+                with patch.object(config, 'WASABI_AIP_BUCKET', self._aip_raw):
+                    with patch.object(wasabi, '_make_client', return_value=client):
+                        wasabi.upload_directory(tmp, 'col')
+            # upload_file(local, bucket, key, ...) — second arg is bucket.
+            self.assertEqual(client.upload_file.call_args.args[1], 'staging-bucket')
+        finally:
+            shutil.rmtree(tmp)
+
+
 class HealthCheckTest(unittest.TestCase):
 
     def test_ok_when_head_bucket_succeeds(self):
