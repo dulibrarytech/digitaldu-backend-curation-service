@@ -40,6 +40,7 @@ import os
 import posixpath
 import shutil
 import stat
+import subprocess
 import threading
 
 import paramiko
@@ -64,6 +65,33 @@ wasabi_profile = config.WASABI_PROFILE
 uid = config.UID
 gid = config.GID
 errors_file = config.ERRORS_FILE
+
+
+# --- subprocess helper -------------------------------------------------------
+
+def _run(argv):
+    """Run an external command with NO shell.
+
+    Replaces the prior `os.system('cp -R ' + folder + ...)` form. Passing an
+    explicit argv list with shell=False means folder/uuid values reach
+    cp/rm/chown as single literal arguments — shell metacharacters in a
+    folder name (`;`, `|`, `$(...)`, spaces, ...) can no longer break out
+    into command execution. Callers pass a `--` end-of-options marker before
+    the operands so a value beginning with `-` can't be read as a flag.
+
+    The exit status is logged but not raised on, matching the legacy
+    os.system behavior (which discarded the status — callers that care, like
+    move_to_ingested's S3 gate, track success through other means). Returns
+    the CompletedProcess so a caller can inspect returncode if needed.
+    """
+    logger.info('exec: %s', ' '.join(argv))
+    result = subprocess.run(argv, capture_output=True, text=True, check=False)
+    if result.returncode != 0:
+        logger.warning(
+            'command exited non-zero (rc=%s): %s | stderr=%s',
+            result.returncode, ' '.join(argv), (result.stderr or '').strip(),
+        )
+    return result
 
 
 # --- paramiko helpers (replacing pysftp's put_r / walktree / cd / execute) --
@@ -1013,15 +1041,49 @@ def check_sftp(uuid, local_file_count):
         remote_package_size_bytes = _sftp_dir_size(sftp, remote_package)
         remote_package_size = _human_size(remote_package_size_bytes)
 
+        # Local total for the same uuid staging dir (002-ingest/<uuid> —
+        # the source move_to_sftp pushes to sftp_path/<uuid>). The Node
+        # side divides remote_package_size_bytes by this to render a byte-
+        # accurate upload %, which advances smoothly even for a single
+        # large file (the remote file grows during the put). 0 when the
+        # local dir is gone/unreadable — the caller treats that as
+        # "unknown total" and falls back to the file-count readout.
+        local_package_size_bytes = _local_dir_size(ingest_path + uuid)
+
         if int(local_file_count) == remote_file_count:
             return dict(message='upload_complete', data=[file_names, remote_file_count])
 
         return dict(message='in_progress', file_names=file_names, remote_file_count=remote_file_count,
                     local_file_count=local_file_count,
-                    remote_package_size=remote_package_size)
+                    remote_package_size=remote_package_size,
+                    remote_package_size_bytes=remote_package_size_bytes,
+                    local_package_size_bytes=local_package_size_bytes)
     finally:
         sftp.close()
         client.close()
+
+
+def _local_dir_size(path):
+    """Sum of regular-file sizes under a local directory, in bytes.
+
+    Used by check_sftp to report the upload *total* for the byte-accurate
+    progress %. Symlinks are skipped (match get_total_batch_size). Returns
+    0 if the path is missing or unreadable — the Node side treats a 0
+    total as "unknown" and the dashboard falls back to the file count.
+    """
+    total = 0
+    try:
+        for dirpath, _dirnames, filenames in os.walk(path):
+            for f in filenames:
+                fp = os.path.join(dirpath, f)
+                if not os.path.islink(fp):
+                    try:
+                        total += os.path.getsize(fp)
+                    except OSError:
+                        pass
+    except Exception as e:  # noqa: BLE001
+        logger.info('local dir size failed for %s: %s', path, e)
+    return total
 
 
 def _human_size(num_bytes):
@@ -1065,7 +1127,7 @@ def move_to_ingested(uuid, folder):
             file_names = [f for f in os.listdir(ingest_path + uuid) if not f.startswith('.')]
 
             for file_name in file_names:
-                os.system('cp -R ' + os.path.join(ingest_path + uuid, file_name) + ' ' + ingested)
+                _run(['cp', '-R', '--', os.path.join(ingest_path + uuid, file_name), ingested])
 
             source = ingest_path + uuid + '/'
             # 2026-05-24 data-loss fix: the prior check was
@@ -1088,7 +1150,7 @@ def move_to_ingested(uuid, folder):
 
         try:
             shutil.move(ingest_path + uuid, ingest_path + folder.replace('new_', ''))
-            os.system('cp -R ' + ingest_path + folder.replace('new_', '') + ' ' + ingested)
+            _run(['cp', '-R', '--', ingest_path + folder.replace('new_', ''), ingested])
             source = ingest_path
             move_result = move_to_s3(source, '')
             # See data-loss fix comment above. Same invariant: only
@@ -1098,7 +1160,7 @@ def move_to_ingested(uuid, folder):
             else:
                 shutil.rmtree(ingest_path + folder.replace('new_', ''))
 
-            os.system('rm -R ' + ingest_path + folder)
+            _run(['rm', '-R', '--', ingest_path + folder])
         except Exception as e:
             logger.info(e)
             return errors.append('ERROR: Unable to move folder (move_to_ingested)')
@@ -1132,8 +1194,7 @@ def reset_permissions(folder):
     message = 'Permissions changed'
 
     try:
-        cmd = 'chown -R ' + uid + ':' + gid + ' ' + ready_path + folder
-        os.system(cmd)
+        _run(['chown', '-R', '--', uid + ':' + gid, ready_path + folder])
     except Exception as e:
         logger.info(e)
         message = 'Unable to reset permissions'

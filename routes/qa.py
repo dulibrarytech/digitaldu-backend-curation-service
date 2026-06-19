@@ -36,6 +36,7 @@ from flask import Blueprint, request
 
 from auth import require_api_key_qa
 from lib import archivematica_ops as ops
+from lib.safe_names import validate_segment
 
 qa_bp = Blueprint('qa', __name__, url_prefix='/api/v2/qa')
 
@@ -169,9 +170,19 @@ def move_to_ingest():
         return json.dumps(['Bad Request: Missing pid param.']), 400
     if folder is None:
         return json.dumps(['Bad Request: Missing folder param.']), 400
-    # Note: legacy did not check `package`; preserved here so existing
+    # Validate path segments before they are joined onto READY_PATH /
+    # INGEST_PATH for the filesystem move (traversal guard).
+    err = validate_segment(uuid, 'uuid') or validate_segment(folder, 'folder')
+    if err:
+        return json.dumps(['Bad Request: ' + err]), 400
+    # Note: legacy did not require `package`; preserved here so existing
     # callers don't regress. ops.move_to_ingest tolerates None package
-    # by surfacing the error inside the move itself.
+    # by surfacing the error inside the move itself — but if one IS
+    # supplied, it must be a safe segment (it becomes a directory name).
+    if package is not None:
+        pkg_err = validate_segment(package, 'package')
+        if pkg_err:
+            return json.dumps(['Bad Request: ' + pkg_err]), 400
     results = ops.move_to_ingest(uuid, folder, package)
     status = 409 if results.get('result') == 'move_in_progress' else 200
     return json.dumps(results), status
@@ -225,6 +236,15 @@ def move_from_ingest_to_ready():
     if package is None:
         return json.dumps(['Bad Request: Missing package param.']), 400
 
+    # Traversal guard: all three become directory-name components of the
+    # 002-ingest/<uuid>/<package> -> 001-ready/<folder>/<package> move.
+    # `actor` is audit-only (never a path), so it is not validated here.
+    err = (validate_segment(uuid, 'uuid')
+           or validate_segment(folder, 'folder')
+           or validate_segment(package, 'package'))
+    if err:
+        return json.dumps(['Bad Request: ' + err]), 400
+
     results = ops.move_from_ingest_to_ready(uuid, folder, package, actor=actor)
 
     # Map the structured result to an HTTP status the Node side can
@@ -271,7 +291,18 @@ def move_to_ingested():
     folder = request.args.get('folder')
     uuid = request.args.get('uuid')
     if folder == 'collection':
+        # Sentinel: resolve to the real batch folder name recorded on disk.
         folder = ops.get_collection_folder_name()
+    # Validate AFTER the sentinel swap — `folder` and `uuid` are joined onto
+    # INGEST_PATH / INGESTED_PATH and passed to cp/rm inside
+    # ops.move_to_ingested, so they must be safe single path segments.
+    err = validate_segment(uuid, 'uuid') or validate_segment(folder, 'folder')
+    if err:
+        return json.dumps(['Bad Request: ' + err]), 400
+    # Guard the `new_`-strip edge: a folder of exactly 'new_' would strip to
+    # '' and make ops operate on the INGEST_PATH/INGESTED_PATH base dir.
+    if not folder.replace('new_', '').strip():
+        return json.dumps(['Bad Request: folder resolves to an empty name']), 400
     results = ops.move_to_ingested(uuid, folder)
     return json.dumps(results), 200
 
@@ -280,8 +311,11 @@ def move_to_ingested():
 @require_api_key_qa
 def reset_permissions():
     folder = request.args.get('folder')
-    if folder is None:
-        return json.dumps(['Bad Request.']), 400
+    # `folder` is joined onto READY_PATH and passed to chown inside
+    # ops.reset_permissions — validate it as a safe single path segment.
+    err = validate_segment(folder, 'folder')
+    if err:
+        return json.dumps(['Bad Request: ' + err]), 400
     is_reset = ops.reset_permissions(folder)
     return json.dumps(is_reset), 200
 
