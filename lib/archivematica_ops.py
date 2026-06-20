@@ -984,25 +984,78 @@ def move_from_ingest_to_ready(uuid, folder, package, actor=None):
         _unlock_uuid(uuid, owner='move_from_ingest_to_ready')
 
 
-def move_to_sftp(pid):
-    """"
-    Moves folder to Archivematica sftp via ssh
-    @param: pid
-    @returns: void
+# Sentinel dropped into the local 002-ingest/<uuid> staging dir by the
+# background upload worker when the SFTP put fails. check_sftp surfaces it
+# as message='upload_failed' so the Node poller can halt the row at once
+# instead of waiting out the upload timeout. A dotfile in this dir, like
+# the existing .lock — it travels with the directory and AM ignores it.
+UPLOAD_ERROR_MARKER = '.upload_error'
+
+
+def _upload_error_marker_path(pid):
+    """Path of the per-package upload-error sentinel (see UPLOAD_ERROR_MARKER)."""
+    return os.path.join(ingest_path + pid, UPLOAD_ERROR_MARKER)
+
+
+def _do_sftp_put(pid):
+    """Background worker: the actual recursive SFTP put.
+
+    Runs in the daemon thread started by move_to_sftp so the HTTP request
+    returns immediately and the Node side can poll check_sftp for live byte
+    progress while the transfer runs. Opens its own SFTP connection (the
+    request's connection is long gone by the time this executes). On failure
+    it writes the .upload_error marker into the local staging dir; check_sftp
+    reports that to the poller, which halts the row.
     """
-
-    errors = []
-
-    client, sftp = _open_sftp()
+    marker = _upload_error_marker_path(pid)
+    # Clear any stale marker from a previous attempt so a retry starts clean.
     try:
-        _sftp_put_r(sftp, ingest_path, sftp_path, preserve_mtime=True)
-        packages = sftp.listdir(sftp_path)
+        os.remove(marker)
+    except OSError:
+        pass
 
-        if pid not in packages:
-            errors.append(-1)
-    finally:
-        sftp.close()
-        client.close()
+    try:
+        client, sftp = _open_sftp()
+        try:
+            _sftp_put_r(sftp, ingest_path, sftp_path, preserve_mtime=True)
+            packages = sftp.listdir(sftp_path)
+            if pid not in packages:
+                raise RuntimeError('package %s not found on sftp after put' % pid)
+        finally:
+            sftp.close()
+            client.close()
+    except Exception as e:  # noqa: BLE001
+        logger.error('move_to_sftp background put failed for %s: %s', pid, e)
+        try:
+            with open(marker, 'w') as fh:
+                fh.write(str(e)[:1000])
+        except OSError as marker_err:
+            logger.error('could not write upload-error marker for %s: %s', pid, marker_err)
+
+
+def move_to_sftp(pid):
+    """Kick off the recursive SFTP put in a BACKGROUND thread; return at once.
+
+    The put is long-running (minutes to ~30 min for big batches). The legacy
+    implementation did it synchronously, so the Node upload stage — which
+    awaits move_to_sftp and only THEN polls check_sftp for byte progress —
+    never saw the upload in flight: the whole transfer happened inside this
+    call, the poll ran after it had already finished, and the dashboard sat
+    on "UPLOADING" with no progress bar the entire time. Backgrounding the
+    put lets the poller observe the remote dir growing
+    (remote_package_size_bytes) against the local total
+    (local_package_size_bytes) and render a live %.
+
+    Mirrors move_to_ingest's fire-and-don't-wait contract. Completion is
+    observed by the poller via check_sftp (remote file count reaching the
+    local count); failure via the .upload_error marker check_sftp surfaces.
+
+    @param: pid
+    @returns: Dictionary (message='upload_started')
+    """
+    thread = threading.Thread(target=_do_sftp_put, args=(pid,), daemon=True)
+    thread.start()
+    return dict(message='upload_started')
 
 
 def check_sftp(uuid, local_file_count):
@@ -1012,6 +1065,18 @@ def check_sftp(uuid, local_file_count):
     @param: local_file_count
     @returns: Dictionary
     """
+
+    # If the background SFTP put (move_to_sftp) died, surface it at once so
+    # the Node poller halts the row instead of waiting out the upload
+    # timeout. Cheap local check before any SFTP round-trip.
+    marker = _upload_error_marker_path(uuid)
+    if os.path.exists(marker):
+        try:
+            with open(marker) as fh:
+                err_text = fh.read()[:1000]
+        except OSError:
+            err_text = ''
+        return dict(message='upload_failed', error=err_text or 'sftp upload failed')
 
     file_names = []
     dir_names = []
@@ -1029,7 +1094,15 @@ def check_sftp(uuid, local_file_count):
     client, sftp = _open_sftp()
     try:
         remote_package = sftp_path + '/' + uuid
-        _sftp_walk(sftp, remote_package, on_file=store_files_name, on_dir=store_dir_name, on_other=store_other_file_types)
+        try:
+            _sftp_walk(sftp, remote_package, on_file=store_files_name, on_dir=store_dir_name, on_other=store_other_file_types)
+        except IOError:
+            # The remote package dir doesn't exist yet — the background put
+            # (move_to_sftp) is just starting and hasn't created it. Report
+            # 0 files arrived (in_progress) so the poller keeps waiting
+            # instead of seeing a 500. _sftp_dir_size below already tolerates
+            # the missing dir (returns 0).
+            del file_names[:]
         remote_file_count = len(file_names)
 
         # Sum file sizes via pure SFTP. The legacy `du -h -s` call
