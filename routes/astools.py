@@ -36,6 +36,7 @@ from flask import Blueprint, jsonify, request
 
 from auth import require_api_key_astools
 from lib import archivesspace_ops as qa_lib
+from lib import batch_structure
 
 logger = logging.getLogger(__name__)
 
@@ -46,9 +47,34 @@ astools_bp = Blueprint('astools', __name__)
 @require_api_key_astools
 def get_workspace_packages():
     """
-    Gets batch folders that have not been processed yet (no uri.txt files).
+    Gets batch folders awaiting Make Digital Objects, with structure QA flags.
 
-    @return: JSON response with list of folder names and errors
+    Response shape (feature-batch-packaging-qa):
+        {
+          "result": [
+            {
+              "name": "new_x-resources_123",
+              "packages": ["pkg_a", ...],
+              "processed": ["pkg_a", ...],          # packages with uri.txt
+              "structure_errors": [
+                {"code": "loose_files", "severity": "error",
+                 "items": ["scan1.tif"], "total": 1}, ...
+              ]
+            }, ...
+          ],
+          "errors": []
+        }
+
+    Differences from the legacy flat name list:
+      * Malformed batches (loose files only, no packages) are INCLUDED
+        with error flags — previously they were silently invisible.
+      * Partially processed batches are included with an info flag.
+      * Package names are embedded, so callers no longer need a
+        follow-up /workspace/packages call per folder.
+    The Node consumer (repo-backend-v2 workspace.js) tolerates both the
+    object entries and the legacy strings, so this deploys independently.
+
+    @return: JSON response with list of batch objects and errors
     """
     try:
         logger.info('GET /api/v1/astools/workspace - Retrieving unprocessed packages')
@@ -62,12 +88,14 @@ def get_workspace_packages():
                 'errors': ['Server configuration error']
             }), 500
 
-        # Get workspace packages (folders needing processing)
-        make_digital_objects_results = qa_lib.get_workspace_ready_folders(workspace)
+        # Get workspace batches (folders needing processing + flagged
+        # malformed folders that the legacy scan silently skipped).
+        batches = batch_structure.get_workspace_batches(workspace)
 
-        logger.info(f'Found {len(make_digital_objects_results)} folders needing processing')
+        flagged = sum(1 for b in batches if b['structure_errors'])
+        logger.info(f'Found {len(batches)} folders needing processing ({flagged} flagged)')
         return jsonify({
-            'result': make_digital_objects_results,
+            'result': batches,
             'errors': []
         }), 200
 
@@ -149,15 +177,17 @@ def get_packages():
                 'errors': [f'Batch path is not a directory: {batch}']
             }), 400
 
-        # Get packages (subdirectories) in batch folder
-        packages = [
-            item.name for item in batch_path.iterdir()
-            if item.is_dir() and not item.name.startswith('.')
-        ]
+        # Full structure scan — one scandir sweep per package. `result`
+        # stays a sorted name array for backward compatibility; the QA
+        # flags ride alongside so the ASpace QA / Packaging views can
+        # surface structure problems on folders this listing serves.
+        scan = batch_structure.scan_batch(batch_path)
 
-        logger.info(f'Found {len(packages)} packages in batch: {batch}')
+        logger.info(f'Found {len(scan["packages"])} packages in batch: {batch}')
         return jsonify({
-            'result': sorted(packages),
+            'result': scan['packages'],
+            'processed': scan['processed'],
+            'structure_errors': scan['structure_errors'],
             'errors': []
         }), 200
 
