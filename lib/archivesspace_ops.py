@@ -251,23 +251,39 @@ def get_metadata_ready_folders(root_dir, target_filename='uri.txt'):
     Gets batch folders that HAVE been processed (i.e., have uri.txt file).
     This is the opposite of get_workspace_ready_folders.
 
+    2026-07-24 (feature-batch-packaging-qa, finding F8): the previous
+    implementation used an unbounded os.walk and derived the batch name
+    as basename(dirname(dirpath)). A uri.txt sitting loose in a batch
+    folder therefore reported the WORKSPACE directory's own name as a
+    "batch", and a uri.txt nested inside a package subfolder reported
+    the PACKAGE name — both produced phantom rows in the ASpace QA /
+    Packaging views. The scan is now bounded to exactly the expected
+    layout: <root>/<batch>/<package>/uri.txt.
+
     @param root_dir: Root directory path to scan
     @param target_filename: Target file to check for (default: 'uri.txt')
-    @return: Sorted list of parent folder names
+    @return: Sorted list of batch folder names
     """
-    missing_parents = set()
+    processed = set()
+    root_path = Path(root_dir)
 
-    for dirpath, dirnames, filenames in os.walk(root_dir):
-        if dirpath == root_dir:
-            continue  # Skip checking the batch parent folder
+    for batch in root_path.iterdir():
+        if not batch.is_dir() or batch.name.startswith('.'):
+            continue
+        if batch.name.lower() == 'ready':
+            continue
+        try:
+            for package in batch.iterdir():
+                if not package.is_dir() or package.name.startswith('.'):
+                    continue
+                if (package / target_filename).is_file():
+                    processed.add(batch.name)
+                    break
+        except PermissionError:
+            logger.warning(f'Permission denied scanning batch folder: {batch}')
+            continue
 
-        if target_filename in filenames:
-            parent_name = os.path.basename(os.path.dirname(dirpath))
-
-            if parent_name.lower() != 'ready':
-                missing_parents.add(parent_name)
-
-    return sorted(missing_parents)
+    return sorted(processed)
 
 
 def check_uri_txt(folder):

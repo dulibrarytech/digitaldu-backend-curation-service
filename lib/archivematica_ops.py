@@ -398,6 +398,36 @@ def _is_locked(uuid):
 # ---------------------------------------------------------------------------
 
 
+def _list_packages(folder):
+    """Non-hidden package DIRECTORIES inside 001-ready/<folder>.
+
+    2026-07-24 (feature-batch-packaging-qa, finding F3): the legacy
+    listers used bare os.listdir, so a stray file dropped directly in
+    the batch folder was treated as a package name — os.listdir(<file>)
+    then raised NotADirectoryError and the route returned a raw 500
+    (and check_package_names_threads would even RENAME the stray file).
+    Every ready-stage QA function now lists through this helper, which
+    keeps only real directories; loose files are reported separately
+    by _list_loose_files so staff get an actionable message instead of
+    a server error.
+    """
+    base = ready_path + folder
+    return [
+        f for f in os.listdir(base)
+        if not f.startswith('.') and os.path.isdir(os.path.join(base, f))
+    ]
+
+
+def _list_loose_files(folder):
+    """Non-hidden loose FILES directly inside 001-ready/<folder> (see
+    _list_packages — these are structure mistakes, not packages)."""
+    base = ready_path + folder
+    return [
+        f for f in os.listdir(base)
+        if not f.startswith('.') and not os.path.isdir(os.path.join(base, f))
+    ]
+
+
 def get_ready_folders():
     """
     Gets ready folders
@@ -486,9 +516,9 @@ def get_package_names(folder):
     :return: packages
     """
 
-    [os.remove(ready_path + folder + '/' + f) for f in os.listdir(ready_path + folder) if f.startswith('.')]
-    packages = [f for f in os.listdir(ready_path + folder) if not f.startswith('.')]
-    return packages
+    [os.remove(ready_path + folder + '/' + f) for f in os.listdir(ready_path + folder)
+     if f.startswith('.') and os.path.isfile(ready_path + folder + '/' + f)]
+    return _list_packages(folder)
 
 
 def check_package_names(folder):
@@ -499,9 +529,16 @@ def check_package_names(folder):
     """
 
     threads = []
-    packages = [f for f in os.listdir(ready_path + folder) if not f.startswith('.')]
-    [os.remove(ready_path + folder + '/' + f) for f in os.listdir(ready_path + folder) if f.startswith('.')]
+    packages = _list_packages(folder)
+    [os.remove(ready_path + folder + '/' + f) for f in os.listdir(ready_path + folder)
+     if f.startswith('.') and os.path.isfile(ready_path + folder + '/' + f)]
     errors = []
+
+    # Loose files are structure mistakes, not packages — report them
+    # instead of renaming them (the thread helper used to lowercase a
+    # stray extensionless file as if it were a package folder).
+    for loose in _list_loose_files(folder):
+        errors.append(loose + ' is a file, not a package folder. Move it into a package folder.')
 
     if len(packages) == 0:
         errors.append(['No packages found'])
@@ -542,10 +579,14 @@ def check_file_names(folder):
     @returns: Dictionary
     """
 
-    packages = [f for f in os.listdir(ready_path + folder) if not f.startswith('.')]
+    packages = _list_packages(folder)
     threads = []
     files_arr = []
     errors = []
+    # Defined before the loop: with zero packages (e.g. a folder holding
+    # only loose files) the loop never runs and the count must be 0, not
+    # an unbound name.
+    local_file_count = 0
 
     try:
         if os.path.exists(errors_file):
@@ -553,6 +594,12 @@ def check_file_names(folder):
     except Exception as e:
         logger.info(e)
         logger.info('Unable to delete errors_file')
+
+    # Report loose files up front. Before the _list_packages fix (F3)
+    # these crashed the whole check with NotADirectoryError → HTTP 500.
+    loose_files = _list_loose_files(folder)
+    for loose in loose_files:
+        errors.append(loose + ' is a file, not a package folder. Move it into a package folder.')
 
     for i in packages:
 
@@ -563,7 +610,8 @@ def check_file_names(folder):
         # Get total file count from packages
         package = ready_path + folder + '/' + i + '/'
         files = [f for f in os.listdir(package) if not f.startswith('.')]
-        [os.remove(package + f) for f in os.listdir(package) if f.startswith('.')]
+        [os.remove(package + f) for f in os.listdir(package)
+         if f.startswith('.') and os.path.isfile(package + f)]
 
         if len(files) < 2:
             errors.append(i + '  is missing files.')
@@ -577,8 +625,10 @@ def check_file_names(folder):
         thread.join()
 
     try:
+        # Append (not replace) so structural errors collected above are
+        # not lost when the image-check error file exists.
         with open(errors_file) as file_errors:
-            errors = file_errors.readlines()
+            errors.extend(file_errors.readlines())
     except Exception as e:
         logger.info(e)
         logger.info('ERROR: Unable to open error file - ' + errors_file)
@@ -653,7 +703,7 @@ def check_uri_txt(folder):
     """
 
     errors = []
-    packages = [f for f in os.listdir(ready_path + folder) if not f.startswith('.')]
+    packages = _list_packages(folder)
 
     if len(packages) == 0:
         return errors.append(-1)
