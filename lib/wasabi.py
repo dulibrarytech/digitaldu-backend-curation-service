@@ -232,8 +232,11 @@ def upload_directory(source_dir, folder):
     Returns:
         dict with shape {
             'ok': bool,
-            'uploaded': int,        # successful file count
+            'uploaded': int,        # successful AND verified file count
             'failed': int,          # failed file count
+            'verified': int,        # head_object-confirmed uploads
+                                    # (== uploaded; kept as an explicit
+                                    # signal for callers/logs)
             'bytes': int,           # total bytes uploaded
             'elapsed_ms': int,
             'errors': [str, ...],   # error messages, capped at 10
@@ -241,6 +244,17 @@ def upload_directory(source_dir, folder):
         `ok` is True iff every file succeeded AND at least one file
         was uploaded. An empty source directory returns ok=False with
         no errors — we don't silently no-op a vanished source.
+
+    2026-07-26 (003-ingested retirement, phase 1): every upload is now
+    verified with an immediate head_object size check. A file whose
+    remote size disagrees with the local size counts as FAILED even
+    though upload_file itself did not raise. Rationale: once the local
+    003-ingested copies are retired, this upload is the batch
+    snapshot's only custodian — "the SDK call returned" is not a
+    strong enough success signal to gate 002-ingest deletion on.
+    (The 2026-07-26 reconciliation found one 132 MB file truncated by
+    the parallel UNVERIFIED local copy path; verification is what
+    separates the surviving path from the retired one.)
 
     Never raises for per-file errors — they're logged and counted.
     Configuration errors (missing profile, bad endpoint) DO raise so
@@ -275,6 +289,7 @@ def upload_directory(source_dir, folder):
 
     uploaded = 0
     failed = 0
+    verified = 0
     total_bytes = 0
     errors = []
 
@@ -308,7 +323,34 @@ def upload_directory(source_dir, folder):
                     key,
                     Callback=_FileProgress(label, size) if size > 0 else None,
                 )
+                # Immediate per-file verification (see docstring). A
+                # head that errors or disagrees on size means we do NOT
+                # count the file as uploaded — callers gate local
+                # cleanup on this result.
+                try:
+                    head = client.head_object(Bucket=bucket, Key=key)
+                    remote_size = head.get('ContentLength')
+                except (ClientError, BotoCoreError) as e:
+                    logger.error(
+                        'wasabi VERIFY head failed file=%s err=%s', rel, e,
+                    )
+                    failed += 1
+                    if len(errors) < 10:
+                        errors.append(f'{fname}: uploaded but verify head failed')
+                    continue
+                if remote_size != size:
+                    logger.error(
+                        'wasabi VERIFY FAILED file=%s local=%d remote=%s',
+                        rel, size, remote_size,
+                    )
+                    failed += 1
+                    if len(errors) < 10:
+                        errors.append(
+                            f'{fname}: verify failed (local {size} != remote {remote_size})'
+                        )
+                    continue
                 uploaded += 1
+                verified += 1
                 total_bytes += size
             except ClientError as e:
                 code = e.response.get('Error', {}).get('Code', 'unknown')
@@ -334,13 +376,14 @@ def upload_directory(source_dir, folder):
     elapsed_ms = int((time.monotonic() - started) * 1000)
     ok = uploaded > 0 and failed == 0
     logger.info(
-        'wasabi upload END uploaded=%d failed=%d bytes=%d elapsed_ms=%d ok=%s',
-        uploaded, failed, total_bytes, elapsed_ms, ok,
+        'wasabi upload END uploaded=%d verified=%d failed=%d bytes=%d elapsed_ms=%d ok=%s',
+        uploaded, verified, failed, total_bytes, elapsed_ms, ok,
     )
     return {
         'ok': ok,
         'uploaded': uploaded,
         'failed': failed,
+        'verified': verified,
         'bytes': total_bytes,
         'elapsed_ms': elapsed_ms,
         'errors': errors,

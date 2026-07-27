@@ -86,8 +86,24 @@ class UploadDirectoryTest(unittest.TestCase):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def _fake_client(self):
+        """
+        S3 client fake. upload_file records the object's true size so
+        head_object (the phase-1 per-file verification probe) answers
+        with the matching ContentLength — the happy path a real
+        successful upload produces. Tests that exercise verification
+        failure override head_object after construction.
+        """
         client = MagicMock()
-        client.upload_file = MagicMock(return_value=None)
+        stored = {}
+
+        def _upload(local_path, bucket, key, **kwargs):
+            stored[key] = os.path.getsize(local_path)
+
+        def _head(Bucket=None, Key=None):  # noqa: N803 - boto3 casing
+            return {'ContentLength': stored.get(Key)}
+
+        client.upload_file = MagicMock(side_effect=_upload)
+        client.head_object = MagicMock(side_effect=_head)
         return client
 
     def test_happy_path_uploads_all_files_skipping_dotfiles(self):
@@ -130,6 +146,14 @@ class UploadDirectoryTest(unittest.TestCase):
             'PutObject',
         )
         client.upload_file.side_effect = [None, failure]
+        # Overriding upload_file's side_effect above bypasses the fake's
+        # size recording, so answer the verification head from the local
+        # tree instead (key 'col-y/<rel>' → file under self.src).
+        client.head_object.side_effect = lambda Bucket=None, Key=None: {
+            'ContentLength': os.path.getsize(
+                os.path.join(self.src, *Key.split('/')[1:])
+            )
+        }
         with patch.object(wasabi, '_make_client', return_value=client):
             result = wasabi.upload_directory(self.src, 'col-y')
         self.assertFalse(result['ok'])
@@ -137,6 +161,46 @@ class UploadDirectoryTest(unittest.TestCase):
         self.assertEqual(result['failed'], 1)
         self.assertEqual(len(result['errors']), 1)
         self.assertIn('AccessDenied', result['errors'][0])
+
+    def test_verify_size_mismatch_counts_as_failed(self):
+        # Phase-1 verification (003-ingested retirement): upload_file
+        # "succeeds" but the remote object's size disagrees — e.g. a
+        # truncated transfer the SDK didn't surface. The file must
+        # count as FAILED so move_to_ingested keeps the local source.
+        client = self._fake_client()
+        client.head_object.side_effect = lambda Bucket=None, Key=None: {
+            'ContentLength': 1  # never matches either fixture file
+        }
+        with patch.object(wasabi, '_make_client', return_value=client):
+            result = wasabi.upload_directory(self.src, 'col-v')
+        self.assertFalse(result['ok'])
+        self.assertEqual(result['uploaded'], 0)
+        self.assertEqual(result['verified'], 0)
+        self.assertEqual(result['failed'], 2)
+        self.assertTrue(any('verify failed' in e for e in result['errors']))
+
+    def test_verify_head_error_counts_as_failed(self):
+        # If the verification probe itself errors, the upload is NOT
+        # trusted — same failed accounting, distinct error text.
+        client = self._fake_client()
+        client.head_object.side_effect = ClientError(
+            {'Error': {'Code': '500', 'Message': 'oops'}}, 'HeadObject',
+        )
+        with patch.object(wasabi, '_make_client', return_value=client):
+            result = wasabi.upload_directory(self.src, 'col-w')
+        self.assertFalse(result['ok'])
+        self.assertEqual(result['uploaded'], 0)
+        self.assertEqual(result['failed'], 2)
+        self.assertTrue(any('verify head failed' in e for e in result['errors']))
+
+    def test_happy_path_reports_verified_count(self):
+        client = self._fake_client()
+        with patch.object(wasabi, '_make_client', return_value=client):
+            result = wasabi.upload_directory(self.src, 'col-ok')
+        self.assertTrue(result['ok'])
+        self.assertEqual(result['verified'], 2)
+        # One head per uploaded file — verification is per-file.
+        self.assertEqual(client.head_object.call_count, 2)
 
     def test_missing_source_dir_returns_error_without_raising(self):
         with patch.object(wasabi, '_make_client', return_value=self._fake_client()):
