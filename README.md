@@ -4,9 +4,9 @@ Flask service that owns the **on-host filesystem + Wasabi S3 + SFTP**
 side of the DigitalDU ingest pipeline. Called from
 `repo-backend-v2` (the Node.js ingest worker) over HTTP; talks to:
 
-- the local filesystem (`/data/ready`, `/data/ingest`, `/data/ingested`),
+- the local filesystem (workspace, `001-ready`, `002-ingest` staging),
 - the Archivematica SFTP daemon (`internal-sftp` subsystem) via paramiko,
-- Wasabi S3 via boto3,
+- Wasabi S3 via boto3 (two buckets: the batch archive and the AIP store),
 - ArchivesSpace via the bundled `make_digital_object.py` CLI.
 
 It supersedes the legacy `digitaldu-backend-qa` (QA service) and
@@ -18,15 +18,26 @@ Flask app.
 | repo-backend  | -------> | curation-api (this)   | --------> | Archivematica |
 | -v2 (Node)    |          |                       |           |  SFTP daemon  |
 +---------------+          |  +------ boto3 ------+|           +---------------+
-                           |  | Wasabi S3 upload | |
+                           |  | Wasabi S3:       | |
+                           |  |  batch archive   | |
+                           |  |  aip-store       | |
                            |  +------------------+ |
                            |  +------ local fs --+ |
+                           |  | workspace        | |
                            |  | 001-ready ─┐     | |
                            |  | 002-ingest │ ←── | |
-                           |  | 003-ingested     | |
                            |  +------------------+ |
                            +-----------------------+
 ```
+
+At the end of a successful ingest, the batch's `002-ingest` staging copy
+is archived **straight to Wasabi** — every uploaded file is verified with
+a `head_object` size check, and the staging copy is removed only after
+that verification passes. The old local `003-ingested/` archive folder
+was **retired 2026-07-26** (its `cp -R` copy was never verified; see
+`repo/INGESTED_RETIREMENT_PLAN.md` for the full history and the
+reconciliation that preceded the change). Endpoint and result names
+still say "ingested" for wire compatibility — they are historical.
 
 ## Requirements
 
@@ -35,8 +46,11 @@ Flask app.
   - `libmagic` (for `python-magic`): `dnf install file-libs`
   - `gcc` + `python3.12-devel` if any wheel falls through to source build
     (rare on x86_64 — boto3 / paramiko / cryptography all ship binary wheels)
-- **AWS CLI profile** at `~/.aws/config` for the service user, matching
-  the `WASABI_PROFILE` env value. boto3 reads creds from this file.
+- **Wasabi credentials** — either `AWS_ACCESS_KEY_ID` +
+  `AWS_SECRET_ACCESS_KEY` in the service env (preferred; no dependency
+  on `~/.aws/*` files), or an AWS CLI profile at `~/.aws/config` for
+  the service user matching `WASABI_PROFILE`. See "Wasabi credentials"
+  below for the resolution order.
 - **Network egress** to the Archivematica SFTP host and the Wasabi
   endpoint.
 
@@ -50,21 +64,26 @@ digitaldu-backend-curation-service/
 ├── requirements.txt        Pinned Python deps
 ├── .env.example            Template for .env (gitignored at deploy)
 ├── lib/
-│   ├── archivematica_ops.py    SFTP + local filesystem ops
-│   ├── archivesspace_ops.py    ASpace tools (workspace / processed / make-digital-objects)
-│   ├── wasabi.py               boto3 S3 upload + health check
+│   ├── archivematica_ops.py    SFTP + local filesystem ops (ready/ingest staging)
+│   ├── archivesspace_ops.py    ASpace tools (workspace / processed / uri.txt checks)
+│   ├── batch_structure.py      Batch structure QA scan (workspace listing flags)
+│   ├── aip_ops.py              AIP-store copy (AM Storage Service → Wasabi aip bucket)
+│   ├── wasabi.py               boto3 S3 upload (per-file verified) + health check
+│   ├── safe_names.py           Path-segment validation (traversal guard)
 │   └── make_digital_object.py  CLI launched by astools route
 ├── routes/
 │   ├── qa.py                   /api/v2/qa/* — Archivematica-side endpoints
-│   └── astools.py              /api/v1/astools/* — ArchivesSpace-side endpoints
-├── tests/
-│   ├── test_move_from_ingest_to_ready.py   pytest — SFTP cleanup + lock
-│   ├── test_wasabi.py                      pytest — boto3 upload + health probe
-│   └── smoke_test.sh                       curl-based endpoint sweep
+│   ├── astools.py              /api/v1/astools/* — ArchivesSpace-side endpoints
+│   └── aip.py                  /api/v2/aip/* — AIP-store endpoints
+├── scripts/
+│   ├── reconcile_ingested_wasabi.py   Read-only local-vs-Wasabi batch audit
+│   └── sync_missing_to_wasabi.py      Uploads files the audit found missing
+├── tests/                  pytest suite (see "Testing" below)
+│   └── smoke_test.sh       curl-based endpoint sweep
 └── deploy/
-    ├── curation-api.service                systemd unit
-    ├── logrotate.curation-api              log rotation
-    └── nginx.conf.example                  reverse-proxy template
+    ├── curation-api.service            systemd unit
+    ├── logrotate.curation-api          log rotation
+    └── nginx.conf.example              reverse-proxy template
 ```
 
 ## Endpoints (summary)
@@ -84,7 +103,7 @@ Two blueprints, both auth-required (`X-API-Key` header, or legacy
 | `GET /move-from-ingest-to-ready` | Rollback move (used by Node rollback flow) |
 | `GET /move-to-sftp` | Push staged batch to AM's SFTP source |
 | `GET /upload-status` | Poll SFTP upload progress |
-| `GET /move-to-ingested` | After-success archive to `003-ingested` + Wasabi S3 |
+| `GET /move-to-ingested` | After-success archive of `002-ingest/<uuid>/` to Wasabi (per-file verified; staging copy removed only on verified success). Name is historical — no local `003-ingested` copy is written any more. |
 | `GET /cleanup_sftp` | Remove a package's files + parent dir from SFTP |
 | `GET /reset_permissions` | chown ready folder back to service user |
 | `GET /set-collection-folder`, `/check-collection-folder` | Folder naming helpers |
@@ -94,12 +113,21 @@ Two blueprints, both auth-required (`X-API-Key` header, or legacy
 
 | Endpoint | Purpose |
 |---|---|
-| `GET /workspace` | List packages in workspace |
-| `GET /workspace/packages`, `/workspace/packages/files` | Package + file details |
-| `GET /processed` | List processed packages (have `uri.txt`) |
+| `GET /workspace` | List batches awaiting Make Digital Objects, **with structure-QA flags** (see "Batch structure QA" below). Returns batch objects `{name, packages, processed, structure_errors}` — malformed batches are included and flagged rather than silently skipped. |
+| `GET /workspace/packages` | Package names in one batch (`result` = sorted name array) + piggybacked `processed` and `structure_errors` |
+| `GET /workspace/packages/files` | Per-package file listings |
+| `GET /processed` | List batches with `uri.txt` (scan bounded to `batch/package/uri.txt` depth) |
 | `GET /workspace/uri`, `/check-uri-txt` | URI helpers |
-| `GET /move-to-ready` | Move workspace package into ready |
+| `GET /move-to-ready` | Move a workspace batch into `001-ready` |
 | `POST /make-digital-objects` | Launch the ASpace digital-object creation CLI |
+| `POST /revert-to-make-digital-objects` | Delete `uri.txt` from every package (returns the batch to the MDO view) |
+
+### `/api/v2/aip/*` — AIP store
+
+| Endpoint | Purpose |
+|---|---|
+| `POST /copy-to-wasabi` | Stream an AM Storage Service AIP into the `WASABI_AIP_BUCKET` (idempotent via size-checked `head_object` probe) |
+| `POST /presigned-url` | Mint a presigned GET URL for an AIP download |
 
 ### Health endpoints (no auth)
 
@@ -108,6 +136,39 @@ Two blueprints, both auth-required (`X-API-Key` header, or legacy
 | `GET /` | Returns `APP_VERSION` |
 | `GET /health` | `{"status": "ok", "version": ...}` |
 | `GET /health/wasabi` | On-demand Wasabi `head_bucket` probe |
+
+## Batch structure QA
+
+Staff assemble batches by hand
+(`WORKSPACE/new_<collection>-resources_<N>/<package>/<files>`), and
+structural mistakes used to be invisible or silently destructive (see
+`repo/BATCH_PACKAGING_QA_FINDINGS.md`). `lib/batch_structure.py` scans
+every batch in a single `os.scandir` pass per directory — no file is
+ever opened, so 100-package / hundreds-of-files batches scan in
+milliseconds — and the `/workspace` + `/workspace/packages` responses
+carry the results as `structure_errors` entries:
+
+```json
+{"code": "loose_files", "severity": "error",
+ "items": ["scan1.tif", "..."], "total": 41}
+```
+
+| Code | Severity | Meaning |
+|---|---|---|
+| `no_packages` | error | Batch folder has no package subfolders |
+| `loose_files` | error | Files sit directly in the batch folder |
+| `empty_package` | error | Package folder has no content files |
+| `nested_dirs` | error | Package folder contains subfolders |
+| `bad_folder_name` | error | Name breaks the `new_…-resources_<N>` convention |
+| `unreadable` | error | Permission denied scanning the batch |
+| `partially_processed` | info | Some but not all packages have `uri.txt` |
+| `name_hygiene` | warn | Spaces in package/file names |
+
+`items` lists are capped at 20 entries (`total` carries the true
+count). The server ships codes only — **all staff-facing wording lives
+in repo-backend-v2** (`ingester/libs/structure_flags.js`), which renders
+the notices in the Make Digital Objects view and blocks the MDO /
+Submit actions on error-severity flags (server-enforced there, too).
 
 ## Setup
 
@@ -174,14 +235,28 @@ Fill in:
 
 - `API_KEY` — shared secret for the Node side; any high-entropy
   string. Generate with `openssl rand -hex 32`.
-- `READY_PATH`, `INGEST_PATH`, `INGESTED_PATH` — local filesystem
-  staging directories.
+- `READY_PATH`, `INGEST_PATH` — local filesystem staging directories
+  (`001-ready`, `002-ingest`).
+- `INGESTED_PATH` — **tooling-only since 2026-07-26**: the service no
+  longer writes a local `003-ingested` archive copy, but the
+  reconciliation / sync scripts under `scripts/` still read this to
+  audit the historical backlog. Keep it set until that backlog is
+  fully deleted, then it can be dropped.
 - `SFTP_HOST`, `SFTP_ID`, `SFTP_PWD`, `SFTP_REMOTE_PATH` —
   Archivematica SFTP daemon address + creds.
-- `WASABI_ENDPOINT`, `WASABI_BUCKET`, `WASABI_PROFILE` — Wasabi
-  details. `WASABI_BUCKET` accepts the legacy `s3://name/` form OR
-  the bare `name` form. `WASABI_PROFILE` must match a profile in
-  `~/.aws/config` for the service user.
+- `WASABI_ENDPOINT`, `WASABI_BUCKET` — Wasabi endpoint + the **batch
+  archive** bucket (completed ingests' source packages).
+  `WASABI_BUCKET` accepts the legacy `s3://name/` form (an optional
+  path becomes a base key prefix) OR the bare `name` form.
+- `WASABI_AIP_BUCKET` — the **AIP store** bucket/prefix (e.g.
+  `s3://library-repository/aip-store/`) used by the `/api/v2/aip/*`
+  routes. Required for those routes; they refuse cleanly if unset
+  rather than falling back to the batch bucket.
+- `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`
+  (+ optional `AWS_DEFAULT_REGION`) — Wasabi credentials, preferred
+  form. Alternatively `WASABI_PROFILE` naming a profile in
+  `~/.aws/config` for the service user (used only when the explicit
+  keys are unset).
 - `WORKSPACE`, `ASPACE_USERNAME`, `ASPACE_PASSWORD`, `SCRIPT_PATH`,
   `LOG_PATH` — ArchivesSpace-side config.
 
@@ -191,28 +266,33 @@ checks remain in the route handlers as a second line of defense.
 
 ### 4. Wasabi credentials
 
-boto3 reads `~/.aws/config` via the named profile. Create or verify
-the entry for the service user:
+Credential resolution order (`lib/wasabi._make_client`):
 
-```ini
-# ~/.aws/config
-[profile wasabi-prod]
-region = us-east-1
-output = json
+1. **Explicit env vars** — `AWS_ACCESS_KEY_ID` +
+   `AWS_SECRET_ACCESS_KEY` (+ optional `AWS_DEFAULT_REGION`) from the
+   service env. Preferred: no dependency on `~/.aws/*` existing for
+   whichever user the process runs as.
+2. **Named profile** — `WASABI_PROFILE` from `~/.aws/config` /
+   `~/.aws/credentials`, used only when the env keys are unset:
 
-# ~/.aws/credentials
-[wasabi-prod]
-aws_access_key_id     = <key>
-aws_secret_access_key = <secret>
-```
+   ```ini
+   # ~/.aws/config
+   [profile wasabi-prod]
+   region = us-east-1
+   output = json
 
-Then set `WASABI_PROFILE=wasabi-prod` in `.env` and verify:
+   # ~/.aws/credentials
+   [wasabi-prod]
+   aws_access_key_id     = <key>
+   aws_secret_access_key = <secret>
+   ```
 
-```bash
-aws s3 ls --profile wasabi-prod --endpoint-url $WASABI_ENDPOINT $WASABI_BUCKET
-```
+3. **Neither** — loud `RuntimeError` at first use; there is no silent
+   fallback to instance metadata or ambient host credentials.
 
-If that command works, boto3 will too.
+Verify whichever path you configured with the on-demand health probe
+(`GET /health/wasabi`, below) — it exercises the exact same client
+construction the uploads use.
 
 ## Running
 
@@ -278,35 +358,41 @@ deployments typically front this with nginx on `:443` and proxy to
 
 ### Unit + integration (pytest)
 
-Inside the activated venv:
+Inside the activated venv. A handful of legacy tests read module-level
+config at import time, so give the suite dummy env values (any
+non-empty strings work — nothing touches the network):
 
 ```bash
 # All tests
+SFTP_REMOTE_PATH=/tmp/fake-sftp WASABI_PROFILE=test \
+WASABI_ENDPOINT=https://example.com WASABI_BUCKET=test-bucket \
 python -m pytest tests/ -v
 
 # A single file
 python -m pytest tests/test_wasabi.py -v
-
-# A single test
-python -m pytest tests/test_wasabi.py::UploadDirectoryTest::test_happy_path_uploads_all_files_skipping_dotfiles -v
 
 # Show coverage of the wasabi module (requires `pip install coverage`)
 coverage run -m pytest tests/test_wasabi.py
 coverage report -m --include='lib/wasabi.py'
 ```
 
-Test files:
+Test files (all `unittest.mock`-based; **no AWS credentials, network,
+or extra plugins needed**):
 
-- `tests/test_move_from_ingest_to_ready.py` — exercises the
-  per-uuid lock, the pure-SFTP `clean_up_sftp` rewrite, and the
-  rollback move-back flow. paramiko's SFTP is mocked.
-- `tests/test_wasabi.py` — boto3 upload + bucket parser + health
-  probe + the `move_to_s3` shim's 0/1 contract. boto3 is mocked at
-  the `_make_client` boundary — **no AWS credentials or network
-  access needed to run**.
-
-Both files use `unittest.mock` directly; no `moto` / `pytest-mock` /
-other plugins required.
+- `test_wasabi.py` — upload + per-file head_object verification,
+  bucket parser, credential resolution, health probe.
+- `test_move_to_ingested_phase3.py` — the S3-only archive contract
+  (verified upload gates staging cleanup; no local archive copy).
+- `test_move_from_ingest_to_ready.py` — per-uuid lock, pure-SFTP
+  cleanup, rollback move-back flow.
+- `test_qa_command_injection.py` — path-segment validation + no-shell
+  subprocess pins.
+- `test_batch_structure.py`, `test_astools_structure_routes.py`,
+  `test_ready_stage_structure_fixes.py` — batch structure QA scan,
+  route response shapes, and the ready-stage loose-file fixes.
+- `test_reconcile_ingested_wasabi.py`, `test_sync_missing_to_wasabi.py`
+  — the audit/repair scripts.
+- `test_upload_progress.py` — background SFTP put + progress polling.
 
 ### Endpoint smoke test (curl)
 
@@ -353,19 +439,67 @@ For any successful ingest you'll see:
 
 ```
 wasabi upload START source=/data/ingest/<uuid>/ bucket=<name> prefix=<folder>/
-wasabi upload file=METS.xml size=12345 → s3://<name>/<folder>/METS.xml
 wasabi upload file=objects/foo.tif size=5242880 → s3://<name>/<folder>/objects/foo.tif
 wasabi upload <folder>/objects/foo.tif — 25% (1310720/5242880 bytes)
 ...
-wasabi upload END uploaded=N failed=0 bytes=<total> elapsed_ms=<N> ok=True
+wasabi upload END uploaded=N verified=N failed=0 bytes=<total> elapsed_ms=<N> ok=True
 ```
+
+Every uploaded file is immediately re-checked with `head_object`
+(size comparison). A `wasabi VERIFY FAILED` line means the remote
+object's size disagreed with the local file — that file counts as
+**failed**, `ok` comes back `False`, and the `002-ingest` staging
+copy is deliberately left in place for a re-run. On the Node side
+this surfaces as a FAILED "Archive to Wasabi" row in the dashboard's
+Job History view.
 
 ### Verify objects landed in Wasabi
 
+The AWS CLI is not installed on the curation host; use the service's
+own venv + credentials (same resolution as the uploads):
+
 ```bash
-aws s3 ls --profile $WASABI_PROFILE --endpoint-url $WASABI_ENDPOINT \
-  s3://$BUCKET/$FOLDER/
+.venv/bin/python -c "import config; from lib import wasabi; \
+c = wasabi._make_client(); b, p = wasabi._parse_bucket(config.WASABI_BUCKET); \
+r = c.list_objects_v2(Bucket=b, Prefix=p + '<folder>/', MaxKeys=25); \
+[print(o['Key'], o['Size']) for o in r.get('Contents', [])]"
 ```
+
+For a full per-file audit of a batch, use the reconciliation script
+(next section) with `--batch <folder>` instead.
+
+### Audit / repair the Wasabi batch archive (scripts/)
+
+Both scripts run on the curation host with the service env loaded:
+
+```bash
+set -a; source /etc/curation-api/env; set +a
+```
+
+**Reconcile** — read-only; compares every file under
+`INGESTED_PATH/<batch>/` (the historical local archive) against
+`s3://$WASABI_BUCKET/<batch>/` by existence + size, and writes a CSV
+summary + JSONL detail with a per-batch verdict
+(`VERIFIED / MISSING / MISMATCH / EMPTY_LOCAL / ERROR`):
+
+```bash
+.venv/bin/python scripts/reconcile_ingested_wasabi.py --limit 5 --output-dir ~/reconcile-sample
+.venv/bin/python scripts/reconcile_ingested_wasabi.py --output-dir ~/reconcile-$(date +%F)
+```
+
+**Sync** — uploads only what reconcile found missing. Dry-run by
+default (`--execute` to upload); never deletes; verifies each upload
+with `head_object`; skips size-mismatched files unless
+`--overwrite-mismatch` (review those by hand first):
+
+```bash
+.venv/bin/python scripts/sync_missing_to_wasabi.py --from-summary <reconcile.csv>
+.venv/bin/python scripts/sync_missing_to_wasabi.py --from-summary <reconcile.csv> --execute
+```
+
+These exist for the 003-ingested retirement backlog audit
+(`repo/INGESTED_RETIREMENT_PLAN.md`) and remain useful as a general
+"is this batch fully in Wasabi?" check.
 
 ### Re-run the Wasabi health probe after a config change
 
@@ -400,6 +534,8 @@ sudo journalctl -u curation-api -n 50  # confirm clean boot
 | `wasabi probe FAILED err=ProfileNotFound` | `WASABI_PROFILE` doesn't match an entry in `~/.aws/config` for the service user | Check `cat ~curation/.aws/config`; profile name is case-sensitive. |
 | `wasabi probe FAILED err=head_bucket failed (403)` | Wasabi creds wrong OR bucket policy denies | Re-issue keys; verify with `aws s3 ls --profile=<p> --endpoint-url=<e> <bucket>` as user `curation`. |
 | `wasabi upload FAILED file=... err=NoCredentialsError` | Profile creds disappeared mid-run (token expiry, file rotation) | Restart the service to re-read `~/.aws/config`. |
+| `wasabi VERIFY FAILED file=... local=N remote=M` | Uploaded object's size disagrees with the local file (truncated/partial transfer) | The staging copy is preserved — fix the cause and re-run the archive (re-trigger `move-to-ingested`, or `scripts/sync_missing_to_wasabi.py`). Also appears as a FAILED "Archive to Wasabi" row in the dashboard Job History. |
+| `003-ingested/` no longer receiving batches | Expected — the local archive copy was retired 2026-07-26 (`repo/INGESTED_RETIREMENT_PLAN.md`). Wasabi is the batch archive. | — |
 | `aws s3 cp` no longer in process list | Expected — boto3 replaced the CLI shellout. Look for `wasabi upload` log lines instead. | — |
 | paramiko `AuthenticationException` | Wrong `SFTP_PWD` OR Archivematica restricted user account | Verify with `sftp -P <port> $SFTP_ID@$SFTP_HOST`. |
 | `python-magic` import error | `libmagic` system library missing | `dnf install file-libs`. |
