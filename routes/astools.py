@@ -66,8 +66,11 @@ def get_workspace_packages():
         }
 
     Differences from the legacy flat name list:
-      * Malformed batches (loose files only, no packages) are INCLUDED
-        with error flags — previously they were silently invisible.
+      * Malformed batches (loose files, with or without packages) are
+        INCLUDED with error flags — previously they were silently
+        invisible. Completely EMPTY folders are the one exception:
+        hidden until staff put anything in them (2026-07-27 — a
+        just-created folder isn't a mistake yet).
       * Partially processed batches are included with an info flag.
       * Package names are embedded, so callers no longer need a
         follow-up /workspace/packages call per folder.

@@ -284,14 +284,36 @@ class GetWorkspaceBatchesTests(unittest.TestCase):
             {'partially_processed'},
         )
 
-    def test_empty_batch_folder_is_included_and_flagged(self):
+    def test_completely_empty_batch_folder_is_hidden(self):
+        # 2026-07-27: staff create the collection folder first and fill
+        # it afterwards — flagging it during that window is noise. It
+        # must appear (with QA) as soon as it contains anything.
         (self.root / 'new_empty-resources_5').mkdir()
+        self.assertEqual(bs.get_workspace_batches(self.root), [])
+
+    def test_empty_folder_with_bad_name_is_also_hidden(self):
+        # Emptiness wins over naming: the name flag appears once the
+        # folder has content.
+        (self.root / 'badly_named_folder').mkdir()
+        self.assertEqual(bs.get_workspace_batches(self.root), [])
+
+    def test_junk_only_folder_counts_as_empty(self):
+        batch = self.root / 'new_junky-resources_6'
+        batch.mkdir()
+        _touch(batch / '.DS_Store')
+        _touch(batch / 'Thumbs.db')
+        self.assertEqual(bs.get_workspace_batches(self.root), [])
+
+    def test_folder_appears_once_it_has_any_content(self):
+        # A single loose file is content — the folder must surface,
+        # flagged, the moment staff put anything in it (F1 stays fixed).
+        batch = self.root / 'new_started-resources_7'
+        batch.mkdir()
+        _touch(batch / 'first_scan.tif')
         batches = bs.get_workspace_batches(self.root)
-        self.assertEqual(self._names(batches), ['new_empty-resources_5'])
-        self.assertEqual(
-            [f['code'] for f in batches[0]['structure_errors']],
-            ['no_packages'],
-        )
+        self.assertEqual(self._names(batches), ['new_started-resources_7'])
+        codes = {f['code'] for f in batches[0]['structure_errors']}
+        self.assertIn('loose_files', codes)
 
     def test_missing_root_raises(self):
         with self.assertRaises(FileNotFoundError):

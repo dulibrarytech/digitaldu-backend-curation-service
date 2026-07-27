@@ -251,9 +251,16 @@ def get_workspace_batches(root_dir):
     Replaces get_workspace_ready_folders' flat name list. Inclusion rules:
 
       * all packages missing uri.txt      -> included (the normal case)
-      * NO packages at all / loose files  -> INCLUDED with error flags.
-        (The old scan silently skipped these, so a batch of loose files
-        never appeared anywhere — finding F1.)
+      * loose files (with or without      -> INCLUDED with error flags.
+        packages)                            (The old scan silently skipped
+        these, so a batch of loose files never appeared anywhere —
+        finding F1.)
+      * COMPLETELY EMPTY folder           -> hidden (2026-07-27). Staff
+        create the collection folder first and fill it afterwards;
+        flagging it "no packages" during that window is noise. It
+        appears — and gets its structure QA — as soon as it contains
+        anything (a package folder or a loose file). Unreadable
+        folders stay visible: a permission problem is not "empty".
       * partially processed               -> included with an info flag
         (previously vanished from this view with no explanation — F6).
       * fully processed                   -> excluded, as before; those
@@ -290,6 +297,15 @@ def get_workspace_batches(root_dir):
 
         if total > 0 and processed == total:
             # Fully processed — belongs to the QA / Packaging views.
+            continue
+
+        # Completely empty folder — hidden until it has content (see
+        # the inclusion rules above). "Content" = at least one package
+        # subfolder OR at least one loose file; an unreadable folder is
+        # kept visible because we can't know it's empty.
+        codes = {flag['code'] for flag in scan['structure_errors']}
+        has_content = total > 0 or 'loose_files' in codes
+        if not has_content and 'unreadable' not in codes:
             continue
 
         batches.append(scan)

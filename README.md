@@ -109,7 +109,7 @@ Two blueprints, both auth-required (`X-API-Key` header, or legacy
 
 | Endpoint | Purpose |
 |---|---|
-| `GET /workspace` | List batches awaiting Make Digital Objects, **with structure-QA flags** (see "Batch structure QA" below). Returns batch objects `{name, packages, processed, structure_errors}` — malformed batches are included and flagged rather than silently skipped. |
+| `GET /workspace` | List batches awaiting Make Digital Objects, **with structure-QA flags** (see "Batch structure QA" below). Returns batch objects `{name, packages, processed, structure_errors}` — malformed batches are included and flagged rather than silently skipped (exception: completely empty folders stay hidden until staff put anything in them). |
 | `GET /workspace/packages` | Package names in one batch (`result` = sorted name array) + piggybacked `processed` and `structure_errors` |
 | `GET /workspace/packages/files` | Per-package file listings |
 | `GET /processed` | List batches with `uri.txt` (scan bounded to `batch/package/uri.txt` depth) |
