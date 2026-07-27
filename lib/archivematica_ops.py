@@ -54,7 +54,10 @@ logger = logging.getLogger(__name__)
 # continue to work without per-line edits.
 ready_path = config.READY_PATH
 ingest_path = config.INGEST_PATH
-ingested_path = config.INGESTED_PATH
+# NOTE: config.INGESTED_PATH still exists for the retirement tooling
+# (scripts/reconcile_ingested_wasabi.py, scripts/sync_missing_to_wasabi.py)
+# but the ops layer no longer reads it — the 003-ingested local archive
+# copy was retired 2026-07-26 (see move_to_ingested's docstring).
 sftp_host = config.SFTP_HOST
 sftp_username = config.SFTP_ID
 sftp_password = config.SFTP_PWD
@@ -1231,78 +1234,70 @@ def _human_size(num_bytes):
 
 def move_to_ingested(uuid, folder):
     """
-    Moves packages to ingested folder and Wasabi S3 bucket
-    @param: pid
-    @param: folder
-    @returns: Dictionary
+    Archives a completed batch's packages to Wasabi S3 and, on VERIFIED
+    success, removes the local 002-ingest staging copy.
+
+    2026-07-26 (003-ingested retirement, phase 3 — see
+    repo/INGESTED_RETIREMENT_PLAN.md): the local `003-ingested/` archive
+    copy is NO LONGER WRITTEN. The `cp -R` that produced it was never
+    verified — the 2026-07-26 reconciliation of the 7.2 TB backlog found
+    its one corrupt file was truncated by that very copy path — while the
+    Wasabi upload below IS verified per file (head_object size check in
+    wasabi.upload_directory) and gates the source cleanup. The Wasabi
+    batch archive is the sole batch-snapshot custodian from here on;
+    preservation-grade redundancy lives in the AIP chain (Wasabi
+    aip-store + DuraCloud + AM storage).
+
+    This also retires the old two-branch layout (per-file cp when the
+    ingested folder existed / whole-folder rename when it didn't). Both
+    branches produced the same S3 keys — `<folder-without-new_>/<rel>` —
+    which is what this single path uploads. The rename variant also
+    uploaded ALL of 002-ingest with an empty prefix, which would have
+    swept any concurrent ingest's staging dir into the wrong keys; the
+    unified path uploads only 002-ingest/<uuid>/.
+
+    On S3 failure the source is left in place (2026-05-24 data-loss fix
+    invariant: cleanup ONLY on verified success) and the caller — repov2
+    Stage 5 — records a FAILED archive_to_wasabi job so staff see it in
+    Job History. The remedy is re-running the archive after the cause is
+    fixed; nothing is lost.
+
+    @param: uuid    directory name in 002-ingest (the collection pid)
+    @param: folder  batch folder name (used, minus `new_`, as the S3 prefix)
+    @returns: Dictionary {result, errors} — same contract as before:
+        result 'packages_moved_to_ingested_folder' on success,
+               'packages_not_moved_to_ingested_folder' otherwise.
     """
 
     errors = []
-    ingested = ingested_path + folder.replace('new_', '')
-    exists = os.path.isdir(ingested)
     result = 'packages_not_moved_to_ingested_folder'
+    source = ingest_path + uuid + '/'
 
-    if exists:
+    if not os.path.isdir(source):
+        logger.warning('move_to_ingested: source not found: %s', source)
+        errors.append('ERROR: Source not found in 002-ingest (move_to_ingested)')
+        return dict(result=result, errors=errors)
 
-        reset_permissions(folder)
+    # Legacy side effect preserved: re-open the 001-ready batch folder's
+    # permissions so staff can keep adding packages to an in-progress
+    # collection. Best-effort — the folder may already be gone when the
+    # last package of a batch completes (chown failure is logged by _run
+    # and ignored, matching the previous behavior).
+    reset_permissions(folder)
 
-        try:  # move only files because collection folder already exists
-            file_names = [f for f in os.listdir(ingest_path + uuid) if not f.startswith('.')]
-
-            for file_name in file_names:
-                _run(['cp', '-R', '--', os.path.join(ingest_path + uuid, file_name), ingested])
-
-            source = ingest_path + uuid + '/'
-            # 2026-05-24 data-loss fix: the prior check was
-            # `if move_result == 1` against the raw os.system return,
-            # which never matched an actual AWS CLI failure
-            # (os.system encodes exit code 1 as 256). The shutil.rmtree
-            # then ran on a failed S3 upload, silently destroying the
-            # local source. The new move_to_s3 returns 0 on success
-            # and a non-zero value on failure; rmtree ONLY runs on 0.
-            move_result = move_to_s3(source, folder.replace('new_', ''))
-            if move_result != 0:
-                errors.append('ERROR: Unable to move packages to wasabi s3')
-            else:
-                shutil.rmtree(source)
-        except Exception as e:
-            logger.info(e)
-            return errors.append('ERROR: Unable to move files to ingested folder (move_to_ingested)')
-
-    else:  # move entire folder
-
-        try:
-            shutil.move(ingest_path + uuid, ingest_path + folder.replace('new_', ''))
-            _run(['cp', '-R', '--', ingest_path + folder.replace('new_', ''), ingested])
-            source = ingest_path
-            move_result = move_to_s3(source, '')
-            # See data-loss fix comment above. Same invariant: only
-            # rmtree the local copy after the S3 upload confirms.
-            if move_result != 0:
-                errors.append('ERROR: Unable to move packages to wasabi s3')
-            else:
-                shutil.rmtree(ingest_path + folder.replace('new_', ''))
-
-            _run(['rm', '-R', '--', ingest_path + folder])
-        except Exception as e:
-            logger.info(e)
-            return errors.append('ERROR: Unable to move folder (move_to_ingested)')
-
-    if len(errors) == 0:
-        try:
-            logger.info('delete collection file after batch is complete')
-            # deletes file
-            # os.remove('collection')
-        except Exception as e:
-            logger.info(e)
-            logger.info('collection file not found')
-
-        try:
-            #clean_up_sftp(uuid)
+    try:
+        move_result = move_to_s3(source, folder.replace('new_', ''))
+        if move_result != 0:
+            errors.append('ERROR: Unable to move packages to wasabi s3')
+        else:
+            # Verified upload (per-file head_object check inside
+            # wasabi.upload_directory) — only now is the staging copy
+            # safe to remove.
+            shutil.rmtree(source)
             result = 'packages_moved_to_ingested_folder'
-        except Exception as e:
-            logger.info(e)
-            logger.info('unable to run clean up sftp function')
+    except Exception as e:
+        logger.error('move_to_ingested: %s', e)
+        errors.append('ERROR: Unable to archive packages to wasabi s3 (move_to_ingested)')
 
     return dict(result=result, errors=errors)
 

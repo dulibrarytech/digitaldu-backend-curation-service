@@ -153,13 +153,11 @@ class SubprocessSinkTests(unittest.TestCase):
         self.tmp = tempfile.mkdtemp(prefix='curation_cmdinj_')
         self.ready = os.path.join(self.tmp, 'ready') + '/'
         self.ingest = os.path.join(self.tmp, 'ingest') + '/'
-        self.ingested = os.path.join(self.tmp, 'ingested') + '/'
-        for d in (self.ready, self.ingest, self.ingested):
+        for d in (self.ready, self.ingest):
             os.makedirs(d)
         self._patches = [
             patch.object(ops, 'ready_path', self.ready),
             patch.object(ops, 'ingest_path', self.ingest),
-            patch.object(ops, 'ingested_path', self.ingested),
             patch.object(ops, 'uid', '1000'),
             patch.object(ops, 'gid', '1000'),
         ]
@@ -193,10 +191,12 @@ class SubprocessSinkTests(unittest.TestCase):
 
     @patch('lib.archivematica_ops.move_to_s3', return_value=0)
     @patch('lib.archivematica_ops.subprocess.run')
-    def test_move_to_ingested_exists_branch_uses_cp_argv(self, mock_run, _m_s3):
+    def test_move_to_ingested_no_longer_copies_to_ingested_dir(self, mock_run, m_s3):
+        # 003-ingested retirement (phase 3): the only subprocess left in
+        # the move_to_ingested path is reset_permissions' chown — the
+        # cp/rm calls that produced the unverified local archive copy
+        # are gone. The Wasabi upload happens in-process via move_to_s3.
         mock_run.return_value = _ok_run()
-        # 'exists' branch: ingested/<folder-without-new_> already present.
-        os.makedirs(os.path.join(self.ingested, 'coll'))
         src = os.path.join(self.ingest, 'uuid-xyz')
         os.makedirs(src)
         with open(os.path.join(src, 'image.tif'), 'w') as f:
@@ -206,17 +206,25 @@ class SubprocessSinkTests(unittest.TestCase):
 
         self._assert_no_shell(mock_run)
         commands = [c.args[0][0] for c in mock_run.call_args_list]
-        self.assertIn('cp', commands)     # per-file copy into ingested/
+        self.assertNotIn('cp', commands)
+        self.assertNotIn('rm', commands)
         self.assertIn('chown', commands)  # via reset_permissions()
+        # S3 prefix is the folder name minus `new_`; source is the
+        # 002-ingest staging dir.
+        m_s3.assert_called_once_with(src + '/', 'coll')
         self.assertEqual(result['result'], 'packages_moved_to_ingested_folder')
+        # Verified upload → staging copy removed.
+        self.assertFalse(os.path.exists(src))
 
     @patch('lib.archivematica_ops.move_to_s3', return_value=0)
     @patch('lib.archivematica_ops.subprocess.run')
-    def test_injection_payload_is_passed_as_one_literal_arg(self, mock_run, _m_s3):
-        # Even if validation were bypassed, a metacharacter-laden name must
-        # arrive as a single argv element — never split or interpreted.
+    def test_injection_payload_never_reaches_a_subprocess(self, mock_run, _m_s3):
+        # Even if validation were bypassed, a metacharacter-laden uuid
+        # must never be interpreted: the only subprocess is chown (whose
+        # operand is the FOLDER, one literal element — pinned by
+        # test_reset_permissions_uses_chown_argv); the uuid is used
+        # purely for in-process path handling.
         mock_run.return_value = _ok_run()
-        os.makedirs(os.path.join(self.ingested, 'coll'))
         src = os.path.join(self.ingest, 'uuid;reboot')
         os.makedirs(src)
         with open(os.path.join(src, 'f.txt'), 'w') as f:
@@ -224,12 +232,13 @@ class SubprocessSinkTests(unittest.TestCase):
 
         ops.move_to_ingested('uuid;reboot', 'new_coll')
 
+        self._assert_no_shell(mock_run)
         for call in mock_run.call_args_list:
             argv = call.args[0]
-            if argv[0] == 'cp':
-                # the source path is one element containing the literal ';'
-                self.assertTrue(any('uuid;reboot' in a for a in argv))
-                self.assertTrue(any(';' in a for a in argv))
+            self.assertFalse(
+                any('uuid;reboot' in a for a in argv),
+                'uuid must not appear in any subprocess argv',
+            )
 
 
 if __name__ == '__main__':
