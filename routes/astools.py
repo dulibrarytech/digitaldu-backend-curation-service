@@ -999,6 +999,18 @@ def make_digital_objects():
             }), 200
         else:
             logger.error(f'Script execution failed for batch: {folder}')
+            # Lift the CLI's per-package `FAILED <pkg>: <reason>` summary
+            # lines (see make_digital_object.report_batch_failures) into
+            # errors[] so the dashboard's result card names the failed
+            # packages and the cause (e.g. duplicate component IDs)
+            # instead of just a return code. Capped — the full output is
+            # still in the response body + log file.
+            errors = [
+                line.strip()
+                for line in (output_content or '').splitlines()
+                if line.startswith('FAILED ')
+            ][:10]
+            errors.append(f'Script execution failed with return code {result.returncode}')
             return jsonify({
                 'result': {
                     'success': False,
@@ -1006,7 +1018,7 @@ def make_digital_objects():
                     'output': output_content,
                     'log_file': log_filename
                 },
-                'errors': [f'Script execution failed with return code {result.returncode}']
+                'errors': errors
             }), 500
 
     except subprocess.TimeoutExpired:

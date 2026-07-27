@@ -656,6 +656,61 @@ def as_log(message: str):
     print(message)
 
 
+def process_batch(base_path: Path, no_kaltura_id: bool, no_caption: bool,
+                  no_publish: bool):
+    """
+    Processes every subdirectory of base_path, continuing past
+    per-package failures.
+
+    2026-07-27: failures are now COLLECTED and returned instead of only
+    logged. Historically the batch loop swallowed every per-package
+    exception (duplicate component IDs, uncataloged items, ...) and the
+    script still exited 0 — the web route then reported success and
+    staff only discovered the un-generated uri.txt at Description QA.
+    main() now exits non-zero when this returns any failures, which the
+    curation route and the dashboard already treat as a failed run.
+
+    @return: (failures, total) where failures is [(subdir_name, error
+             message), ...] and total is the number of subdirectories
+             attempted.
+    """
+    subdirs = sorted([d for d in base_path.iterdir() if d.is_dir()], key=lambda x: x.name)
+
+    if not subdirs:
+        logger.warning(f'No subdirectories found in {base_path}')
+        return [], 0
+
+    logger.info(f'Processing {len(subdirs)} director(ies)')
+
+    failures = []
+    for subdir in subdirs:
+        try:
+            process(subdir, no_kaltura_id, no_caption, no_publish)
+        except Exception as e:
+            logger.error(f'Failed to process {subdir.name}: {str(e)}')
+            failures.append((subdir.name, str(e)))
+            # Continue with next directory
+            continue
+    return failures, len(subdirs)
+
+
+def report_batch_failures(failures, total):
+    """
+    Prints the end-of-run failure summary to STDOUT (as_log), where the
+    web route's captured output — and therefore the dashboard's result
+    card — will carry it. Lines are prefixed `FAILED ` so the route can
+    lift them into its errors[] array for the card's headline.
+    """
+    if not failures:
+        return
+    as_log('')
+    as_log(f'==== MAKE DIGITAL OBJECTS: {len(failures)} of {total} package(s) FAILED ====')
+    for name, error in failures:
+        as_log(f'FAILED {name}: {error}')
+    as_log('Fix the issues above in ArchivesSpace, then run Make Digital Objects again.')
+    as_log('Packages that already succeeded are unaffected and are re-checked on the next run.')
+
+
 def process(path: Path, no_kaltura_id: bool, no_caption: bool, no_publish: bool):
     """
     Main processing function for a single directory.
@@ -772,22 +827,22 @@ def main():
             logger.info('Running in batch mode')
             base_path = get_path(args.path, config['WORKSPACE'])
 
-            # Get all subdirectories
-            subdirs = sorted([d for d in base_path.iterdir() if d.is_dir()], key=lambda x: x.name)
-
-            if not subdirs:
-                logger.warning(f'No subdirectories found in {base_path}')
-                return
-
-            logger.info(f'Processing {len(subdirs)} director(ies)')
-
-            for subdir in subdirs:
-                try:
-                    process(subdir, args.no_kaltura_id, args.no_caption, args.no_publish)
-                except Exception as e:
-                    logger.error(f'Failed to process {subdir.name}: {str(e)}')
-                    # Continue with next directory
-                    continue
+            failures, total = process_batch(
+                base_path, args.no_kaltura_id, args.no_caption, args.no_publish
+            )
+            if failures:
+                # Per-package failures (duplicate component IDs,
+                # uncataloged items, ...) must FAIL the run: exit 2 so
+                # the curation route returns its failure envelope and
+                # the dashboard records a FAILED job with the summary
+                # visible on the result card. Exit 2 (not 1)
+                # distinguishes "some packages failed" from the
+                # config/connection failures below.
+                report_batch_failures(failures, total)
+                logger.error(
+                    f'Script completed with {len(failures)} failed package(s)'
+                )
+                sys.exit(2)
         else:
             path = get_path(args.path, config['WORKSPACE'])
             process(path, args.no_kaltura_id, args.no_caption, args.no_publish)
