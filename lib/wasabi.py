@@ -560,6 +560,121 @@ def generate_presigned_url(key, ttl_seconds=900, bucket_config=None):
     )
 
 
+def list_prefixes(prefix, continuation_token=None, bucket_config=None,
+                  max_keys=1000):
+    """
+    One page of "subfolder" names under `prefix` (Delimiter='/').
+
+    Read-only. Used by the archive-browser routes (routes/archive.py)
+    to walk the batch archive's <collection>/<package>/<files> layout
+    one level at a time without ever listing the full 88k-object
+    bucket.
+
+    Args:
+        prefix              key prefix to list under ('' for the bucket
+                            top level; otherwise MUST end with '/')
+        continuation_token  opaque S3 token from a previous page, or None
+        bucket_config       WASABI_*BUCKET override (None → WASABI_BUCKET)
+        max_keys            page size (S3 caps at 1000)
+
+    Returns:
+        {'prefixes': [<name>, ...],   # child names, no parent prefix,
+                                      # no trailing slash, S3 sort order
+         'next_token': str | None}
+    """
+    bucket, base_prefix = _resolve_bucket(bucket_config)
+    full_prefix = base_prefix + prefix
+    client = _make_client()
+
+    kwargs = {
+        'Bucket': bucket,
+        'Prefix': full_prefix,
+        'Delimiter': '/',
+        'MaxKeys': max_keys,
+    }
+    if continuation_token:
+        kwargs['ContinuationToken'] = continuation_token
+    res = client.list_objects_v2(**kwargs)
+
+    prefixes = []
+    for entry in res.get('CommonPrefixes', []):
+        name = entry.get('Prefix', '')[len(full_prefix):].rstrip('/')
+        if name:
+            prefixes.append(name)
+    return {
+        'prefixes': prefixes,
+        'next_token': res.get('NextContinuationToken') if res.get('IsTruncated') else None,
+    }
+
+
+def list_all_prefixes(prefix, bucket_config=None):
+    """
+    Every "subfolder" name under `prefix`, following pagination to the
+    end. Safe ONLY for levels known to be small (the archive browser
+    uses it for the ~hundred top-level collections); deeper levels go
+    through the paged list_prefixes so the UI can lazy-load.
+    """
+    names = []
+    token = None
+    while True:
+        page = list_prefixes(prefix, continuation_token=token,
+                             bucket_config=bucket_config)
+        names.extend(page['prefixes'])
+        token = page['next_token']
+        if not token:
+            break
+    return names
+
+
+def list_objects(prefix, continuation_token=None, bucket_config=None,
+                 max_keys=1000):
+    """
+    One page of OBJECTS directly under `prefix` (Delimiter='/'), with
+    size + last-modified. Companion to list_prefixes for the archive
+    browser's file level; a level can contain both subfolders and
+    files, so callers wanting a complete picture use both.
+
+    Returns:
+        {'objects': [{'name': <basename>, 'key': <full key minus
+                      base_prefix>, 'size': int,
+                      'last_modified': ISO-8601 str | None}, ...],
+         'next_token': str | None}
+    """
+    bucket, base_prefix = _resolve_bucket(bucket_config)
+    full_prefix = base_prefix + prefix
+    client = _make_client()
+
+    kwargs = {
+        'Bucket': bucket,
+        'Prefix': full_prefix,
+        'Delimiter': '/',
+        'MaxKeys': max_keys,
+    }
+    if continuation_token:
+        kwargs['ContinuationToken'] = continuation_token
+    res = client.list_objects_v2(**kwargs)
+
+    objects = []
+    for obj in res.get('Contents', []):
+        key = obj.get('Key', '')
+        name = key[len(full_prefix):]
+        # Skip the zero-byte "directory marker" some S3 tools create at
+        # the prefix itself.
+        if not name:
+            continue
+        last_modified = obj.get('LastModified')
+        objects.append({
+            'name': name,
+            'key': key[len(base_prefix):],
+            'size': obj.get('Size', 0),
+            'last_modified': last_modified.isoformat() if last_modified else None,
+        })
+    return {
+        'objects': objects,
+        'next_token': res.get('NextContinuationToken') if res.get('IsTruncated') else None,
+    }
+
+
 def health_check():
     """
     Probe Wasabi reachability + bucket auth. Called once at app
