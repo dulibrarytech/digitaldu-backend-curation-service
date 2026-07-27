@@ -33,11 +33,7 @@ Flask app.
 At the end of a successful ingest, the batch's `002-ingest` staging copy
 is archived **straight to Wasabi** — every uploaded file is verified with
 a `head_object` size check, and the staging copy is removed only after
-that verification passes. The old local `003-ingested/` archive folder
-was **retired 2026-07-26** (its `cp -R` copy was never verified; see
-`repo/INGESTED_RETIREMENT_PLAN.md` for the full history and the
-reconciliation that preceded the change). Endpoint and result names
-still say "ingested" for wire compatibility — they are historical.
+that verification passes. 
 
 ## Requirements
 
@@ -103,7 +99,7 @@ Two blueprints, both auth-required (`X-API-Key` header, or legacy
 | `GET /move-from-ingest-to-ready` | Rollback move (used by Node rollback flow) |
 | `GET /move-to-sftp` | Push staged batch to AM's SFTP source |
 | `GET /upload-status` | Poll SFTP upload progress |
-| `GET /move-to-ingested` | After-success archive of `002-ingest/<uuid>/` to Wasabi (per-file verified; staging copy removed only on verified success). Name is historical — no local `003-ingested` copy is written any more. |
+| `GET /move-to-ingested` | After-success archive of `002-ingest/<uuid>/` to Wasabi (per-file verified; staging copy removed only on verified success). |
 | `GET /cleanup_sftp` | Remove a package's files + parent dir from SFTP |
 | `GET /reset_permissions` | chown ready folder back to service user |
 | `GET /set-collection-folder`, `/check-collection-folder` | Folder naming helpers |
@@ -237,11 +233,6 @@ Fill in:
   string. Generate with `openssl rand -hex 32`.
 - `READY_PATH`, `INGEST_PATH` — local filesystem staging directories
   (`001-ready`, `002-ingest`).
-- `INGESTED_PATH` — **tooling-only since 2026-07-26**: the service no
-  longer writes a local `003-ingested` archive copy, but the
-  reconciliation / sync scripts under `scripts/` still read this to
-  audit the historical backlog. Keep it set until that backlog is
-  fully deleted, then it can be dropped.
 - `SFTP_HOST`, `SFTP_ID`, `SFTP_PWD`, `SFTP_REMOTE_PATH` —
   Archivematica SFTP daemon address + creds.
 - `WASABI_ENDPOINT`, `WASABI_BUCKET` — Wasabi endpoint + the **batch
@@ -249,7 +240,7 @@ Fill in:
   `WASABI_BUCKET` accepts the legacy `s3://name/` form (an optional
   path becomes a base key prefix) OR the bare `name` form.
 - `WASABI_AIP_BUCKET` — the **AIP store** bucket/prefix (e.g.
-  `s3://library-repository/aip-store/`) used by the `/api/v2/aip/*`
+  `s3://repository-bucket/aip-store/`) used by the `/api/v2/aip/*`
   routes. Required for those routes; they refuse cleanly if unset
   rather than falling back to the batch bucket.
 - `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`
@@ -468,47 +459,6 @@ r = c.list_objects_v2(Bucket=b, Prefix=p + '<folder>/', MaxKeys=25); \
 For a full per-file audit of a batch, use the reconciliation script
 (next section) with `--batch <folder>` instead.
 
-### Audit / repair the Wasabi batch archive (scripts/)
-
-Both scripts run on the curation host with the service env loaded:
-
-```bash
-set -a; source /etc/curation-api/env; set +a
-```
-
-**Reconcile** — read-only; compares every file under
-`INGESTED_PATH/<batch>/` (the historical local archive) against
-`s3://$WASABI_BUCKET/<batch>/` by existence + size, and writes a CSV
-summary + JSONL detail with a per-batch verdict
-(`VERIFIED / MISSING / MISMATCH / EMPTY_LOCAL / ERROR`):
-
-```bash
-.venv/bin/python scripts/reconcile_ingested_wasabi.py --limit 5 --output-dir ~/reconcile-sample
-.venv/bin/python scripts/reconcile_ingested_wasabi.py --output-dir ~/reconcile-$(date +%F)
-```
-
-**Sync** — uploads only what reconcile found missing. Dry-run by
-default (`--execute` to upload); never deletes; verifies each upload
-with `head_object`; skips size-mismatched files unless
-`--overwrite-mismatch` (review those by hand first):
-
-```bash
-.venv/bin/python scripts/sync_missing_to_wasabi.py --from-summary <reconcile.csv>
-.venv/bin/python scripts/sync_missing_to_wasabi.py --from-summary <reconcile.csv> --execute
-```
-
-These exist for the 003-ingested retirement backlog audit
-(`repo/INGESTED_RETIREMENT_PLAN.md`) and remain useful as a general
-"is this batch fully in Wasabi?" check.
-
-### Re-run the Wasabi health probe after a config change
-
-Either restart the service (boot probe re-runs) or hit the
-on-demand route:
-
-```bash
-curl -s -H "X-API-Key: $API_KEY" http://127.0.0.1:8185/health/wasabi | jq
-```
 
 ### Rebuild the venv from scratch
 
@@ -535,7 +485,6 @@ sudo journalctl -u curation-api -n 50  # confirm clean boot
 | `wasabi probe FAILED err=head_bucket failed (403)` | Wasabi creds wrong OR bucket policy denies | Re-issue keys; verify with `aws s3 ls --profile=<p> --endpoint-url=<e> <bucket>` as user `curation`. |
 | `wasabi upload FAILED file=... err=NoCredentialsError` | Profile creds disappeared mid-run (token expiry, file rotation) | Restart the service to re-read `~/.aws/config`. |
 | `wasabi VERIFY FAILED file=... local=N remote=M` | Uploaded object's size disagrees with the local file (truncated/partial transfer) | The staging copy is preserved — fix the cause and re-run the archive (re-trigger `move-to-ingested`, or `scripts/sync_missing_to_wasabi.py`). Also appears as a FAILED "Archive to Wasabi" row in the dashboard Job History. |
-| `003-ingested/` no longer receiving batches | Expected — the local archive copy was retired 2026-07-26 (`repo/INGESTED_RETIREMENT_PLAN.md`). Wasabi is the batch archive. | — |
 | `aws s3 cp` no longer in process list | Expected — boto3 replaced the CLI shellout. Look for `wasabi upload` log lines instead. | — |
 | paramiko `AuthenticationException` | Wrong `SFTP_PWD` OR Archivematica restricted user account | Verify with `sftp -P <port> $SFTP_ID@$SFTP_HOST`. |
 | `python-magic` import error | `libmagic` system library missing | `dnf install file-libs`. |
