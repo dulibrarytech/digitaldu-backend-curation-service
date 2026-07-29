@@ -135,6 +135,13 @@ def scan_batch(batch_path):
         packages          — sorted package (subfolder) names
         processed         — sorted package names that contain uri.txt
         structure_errors  — list of flag dicts (see module docstring)
+        total_bytes       — sum of regular-file sizes across the batch
+                            root and every package (from the same
+                            scandir entries; stat only, still no file
+                            opens). Contents of nested directories are
+                            NOT counted — nesting is a structure error
+                            and their contents never ingest as-is.
+                            None when the batch folder is unreadable.
     """
     batch_path = Path(batch_path)
     name = batch_path.name
@@ -142,6 +149,14 @@ def scan_batch(batch_path):
     packages = []
     loose_files = []
     structure_errors = []
+    total_bytes = 0
+
+    def _entry_size(entry):
+        """st_size of a scandir entry; 0 if it vanished mid-scan."""
+        try:
+            return entry.stat(follow_symlinks=False).st_size
+        except OSError:
+            return 0
 
     try:
         with os.scandir(batch_path) as entries:
@@ -152,6 +167,7 @@ def scan_batch(batch_path):
                     packages.append(entry.name)
                 elif entry.is_file(follow_symlinks=False):
                     loose_files.append(entry.name)
+                    total_bytes += _entry_size(entry)
     except PermissionError as e:
         logger.warning('scan_batch: permission denied for %s: %s', batch_path, e)
         return {
@@ -159,6 +175,7 @@ def scan_batch(batch_path):
             'packages': [],
             'processed': [],
             'structure_errors': [_flag('unreadable', SEVERITY_ERROR, [])],
+            'total_bytes': None,
         }
 
     packages.sort()
@@ -193,6 +210,7 @@ def scan_batch(batch_path):
                     if entry.is_dir(follow_symlinks=False):
                         subdirs.append(entry.name)
                     elif entry.is_file(follow_symlinks=False):
+                        total_bytes += _entry_size(entry)
                         if entry.name == 'uri.txt':
                             has_uri = True
                         else:
@@ -233,6 +251,7 @@ def scan_batch(batch_path):
         'packages': packages,
         'processed': processed,
         'structure_errors': structure_errors,
+        'total_bytes': total_bytes,
     }
 
 

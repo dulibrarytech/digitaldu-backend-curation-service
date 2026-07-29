@@ -322,3 +322,61 @@ class GetWorkspaceBatchesTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class TotalBytesTests(unittest.TestCase):
+    """
+    total_bytes — sum of regular-file sizes across the batch root and
+    every package (stat only, no opens). Nested-dir contents excluded;
+    unreadable batch -> None.
+    """
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(prefix='batch_structure_size_'))
+
+    def tearDown(self):
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    def _make_batch(self, name=GOOD_BATCH):
+        batch = self.root / name
+        batch.mkdir()
+        return batch
+
+    def _write(self, path, size):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b'x' * size)
+
+    def test_sums_package_files_and_loose_files(self):
+        batch = self._make_batch()
+        self._write(batch / 'pkg_a' / 'file1.tif', 100)
+        self._write(batch / 'pkg_a' / 'file2.tif', 200)
+        self._write(batch / 'pkg_b' / 'file1.pdf', 50)
+        self._write(batch / 'loose.tif', 7)  # loose file still counts
+
+        scan = bs.scan_batch(batch)
+        self.assertEqual(scan['total_bytes'], 357)
+
+    def test_uri_txt_counts_but_nested_dir_contents_do_not(self):
+        batch = self._make_batch()
+        self._write(batch / 'pkg_a' / 'file1.tif', 100)
+        self._write(batch / 'pkg_a' / 'uri.txt', 10)
+        # Nested dir (a structure error) — its contents are excluded.
+        self._write(batch / 'pkg_a' / 'nested' / 'hidden.tif', 5000)
+
+        scan = bs.scan_batch(batch)
+        self.assertEqual(scan['total_bytes'], 110)
+        self.assertIn('nested_dirs', {f['code'] for f in scan['structure_errors']})
+
+    def test_empty_batch_is_zero_and_unreadable_is_none(self):
+        batch = self._make_batch()
+        self.assertEqual(bs.scan_batch(batch)['total_bytes'], 0)
+
+        if os.geteuid() == 0:
+            self.skipTest('running as root — chmod 0 is not enforceable')
+        locked = self._make_batch('new_locked-resources_9')
+        os.chmod(locked, 0)
+        try:
+            scan = bs.scan_batch(locked)
+            self.assertIsNone(scan['total_bytes'])
+        finally:
+            os.chmod(locked, 0o755)
