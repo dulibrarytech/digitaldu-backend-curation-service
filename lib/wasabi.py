@@ -627,12 +627,17 @@ def list_all_prefixes(prefix, bucket_config=None):
 
 
 def list_objects(prefix, continuation_token=None, bucket_config=None,
-                 max_keys=1000):
+                 max_keys=1000, recursive=False):
     """
     One page of OBJECTS directly under `prefix` (Delimiter='/'), with
     size + last-modified. Companion to list_prefixes for the archive
     browser's file level; a level can contain both subfolders and
     files, so callers wanting a complete picture use both.
+
+    With recursive=True the Delimiter is dropped, so the page walks
+    EVERY object under the prefix regardless of nesting — used by the
+    AIP-store size listing, where the caller wants the whole flat
+    inventory rather than one browse level.
 
     Returns:
         {'objects': [{'name': <basename>, 'key': <full key minus
@@ -647,9 +652,10 @@ def list_objects(prefix, continuation_token=None, bucket_config=None,
     kwargs = {
         'Bucket': bucket,
         'Prefix': full_prefix,
-        'Delimiter': '/',
         'MaxKeys': max_keys,
     }
+    if not recursive:
+        kwargs['Delimiter'] = '/'
     if continuation_token:
         kwargs['ContinuationToken'] = continuation_token
     res = client.list_objects_v2(**kwargs)

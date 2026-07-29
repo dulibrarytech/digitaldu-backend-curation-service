@@ -43,6 +43,15 @@ Endpoints:
         actual AIP bytes never transit repo-backend-v2 or the curation
         service.
 
+    GET /api/v2/aip/list-objects?token=<continuation>
+        Returns: 200 with {ok, objects: [{key, size}], next_token,
+        error?}
+
+        One page (up to 1000) of the AIP-store bucket's full flat
+        inventory — key + size only. Consumed by repo-backend-v2's
+        scripts/backfill_aip_sizes.js to fill tbl_aip_store.bytes for
+        legacy rows without a per-object round-trip.
+
 Auth: shared X-API-Key (same scheme as /api/v2/qa/).
 """
 
@@ -108,6 +117,46 @@ def copy_to_wasabi():
         }), 200
 
     return jsonify(result), 200
+
+
+@aip_bp.route('/list-objects', methods=['GET'])
+@require_api_key_qa
+def list_aip_objects():
+    """
+    One page of the AIP-store bucket inventory (key + size). Pass the
+    returned next_token back as ?token= to walk the whole bucket —
+    ~21 pages for the current ~20.9k-object store. Same 200 + ok=false
+    error envelope as the other AIP routes.
+    """
+    if not config.WASABI_AIP_BUCKET:
+        return jsonify({
+            'ok': False,
+            'error': (
+                'WASABI_AIP_BUCKET is not configured. Set it in the '
+                'curation service .env and restart.'
+            ),
+        }), 200
+
+    token = (request.args.get('token') or '').strip() or None
+    try:
+        res = wasabi.list_objects(
+            '',
+            continuation_token=token,
+            bucket_config=config.WASABI_AIP_BUCKET,
+            max_keys=1000,
+            recursive=True,
+        )
+    except Exception as e:
+        logger.exception('list_aip_objects: listing failed')
+        return jsonify({'ok': False, 'error': str(e)}), 200
+
+    return jsonify({
+        'ok': True,
+        'objects': [
+            {'key': o['key'], 'size': o['size']} for o in res['objects']
+        ],
+        'next_token': res['next_token'],
+    }), 200
 
 
 @aip_bp.route('/presigned-url', methods=['POST'])
