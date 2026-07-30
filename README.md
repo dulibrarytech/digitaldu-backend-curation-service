@@ -201,7 +201,7 @@ Fill in:
   `WASABI_BUCKET` accepts the legacy `s3://name/` form (an optional
   path becomes a base key prefix) OR the bare `name` form.
 - `WASABI_AIP_BUCKET` — the **AIP store** bucket/prefix (e.g.
-  `s3://repository-bucket/aip-store/`) used by the `/api/v2/aip/*`
+  `s3://bucket/aip-store/`) used by the `/api/v2/aip/*`
   routes. Required for those routes; they refuse cleanly if unset
   rather than falling back to the batch bucket.
 - `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`
