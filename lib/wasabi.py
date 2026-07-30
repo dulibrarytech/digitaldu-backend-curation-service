@@ -607,6 +607,54 @@ def list_prefixes(prefix, continuation_token=None, bucket_config=None,
     }
 
 
+def search_prefixes(parent, q, continuation_token=None, bucket_config=None,
+                    max_keys=1000):
+    """
+    One page of child "subfolder" names under `parent` whose names
+    START WITH `q` — a server-side S3 prefix search (2026-07-30).
+
+    Built for the archive browser's package level: a migrated
+    collection can hold thousands of package folders, and the
+    client-side "filter loaded names" box could not see past the
+    loaded page — a freshly archived package looked missing when it
+    was merely pages deep. S3 prefix listing makes typing the start
+    of a package id an exact, bucket-side search.
+
+    Args:
+        parent   level prefix, '' or ending with '/'
+                 (e.g. 'B002_..._496/')
+        q        partial child name to match from the start
+    Returns:
+        same shape as list_prefixes: {'prefixes': [name, ...],
+        'next_token': str | None} — names are full child names
+        (q re-included), no trailing slash.
+    """
+    bucket, base_prefix = _resolve_bucket(bucket_config)
+    full_parent = base_prefix + parent
+    client = _make_client()
+
+    kwargs = {
+        'Bucket': bucket,
+        'Prefix': full_parent + q,
+        'Delimiter': '/',
+        'MaxKeys': max_keys,
+    }
+    if continuation_token:
+        kwargs['ContinuationToken'] = continuation_token
+    res = client.list_objects_v2(**kwargs)
+
+    names = []
+    for cp in res.get('CommonPrefixes', []):
+        name = cp.get('Prefix', '')[len(full_parent):].rstrip('/')
+        if name:
+            names.append(name)
+    return {
+        'prefixes': names,
+        'next_token': res.get('NextContinuationToken')
+        if res.get('IsTruncated') else None,
+    }
+
+
 def list_all_prefixes(prefix, bucket_config=None):
     """
     Every "subfolder" name under `prefix`, following pagination to the

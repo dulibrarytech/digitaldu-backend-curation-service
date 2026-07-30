@@ -117,13 +117,27 @@ def list_collections():
 @archive_bp.route('/collections/<collection>/packages', methods=['GET'])
 @require_api_key_qa
 def list_packages(collection):
-    """One page of package folder names inside a collection."""
+    """One page of package folder names inside a collection.
+
+    Optional `q` = server-side S3 prefix search (2026-07-30): matches
+    package names STARTING WITH q, bucket-side — a migrated collection
+    can hold thousands of packages, and the loaded-page filter could
+    not see past pagination."""
     err = validate_segment(collection, 'collection')
     if err:
         return _error(400, err)
     token = request.args.get('token') or None
+    q = (request.args.get('q') or '').strip()
+    if q:
+        err = validate_segment(q, 'q')
+        if err:
+            return _error(400, err)
     try:
-        page = wasabi.list_prefixes(collection + '/', continuation_token=token)
+        page = (
+            wasabi.search_prefixes(collection + '/', q, continuation_token=token)
+            if q
+            else wasabi.list_prefixes(collection + '/', continuation_token=token)
+        )
         return jsonify({
             'result': {
                 'packages': page['prefixes'],

@@ -74,14 +74,28 @@ def _am_storage_auth_header():
     }
 
 
-def _am_file_url(aip_uuid):
+def _am_storage_base():
+    """Normalize ARCHIVEMATICA_STORAGE_API to a host base WITHOUT the
+    /api suffix. The two repos grew different env conventions —
+    repo-backend-v2 stores `https://host:8000/api/` (and appends
+    `v2/...`), while this module appends the full `/api/v2/...` path.
+    An operator mirroring the repov2 value here (the natural move, and
+    exactly what the deploy doc suggested) produced
+    `.../api/api/v2/file/<uuid>/` — which AM answers with a clean 404
+    for EVERY AIP (2026-07-30 staging incident, masqueraded as
+    "AIP not found in AM Storage Service"). Accept both shapes."""
     base = (config.ARCHIVEMATICA_STORAGE_API or '').rstrip('/')
-    return f'{base}/api/v2/file/{aip_uuid}/'
+    if base.endswith('/api'):
+        base = base[:-len('/api')]
+    return base
+
+
+def _am_file_url(aip_uuid):
+    return f'{_am_storage_base()}/api/v2/file/{aip_uuid}/'
 
 
 def _am_download_url(aip_uuid):
-    base = (config.ARCHIVEMATICA_STORAGE_API or '').rstrip('/')
-    return f'{base}/api/v2/file/{aip_uuid}/download/'
+    return f'{_am_storage_base()}/api/v2/file/{aip_uuid}/download/'
 
 
 def _resolve_wasabi_key(am_metadata):

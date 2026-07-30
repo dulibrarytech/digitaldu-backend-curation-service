@@ -234,3 +234,43 @@ class WasabiListingHelperTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class PackageSearchTests(unittest.TestCase):
+    """Server-side package prefix search (2026-07-30): ?q= on the
+    packages level queries S3 by name prefix instead of filtering the
+    loaded page — a fresh backup in a thousands-of-packages migrated
+    collection was invisible behind pagination."""
+
+    def setUp(self):
+        self.client = _make_client()
+        self.env = patch.dict(os.environ, {'API_KEY': API_KEY})
+        self.env.start()
+
+    def tearDown(self):
+        self.env.stop()
+
+    def _get(self, url):
+        return self.client.get(url, headers={'X-API-Key': API_KEY})
+
+    def test_q_routes_to_search_prefixes(self):
+        fake = {'prefixes': ['B002.01.0103.0160'], 'next_token': None}
+        with patch.object(wasabi, 'search_prefixes', return_value=fake) as m:
+            res = self._get('/api/v2/archive/collections/coll_a/packages?q=B002.01.0103')
+        self.assertEqual(res.status_code, 200)
+        body = res.get_json()
+        self.assertEqual(body['result']['packages'], ['B002.01.0103.0160'])
+        args, kwargs = m.call_args
+        self.assertEqual(args[0], 'coll_a/')
+        self.assertEqual(args[1], 'B002.01.0103')
+
+    def test_without_q_uses_plain_listing(self):
+        fake = {'prefixes': ['p1'], 'next_token': 'tok'}
+        with patch.object(wasabi, 'list_prefixes', return_value=fake) as m:
+            res = self._get('/api/v2/archive/collections/coll_a/packages')
+        self.assertEqual(res.status_code, 200)
+        self.assertTrue(m.called)
+
+    def test_unsafe_q_is_rejected(self):
+        res = self._get('/api/v2/archive/collections/coll_a/packages?q=..%2Fetc')
+        self.assertEqual(res.status_code, 400)

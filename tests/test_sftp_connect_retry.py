@@ -213,3 +213,38 @@ class ConnectPacingTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class AmStorageUrlTests(unittest.TestCase):
+    """ARCHIVEMATICA_STORAGE_API arrives in two shapes depending on
+    which repo's convention the operator copied (2026-07-30 staging
+    incident: the /api-suffixed repov2 shape produced /api/api/ URLs
+    and a clean 404 for every AIP)."""
+
+    def _url_for(self, base_value):
+        from lib import aip_ops
+        import config
+        with patch.object(config, 'ARCHIVEMATICA_STORAGE_API', base_value):
+            return aip_ops._am_file_url('u-1')
+
+    def test_host_only_base(self):
+        self.assertEqual(
+            self._url_for('https://am.example:8000'),
+            'https://am.example:8000/api/v2/file/u-1/',
+        )
+
+    def test_api_suffixed_base_repov2_convention(self):
+        for v in ('https://am.example:8000/api/', 'https://am.example:8000/api'):
+            self.assertEqual(
+                self._url_for(v),
+                'https://am.example:8000/api/v2/file/u-1/',
+            )
+
+    def test_download_url_shares_normalization(self):
+        from lib import aip_ops
+        import config
+        with patch.object(config, 'ARCHIVEMATICA_STORAGE_API', 'https://am.example:8000/api/'):
+            self.assertEqual(
+                aip_ops._am_download_url('u-2'),
+                'https://am.example:8000/api/v2/file/u-2/download/',
+            )
