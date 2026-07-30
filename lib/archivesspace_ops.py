@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import os
-import shutil
 import logging
 from pathlib import Path
 from typing import List, Set, Optional
@@ -533,46 +532,3 @@ def check_uri_txt_safe(folder):
             'result': 'Error checking URI txt files',
             'errors': ['Unexpected error occurred']
         }
-
-
-def move_to_ready(folder):
-    """
-    Moves folder from workspace to ready folder and renames it using pid.
-
-    @param folder: Folder name to move
-    @return: Dictionary with result and errors
-    """
-    workspace_path = os.getenv('WORKSPACE')
-    ready_path = os.getenv('READY_PATH')
-    errors = []
-
-    if not workspace_path:
-        errors.append('ERROR: WORKSPACE environment variable not set')
-        return dict(result='batch_not_moved_to_ready_folder.', errors=errors)
-
-    if not ready_path:
-        errors.append('ERROR: READY_PATH environment variable not set')
-        return dict(result='batch_not_moved_to_ready_folder.', errors=errors)
-
-    # Build source and destination paths
-    source_path = Path(workspace_path) / folder
-    destination_path = Path(ready_path) / folder
-
-    try:
-        if not source_path.exists():
-            errors.append(f'ERROR: Source folder does not exist: {source_path}')
-            return dict(result='batch_not_moved_to_ready_folder.', errors=errors)
-
-        shutil.move(str(source_path), str(destination_path))
-        logger.info(f'Moved {source_path} to {destination_path}')
-
-    except Exception as e:
-        logger.error(f'Error moving folder: {str(e)}', exc_info=True)
-        errors.append(f'ERROR: Unable to move folder: {str(e)}')
-
-    if len(errors) == 0:
-        result = 'batch_moved_to_ready_folder.'
-    else:
-        result = 'batch_not_moved_to_ready_folder.'
-
-    return dict(result=result, errors=errors)

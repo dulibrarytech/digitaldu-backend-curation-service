@@ -555,42 +555,6 @@ def check_uri_txt():
         }), 500
 
 
-@astools_bp.route('/api/v1/astools/move-to-ready', methods=['GET'])
-@require_api_key_astools
-def move_to_ready_():
-    """
-    Moves packages to ready folder.
-
-    @param folder: Folder name to move
-    @return: JSON response with result
-    """
-    try:
-        logger.info('GET /api/v1/astools/move-to-ready - Moving folder')
-
-        folder = request.args.get('folder', '').strip()
-
-        # Validate folder parameter
-        if not folder:
-            logger.warning('Missing folder parameter')
-            return jsonify({
-                'result': None,
-                'errors': ['Bad request: Missing folder parameter']
-            }), 400
-
-        # Move folder using qa_lib
-        results = qa_lib.move_to_ready(folder)
-
-        logger.info(f'Move operation completed: {results["result"]}')
-        return jsonify(results), 200
-
-    except Exception as e:
-        logger.error(f'Unexpected error in move_to_ready: {str(e)}', exc_info=True)
-        return jsonify({
-            'result': None,
-            'errors': ['Internal server error']
-        }), 500
-
-
 # Helper Functions
 
 def _validate_folder_parameter(folder: str) -> Optional[str]:

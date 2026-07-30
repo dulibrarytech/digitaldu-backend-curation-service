@@ -78,7 +78,6 @@ Two blueprints, both auth-required (`X-API-Key` header, or legacy
 | `GET /workspace/packages/files` | Per-package file listings |
 | `GET /processed` | List batches with `uri.txt` (scan bounded to `batch/package/uri.txt` depth) |
 | `GET /workspace/uri`, `/check-uri-txt` | URI helpers |
-| `GET /move-to-ready` | Move a workspace batch into `001-ready` |
 | `POST /make-digital-objects` | Launch the ASpace digital-object creation CLI |
 | `POST /revert-to-make-digital-objects` | Delete `uri.txt` from every package (returns the batch to the MDO view) |
 

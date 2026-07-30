@@ -228,7 +228,6 @@ test_endpoint "workspace/packages no batch"        GET "/api/v1/astools/workspac
 test_endpoint "workspace/packages/files no batch"  GET "/api/v1/astools/workspace/packages/files"  400
 test_endpoint "workspace/uri no params"            GET "/api/v1/astools/workspace/uri"             400
 test_endpoint "check-uri-txt no folder"            GET "/api/v1/astools/check-uri-txt"             400
-test_endpoint "move-to-ready no folder"            GET "/api/v1/astools/move-to-ready"             400
 
 if [[ -n "$TEST_FOLDER" ]]; then
     test_endpoint "workspace/packages"        GET "/api/v1/astools/workspace/packages?batch=$TEST_FOLDER"        200 '.errors | type == "array"'
@@ -254,9 +253,6 @@ if [[ "$RUN_FULL" == "1" ]]; then
 
     # set-collection-folder is the safest mutator — writes a single text file.
     test_endpoint "set-collection-folder"  GET "/api/v2/qa/set-collection-folder?folder=$TEST_FOLDER"  200 '.is_set != null'
-
-    # move-to-ready (astools) — moves a folder; only run if the test_folder is intentionally disposable
-    test_endpoint "move-to-ready"  GET "/api/v1/astools/move-to-ready?folder=$TEST_FOLDER"  200
 
     # The following are skipped even with --full because they touch SFTP / Archivematica /
     # ArchivesSpace and need careful coordination. Run them by hand if needed.

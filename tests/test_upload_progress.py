@@ -55,7 +55,9 @@ class LocalDirSizeTests(unittest.TestCase):
 
 class _IngestTmpMixin(unittest.TestCase):
     """Point ops.ingest_path at a tempdir with a 002-ingest/<pid> staging
-    dir, so marker writes/reads stay hermetic."""
+    dir, so marker writes/reads stay hermetic. Also stub ops.sftp_path —
+    it is None on hosts without SFTP_REMOTE_PATH in the env, and
+    check_sftp concatenates it into the remote package path."""
 
     PID = 'codu-test'
 
@@ -63,11 +65,14 @@ class _IngestTmpMixin(unittest.TestCase):
         self.tmp = tempfile.mkdtemp(prefix='upl_')
         os.makedirs(os.path.join(self.tmp, self.PID))
         self._orig_ingest = ops.ingest_path
+        self._orig_sftp_path = ops.sftp_path
         # functions use `ingest_path + pid`, so keep the trailing sep.
         ops.ingest_path = self.tmp + os.sep
+        ops.sftp_path = '/remote/ingest'
 
     def tearDown(self):
         ops.ingest_path = self._orig_ingest
+        ops.sftp_path = self._orig_sftp_path
 
     def marker_path(self):
         return os.path.join(self.tmp, self.PID, ops.UPLOAD_ERROR_MARKER)
