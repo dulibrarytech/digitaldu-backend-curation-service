@@ -9,17 +9,13 @@ side of the DigitalDU ingest pipeline. Called from
 - Wasabi S3 via boto3 (two buckets: the batch archive and the AIP store),
 - ArchivesSpace via the bundled `make_digital_object.py` CLI.
 
-It supersedes the legacy `digitaldu-backend-qa` (QA service) and
-`astools-web_v2` services — both surfaces live here behind a single
-Flask app.
-
 ```
 +---------------+   HTTP   +-----------------------+   SFTP    +---------------+
 | repo-backend  | -------> | curation-api (this)   | --------> | Archivematica |
 | -v2 (Node)    |          |                       |           |  SFTP daemon  |
 +---------------+          |  +------ boto3 ------+|           +---------------+
                            |  | Wasabi S3:       | |
-                           |  |  batch archive   | |
+                           |  |  batch backup    | |
                            |  |  aip-store       | |
                            |  +------------------+ |
                            |  +------ local fs --+ |
@@ -31,7 +27,7 @@ Flask app.
 ```
 
 At the end of a successful ingest, the batch's `002-ingest` staging copy
-is archived **straight to Wasabi** — every uploaded file is verified with
+is backed up **straight to Wasabi** — every uploaded file is verified with
 a `head_object` size check, and the staging copy is removed only after
 that verification passes. 
 
@@ -49,38 +45,6 @@ that verification passes.
   below for the resolution order.
 - **Network egress** to the Archivematica SFTP host and the Wasabi
   endpoint.
-
-## Project layout
-
-```
-digitaldu-backend-curation-service/
-├── app.py                  Flask app factory + entry point + startup probe
-├── auth.py                 X-API-Key + ?api_key= decorators (two response shapes)
-├── config.py               Env-var loader + startup validation
-├── requirements.txt        Pinned Python deps
-├── .env.example            Template for .env (gitignored at deploy)
-├── lib/
-│   ├── archivematica_ops.py    SFTP + local filesystem ops (ready/ingest staging)
-│   ├── archivesspace_ops.py    ASpace tools (workspace / processed / uri.txt checks)
-│   ├── batch_structure.py      Batch structure QA scan (workspace listing flags)
-│   ├── aip_ops.py              AIP-store copy (AM Storage Service → Wasabi aip bucket)
-│   ├── wasabi.py               boto3 S3 upload (per-file verified) + health check
-│   ├── safe_names.py           Path-segment validation (traversal guard)
-│   └── make_digital_object.py  CLI launched by astools route
-├── routes/
-│   ├── qa.py                   /api/v2/qa/* — Archivematica-side endpoints
-│   ├── astools.py              /api/v1/astools/* — ArchivesSpace-side endpoints
-│   └── aip.py                  /api/v2/aip/* — AIP-store endpoints
-├── scripts/
-│   ├── reconcile_ingested_wasabi.py   Read-only local-vs-Wasabi batch audit
-│   └── sync_missing_to_wasabi.py      Uploads files the audit found missing
-├── tests/                  pytest suite (see "Testing" below)
-│   └── smoke_test.sh       curl-based endpoint sweep
-└── deploy/
-    ├── curation-api.service            systemd unit
-    ├── logrotate.curation-api          log rotation
-    └── nginx.conf.example              reverse-proxy template
-```
 
 ## Endpoints (summary)
 
@@ -136,9 +100,7 @@ Two blueprints, both auth-required (`X-API-Key` header, or legacy
 ## Batch structure QA
 
 Staff assemble batches by hand
-(`WORKSPACE/new_<collection>-resources_<N>/<package>/<files>`), and
-structural mistakes used to be invisible or silently destructive (see
-`repo/BATCH_PACKAGING_QA_FINDINGS.md`). `lib/batch_structure.py` scans
+(`WORKSPACE/new_<collection>-resources_<N>/<package>/<files>`). `lib/batch_structure.py` scans
 every batch in a single `os.scandir` pass per directory — no file is
 ever opened, so 100-package / hundreds-of-files batches scan in
 milliseconds — and the `/workspace` + `/workspace/packages` responses
