@@ -22,6 +22,7 @@ Run:
     python -m pytest tests/test_sftp_connect_retry.py -v
 """
 
+import tempfile
 import threading
 import unittest
 from unittest.mock import patch, MagicMock
@@ -59,10 +60,10 @@ def _fake_client_factory(fail_times, error=None):
 
 
 def _quiet_throttles():
-    """Disable pacing + give the test its own semaphore."""
+    """Disable pacing + give the test its own slot-lock directory."""
     return (
         patch.object(ops, 'SFTP_CONNECT_MIN_INTERVAL_S', 0),
-        patch.object(ops, '_sftp_slots', threading.BoundedSemaphore(ops.SFTP_MAX_SESSIONS)),
+        patch.object(ops, 'SFTP_LOCK_DIR', tempfile.mkdtemp(prefix='sftp-slots-')),
     )
 
 
@@ -120,43 +121,74 @@ class OpenSftpRetryTests(unittest.TestCase):
 
 
 class SessionSlotTests(unittest.TestCase):
+    """flock-backed slots are HOST-global: distinct fds on the same
+    lock file conflict even within one process, so these tests exercise
+    the real cross-worker semantics."""
 
     def test_slot_released_on_client_close_and_on_failure(self):
         factory, _ = _fake_client_factory(fail_times=0)
-        slots = threading.BoundedSemaphore(1)
-        pace_off = patch.object(ops, 'SFTP_CONNECT_MIN_INTERVAL_S', 0)
+        pace_off, fresh_dir = _quiet_throttles()
+        one_slot = patch.object(ops, 'SFTP_MAX_SESSIONS', 1)
+        fast_timeout = patch.object(ops, 'SFTP_SLOT_ACQUIRE_TIMEOUT_S', 0.01)
         with patch.object(paramiko, 'SSHClient', side_effect=factory), \
-             patch.object(ops, '_sftp_slots', slots), pace_off:
+             pace_off, fresh_dir, one_slot, fast_timeout:
             client, _ = ops._open_sftp()
             # Slot is held while the session is open...
-            self.assertFalse(slots.acquire(timeout=0.01))
+            with self.assertRaises(RuntimeError):
+                ops._acquire_global_slot()
             client.close()
             # ...and freed exactly once on close (double-close safe).
             client.close()
-            self.assertTrue(slots.acquire(timeout=0.01))
-            slots.release()
+            fd = ops._acquire_global_slot()
+            import os as _os
+            _os.close(fd)
 
-        # Failure path releases too.
-        fail_factory, _ = _fake_client_factory(fail_times=99)
-        with patch.object(paramiko, 'SSHClient', side_effect=fail_factory), \
-             patch.object(ops, '_sftp_slots', slots), \
-             patch.object(ops.time, 'sleep'), pace_off:
-            with self.assertRaises(paramiko.SSHException):
-                ops._open_sftp()
-        self.assertTrue(slots.acquire(timeout=0.01))
-        slots.release()
+            # Failure path releases too.
+            fail_factory, _ = _fake_client_factory(fail_times=99)
+            with patch.object(paramiko, 'SSHClient', side_effect=fail_factory), \
+                 patch.object(ops.time, 'sleep'):
+                with self.assertRaises(paramiko.SSHException):
+                    ops._open_sftp()
+            fd = ops._acquire_global_slot()
+            _os.close(fd)
 
     def test_exhausted_slots_refuse_instead_of_piling_on(self):
         factory, _ = _fake_client_factory(fail_times=0)
-        slots = threading.BoundedSemaphore(1)
-        pace_off = patch.object(ops, 'SFTP_CONNECT_MIN_INTERVAL_S', 0)
+        pace_off, fresh_dir = _quiet_throttles()
         with patch.object(paramiko, 'SSHClient', side_effect=factory), \
-             patch.object(ops, '_sftp_slots', slots), \
-             patch.object(ops, 'SFTP_SLOT_ACQUIRE_TIMEOUT_S', 0.01), pace_off:
+             pace_off, fresh_dir, \
+             patch.object(ops, 'SFTP_MAX_SESSIONS', 1), \
+             patch.object(ops, 'SFTP_SLOT_ACQUIRE_TIMEOUT_S', 0.01):
             client, _ = ops._open_sftp()
             with self.assertRaises(RuntimeError):
                 ops._open_sftp()
             client.close()
+
+
+class MoveToSftpSingleFlightTests(unittest.TestCase):
+
+    def test_second_start_for_same_pid_is_a_noop(self):
+        started = []
+        fake_thread = MagicMock()
+        fake_thread_cls = MagicMock(
+            side_effect=lambda **kw: started.append(kw) or fake_thread
+        )
+        with patch.object(ops.threading, 'Thread', fake_thread_cls):
+            try:
+                r1 = ops.move_to_sftp('pid-single')
+                r2 = ops.move_to_sftp('pid-single')
+                self.assertEqual(r1['message'], 'upload_started')
+                self.assertEqual(r2['message'], 'upload_already_running')
+                self.assertEqual(len(started), 1)
+                # Once the put finishes (registry cleared), a new start works.
+                with ops._sftp_puts_lock:
+                    ops._sftp_puts_in_flight.discard('pid-single')
+                r3 = ops.move_to_sftp('pid-single')
+                self.assertEqual(r3['message'], 'upload_started')
+                self.assertEqual(len(started), 2)
+            finally:
+                with ops._sftp_puts_lock:
+                    ops._sftp_puts_in_flight.discard('pid-single')
 
 
 class ConnectPacingTests(unittest.TestCase):
@@ -167,7 +199,7 @@ class ConnectPacingTests(unittest.TestCase):
         with patch.object(paramiko, 'SSHClient', side_effect=factory), \
              patch.object(ops.time, 'sleep', side_effect=sleeps.append), \
              patch.object(ops, 'SFTP_CONNECT_MIN_INTERVAL_S', 5.0), \
-             patch.object(ops, '_sftp_slots', threading.BoundedSemaphore(5)), \
+             patch.object(ops, 'SFTP_LOCK_DIR', tempfile.mkdtemp(prefix='sftp-slots-')), \
              patch.object(ops, '_sftp_last_connect_at', [None]):
             c1, _ = ops._open_sftp()
             c1.close()

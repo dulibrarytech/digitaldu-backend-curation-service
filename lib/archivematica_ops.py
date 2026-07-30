@@ -35,6 +35,7 @@ logger.info() to a module logger.
     tbl_ingest_events audit trail.
 """
 
+import fcntl
 import logging
 import os
 import posixpath
@@ -133,15 +134,19 @@ SFTP_AUTH_TIMEOUT_S = 30
 #                             polls never hammer sshd with rapid
 #                             logins. Default 1s.
 #
-# Per-process, not global: with gunicorn --workers 4 the theoretical
-# ceiling is 4x the cap — but the real session sources (the Node
-# worker's <=2 concurrent uploads plus one poll per in-flight row)
-# sit well under a single cap in practice; this is the backstop.
+# GLOBAL across gunicorn workers (2026-07-30): the first cut used a
+# threading.Semaphore, which is per-process — with --workers 4 the
+# real ceiling was 4x the cap and the vendor still saw bursts. The
+# slots are now flock()-backed lock files in SFTP_LOCK_DIR, so every
+# worker process on the host competes for the SAME SFTP_MAX_SESSIONS
+# slots. A slot is held for the lifetime of the SSH session and
+# releases when the caller closes the client (or the process dies —
+# the kernel drops flocks automatically, so a crashed worker can't
+# leak slots).
 SFTP_MAX_SESSIONS = int(os.getenv('SFTP_MAX_SESSIONS', '5'))
 SFTP_CONNECT_MIN_INTERVAL_S = float(os.getenv('SFTP_CONNECT_MIN_INTERVAL_S', '1.0'))
 SFTP_SLOT_ACQUIRE_TIMEOUT_S = 600  # > longest realistic poll pile-up
-
-_sftp_slots = threading.BoundedSemaphore(SFTP_MAX_SESSIONS)
+SFTP_LOCK_DIR = os.getenv('SFTP_LOCK_DIR', '/tmp/curation-sftp-slots')
 _sftp_pace_lock = threading.Lock()
 # None = no connect yet. NOT 0.0: time.monotonic()'s epoch is
 # platform-defined (near process start on macOS), so a 0.0 seed would
@@ -164,30 +169,54 @@ def _pace_connect():
         _sftp_last_connect_at[0] = time.monotonic()
 
 
+def _acquire_global_slot():
+    """Claim one of SFTP_MAX_SESSIONS flock-backed slot files, HOST-wide
+    (all gunicorn workers share the same lock dir). Returns the held
+    fd. Raises RuntimeError when no slot frees within the timeout —
+    refusing loudly beats piling more logins onto the vendor's sshd."""
+    os.makedirs(SFTP_LOCK_DIR, exist_ok=True)
+    deadline = time.monotonic() + SFTP_SLOT_ACQUIRE_TIMEOUT_S
+    while True:
+        for i in range(SFTP_MAX_SESSIONS):
+            path = os.path.join(SFTP_LOCK_DIR, 'slot-%d.lock' % i)
+            fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o644)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return fd
+            except OSError:
+                os.close(fd)
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                'sftp session slots exhausted (%d in use host-wide) — '
+                'refusing to open another connection' % SFTP_MAX_SESSIONS
+            )
+        # Jittered nap so waiters from different processes de-align.
+        time.sleep(0.5 + random.random() * 0.5)
+
+
 def _open_sftp():
     """Open a paramiko SSH+SFTP session with bounded connect retries.
 
     Caller must close both returned handles — closing the CLIENT
-    releases this process's session slot (see the close wrapper
-    below). Raises the last error after SFTP_CONNECT_ATTEMPTS failed
-    setups, or RuntimeError if no session slot frees up in time.
+    releases the host-wide session slot (see the close wrapper below).
+    Raises the last error after SFTP_CONNECT_ATTEMPTS failed setups,
+    or RuntimeError if no session slot frees up in time.
     """
-    if not _sftp_slots.acquire(timeout=SFTP_SLOT_ACQUIRE_TIMEOUT_S):
-        raise RuntimeError(
-            'sftp session slots exhausted (%d in use) — refusing to open '
-            'another connection' % SFTP_MAX_SESSIONS
-        )
+    slot_fd = _acquire_global_slot()
     try:
-        return _open_sftp_unslotted()
+        client, sftp = _open_sftp_unslotted()
     except BaseException:
-        _sftp_slots.release()
+        os.close(slot_fd)  # closing the fd drops the flock
         raise
+    _release_slot_on_close(client, slot_fd)
+    return client, sftp
 
 
-def _release_slot_on_close(client):
+def _release_slot_on_close(client, slot_fd):
     """Arrange for the session slot to release exactly once when the
     caller closes the client (every _open_sftp caller closes in a
-    finally block)."""
+    finally block). Closing the fd drops the flock; if the process
+    dies first, the kernel drops it — slots can't leak."""
     orig_close = client.close
     released = [False]
 
@@ -197,7 +226,10 @@ def _release_slot_on_close(client):
         finally:
             if not released[0]:
                 released[0] = True
-                _sftp_slots.release()
+                try:
+                    os.close(slot_fd)
+                except OSError:
+                    pass
 
     client.close = close_and_release
 
@@ -223,7 +255,6 @@ def _open_sftp_unslotted():
                 auth_timeout=SFTP_AUTH_TIMEOUT_S,
             )
             sftp = client.open_sftp()
-            _release_slot_on_close(client)
             return client, sftp
         except (paramiko.SSHException, OSError) as e:
             last_err = e
@@ -1181,6 +1212,18 @@ def _upload_error_marker_path(pid):
     return os.path.join(ingest_path + pid, UPLOAD_ERROR_MARKER)
 
 
+# Per-package single-flight registry (2026-07-30): a Node worker
+# restart mid-batch re-dispatches rows and re-calls move_to_sftp while
+# the PREVIOUS daemon thread for the same package may still be
+# uploading — duplicate concurrent puts of the same tree, extra SSH
+# sessions, and a burst the Node side can't even see. This process's
+# in-flight puts are tracked here; a second start for the same pid is
+# a no-op ('upload_already_running'). Per-process is the right scope:
+# whichever gunicorn worker took the original request owns the thread.
+_sftp_puts_in_flight = set()
+_sftp_puts_lock = threading.Lock()
+
+
 def _do_sftp_put(pid):
     """Background worker: the actual recursive SFTP put.
 
@@ -1215,6 +1258,9 @@ def _do_sftp_put(pid):
                 fh.write(str(e)[:1000])
         except OSError as marker_err:
             logger.error('could not write upload-error marker for %s: %s', pid, marker_err)
+    finally:
+        with _sftp_puts_lock:
+            _sftp_puts_in_flight.discard(pid)
 
 
 def move_to_sftp(pid):
@@ -1234,9 +1280,20 @@ def move_to_sftp(pid):
     observed by the poller via check_sftp (remote file count reaching the
     local count); failure via the .upload_error marker check_sftp surfaces.
 
+    Single-flight per package: if this process already has a put
+    running for `pid`, DON'T start another — a Node-side restart
+    re-dispatches rows and used to double up concurrent puts of the
+    same tree (2026-07-30). The poller can't tell the difference and
+    doesn't need to: the running put keeps making progress either way.
+
     @param: pid
-    @returns: Dictionary (message='upload_started')
+    @returns: Dictionary (message='upload_started'|'upload_already_running')
     """
+    with _sftp_puts_lock:
+        if pid in _sftp_puts_in_flight:
+            logger.info('move_to_sftp: put already in flight for %s — not starting another', pid)
+            return dict(message='upload_already_running')
+        _sftp_puts_in_flight.add(pid)
     thread = threading.Thread(target=_do_sftp_put, args=(pid,), daemon=True)
     thread.start()
     return dict(message='upload_started')
