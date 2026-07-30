@@ -95,7 +95,7 @@ class MoveToSftpAsyncTests(_IngestTmpMixin):
             def close(self):
                 pass
 
-        def fake_put_r(sftp, local, remote, preserve_mtime=True):
+        def fake_put_r(sftp, local, remote, preserve_mtime=True, **kwargs):
             started.set()
             release.wait(5)  # simulate a long-running upload
             finished.set()
@@ -202,3 +202,94 @@ class CheckSftpFailureTests(_IngestTmpMixin):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class UploadCancelTests(_IngestTmpMixin):
+    """Cancel + single-flight guards on the background put (2026-07-30:
+    'Halt entire batch' left daemon-thread puts running, and duplicate
+    puts across gunicorn workers produced 'size mismatch in put!')."""
+
+    def cancel_path(self):
+        return os.path.join(self.tmp, self.PID, ops.UPLOAD_CANCEL_MARKER)
+
+    def test_request_upload_cancel_writes_flag(self):
+        res = ops.request_upload_cancel(self.PID)
+        self.assertEqual(res['message'], 'cancel_requested')
+        self.assertTrue(os.path.exists(self.cancel_path()))
+        # No staging dir → no-op result.
+        res2 = ops.request_upload_cancel('no-such-pid')
+        self.assertEqual(res2['message'], 'no_staging_dir')
+
+    def test_put_aborts_between_files_when_flag_appears(self):
+        put_files = []
+
+        class FakeSftp:
+            def listdir(self, _p):
+                return [UploadCancelTests.PID]
+
+            def close(self):
+                pass
+
+        def fake_put_r(sftp, local, remote, preserve_mtime=True, should_abort=None):
+            # Simulate two files; flag lands after the first.
+            put_files.append('f1')
+            with open(self.cancel_path(), 'w') as fh:
+                fh.write('x')
+            if should_abort and should_abort():
+                raise ops.UploadCancelled()
+            put_files.append('f2')
+
+        with mock.patch.object(ops, '_open_sftp', lambda: (_FakeClient(), FakeSftp())), \
+                mock.patch.object(ops, '_sftp_put_r', fake_put_r):
+            ops._do_sftp_put(self.PID)
+
+        self.assertEqual(put_files, ['f1'])
+        # Cancelled put is NOT an error — no .upload_error marker, and
+        # the cancel flag is consumed.
+        self.assertFalse(os.path.exists(self.marker_path()))
+        self.assertFalse(os.path.exists(self.cancel_path()))
+
+    def test_sftp_put_r_aborts_promptly_via_should_abort(self):
+        d = tempfile.mkdtemp(prefix='putr_')
+        for name in ('a.bin', 'b.bin'):
+            with open(os.path.join(d, name), 'wb') as f:
+                f.write(b'x' * 10)
+        calls = []
+
+        class FakeSftp:
+            def put(self, local, remote, callback=None):
+                calls.append(os.path.basename(local))
+
+            def utime(self, *_a):
+                pass
+
+            def stat(self, _p):
+                return None  # dirs "exist" — skip mkdir
+
+            def mkdir(self, _p):
+                pass
+
+        aborts = iter([False, True])  # first file allowed, then abort
+        with self.assertRaises(ops.UploadCancelled):
+            ops._sftp_put_r(
+                FakeSftp(), d, '/remote', preserve_mtime=False,
+                should_abort=lambda: next(aborts),
+            )
+        # Exactly one of the two files went up (os.walk order is
+        # platform-dependent) — the abort fired before the second.
+        self.assertEqual(len(calls), 1)
+
+    def test_second_process_bows_out_via_put_lock(self):
+        import fcntl as _fcntl
+        lock_dir = tempfile.mkdtemp(prefix='putlock_')
+        with mock.patch.object(ops, 'SFTP_LOCK_DIR', lock_dir):
+            # Hold the put lock as if another worker owns the upload.
+            fd = os.open(ops._put_lock_path(self.PID), os.O_CREAT | os.O_RDWR)
+            _fcntl.flock(fd, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+            try:
+                def explode():
+                    raise AssertionError('must not open SFTP while another put holds the lock')
+                with mock.patch.object(ops, '_open_sftp', explode):
+                    ops._do_sftp_put(self.PID)  # bows out silently
+            finally:
+                os.close(fd)

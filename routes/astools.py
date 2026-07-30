@@ -191,6 +191,11 @@ def get_packages():
             'result': scan['packages'],
             'processed': scan['processed'],
             'structure_errors': scan['structure_errors'],
+            # Batch size (2026-07-30): the ASpace QA / Packaging views
+            # resolve folders through THIS endpoint (not /workspace),
+            # so the Size column was blank there until the scan's
+            # total_bytes rode along here too.
+            'total_bytes': scan['total_bytes'],
             'errors': []
         }), 200
 

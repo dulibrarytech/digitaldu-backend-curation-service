@@ -292,17 +292,37 @@ def _sftp_mkdir_p(sftp, remote_dir):
         sftp.mkdir(remote_dir)
 
 
-def _sftp_put_r(sftp, local_dir, remote_dir, preserve_mtime=True):
-    """Recursive directory upload (replaces pysftp.Connection.put_r)."""
+class UploadCancelled(Exception):
+    """Raised inside a put to abort it — see request_upload_cancel."""
+
+
+def _sftp_put_r(sftp, local_dir, remote_dir, preserve_mtime=True, should_abort=None):
+    """Recursive directory upload (replaces pysftp.Connection.put_r).
+
+    `should_abort` (optional callable) is checked before every file AND
+    every ~8 MB inside a file (via paramiko's put callback) — raising
+    UploadCancelled aborts the transfer promptly even mid-way through a
+    single multi-GB file (2026-07-30: "Halt entire batch" cancelled the
+    queue rows but the background puts kept uploading to completion).
+    """
+    check_every = 256  # put callback fires per 32 KB chunk → ~8 MB
+
+    def _chunk_cb(_transferred, _total, _counter=[0]):
+        _counter[0] += 1
+        if _counter[0] % check_every == 0 and should_abort and should_abort():
+            raise UploadCancelled()
+
     _sftp_mkdir_p(sftp, remote_dir)
     for root, dirs, files in os.walk(local_dir):
         rel = os.path.relpath(root, local_dir)
         rel_remote = remote_dir if rel == '.' else posixpath.join(remote_dir, rel.replace(os.sep, '/'))
         _sftp_mkdir_p(sftp, rel_remote)
         for fname in files:
+            if should_abort and should_abort():
+                raise UploadCancelled()
             local_file = os.path.join(root, fname)
             remote_file = posixpath.join(rel_remote, fname)
-            sftp.put(local_file, remote_file)
+            sftp.put(local_file, remote_file, callback=_chunk_cb if should_abort else None)
             if preserve_mtime:
                 st = os.stat(local_file)
                 sftp.utime(remote_file, (st.st_atime, st.st_mtime))
@@ -1212,6 +1232,40 @@ def _upload_error_marker_path(pid):
     return os.path.join(ingest_path + pid, UPLOAD_ERROR_MARKER)
 
 
+UPLOAD_CANCEL_MARKER = '.upload_cancel'
+
+
+def _upload_cancel_marker_path(pid):
+    """Path of the cancel-request sentinel. Flag FILE (not memory) on
+    purpose: the put runs in a daemon thread of whichever gunicorn
+    worker took the original request, and the cancel request can land
+    on any other worker — the filesystem is the cross-process signal."""
+    return os.path.join(ingest_path + pid, UPLOAD_CANCEL_MARKER)
+
+
+def request_upload_cancel(pid):
+    """Ask an in-flight put for `pid` to stop (2026-07-30: 'Halt entire
+    batch' cancelled the queue rows but the background puts kept going).
+    Best-effort and idempotent: writes the sentinel; the put checks it
+    per file and every ~8 MB within a file. No-op result if there's no
+    staging dir (nothing is uploading from it)."""
+    staging = ingest_path + pid
+    if not os.path.isdir(staging):
+        return dict(message='no_staging_dir')
+    try:
+        with open(_upload_cancel_marker_path(pid), 'w') as fh:
+            fh.write('cancel requested')
+        logger.info('request_upload_cancel: flag written for %s', pid)
+        return dict(message='cancel_requested')
+    except OSError as e:
+        logger.error('request_upload_cancel failed for %s: %s', pid, e)
+        return dict(message='cancel_flag_write_failed', error=str(e))
+
+
+def _put_lock_path(pid):
+    return os.path.join(SFTP_LOCK_DIR, 'put-%s.lock' % pid)
+
+
 # Per-package single-flight registry (2026-07-30): a Node worker
 # restart mid-batch re-dispatches rows and re-calls move_to_sftp while
 # the PREVIOUS daemon thread for the same package may still be
@@ -1235,22 +1289,60 @@ def _do_sftp_put(pid):
     reports that to the poller, which halts the row.
     """
     marker = _upload_error_marker_path(pid)
-    # Clear any stale marker from a previous attempt so a retry starts clean.
+
+    # CROSS-PROCESS single-flight (2026-07-30): the in-memory registry
+    # in move_to_sftp only covers THIS worker process; a re-dispatch
+    # landing on a different gunicorn worker started a second put of
+    # the same tree — paramiko's post-put verify then caught the other
+    # put's truncation as "size mismatch in put! 0 != N". The flock is
+    # the host-wide guard: if another process holds the put lock for
+    # this pid, bow out and let that put finish.
+    os.makedirs(SFTP_LOCK_DIR, exist_ok=True)
+    put_lock_fd = os.open(_put_lock_path(pid), os.O_CREAT | os.O_RDWR, 0o644)
     try:
-        os.remove(marker)
+        fcntl.flock(put_lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
-        pass
+        os.close(put_lock_fd)
+        logger.info(
+            '_do_sftp_put: another process is already uploading %s — bowing out', pid,
+        )
+        return
+
+    cancel_flag = _upload_cancel_marker_path(pid)
+
+    def _cancelled():
+        return os.path.exists(cancel_flag)
+
+    # Clear stale markers from a previous attempt so a retry starts clean.
+    for stale in (marker, cancel_flag):
+        try:
+            os.remove(stale)
+        except OSError:
+            pass
 
     try:
         client, sftp = _open_sftp()
         try:
-            _sftp_put_r(sftp, ingest_path, sftp_path, preserve_mtime=True)
+            _sftp_put_r(
+                sftp, ingest_path, sftp_path,
+                preserve_mtime=True, should_abort=_cancelled,
+            )
             packages = sftp.listdir(sftp_path)
             if pid not in packages:
                 raise RuntimeError('package %s not found on sftp after put' % pid)
         finally:
             sftp.close()
             client.close()
+    except UploadCancelled:
+        # Staff-requested stop — not an error. No .upload_error marker
+        # (the queue row is already CANCELLED_BY_USER and nobody polls);
+        # the partial remote tree is cleaned up by the rollback's
+        # clean_up_sftp step.
+        logger.info('move_to_sftp: upload for %s cancelled by staff request', pid)
+        try:
+            os.remove(cancel_flag)
+        except OSError:
+            pass
     except Exception as e:  # noqa: BLE001
         logger.error('move_to_sftp background put failed for %s: %s', pid, e)
         try:
@@ -1261,6 +1353,7 @@ def _do_sftp_put(pid):
     finally:
         with _sftp_puts_lock:
             _sftp_puts_in_flight.discard(pid)
+        os.close(put_lock_fd)  # drops the flock
 
 
 def move_to_sftp(pid):

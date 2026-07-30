@@ -110,6 +110,9 @@ class WorkspaceRouteTests(unittest.TestCase):
         self.assertEqual(body['processed'], [])
         codes = {f['code'] for f in body['structure_errors']}
         self.assertEqual(codes, {'loose_files', 'empty_package'})
+        # Batch size rides along (2026-07-30) so the QA / Packaging
+        # views' Size column works — _touch writes 1 byte per file.
+        self.assertEqual(body['total_bytes'], 2)
 
     def test_packages_endpoint_404_for_missing_batch(self):
         res = self._get('/api/v1/astools/workspace/packages?batch=nope')

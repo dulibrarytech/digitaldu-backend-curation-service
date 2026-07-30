@@ -272,6 +272,20 @@ def move_to_sftp():
     return json.dumps(dict(message='Uploading packages to Archivematica sftp')), 200
 
 
+@qa_bp.route('/cancel-upload', methods=['GET'])
+@require_api_key_qa
+def cancel_upload():
+    """Ask the in-flight background put for `uuid` to stop (2026-07-30:
+    'Halt entire batch' cancelled queue rows but the daemon-thread puts
+    kept uploading). Best-effort + idempotent — see
+    ops.request_upload_cancel."""
+    uuid = request.args.get('uuid')
+    if uuid is None:
+        return json.dumps(['Bad Request: Missing uuid param.']), 400
+    result = ops.request_upload_cancel(uuid)
+    return json.dumps(result), 200
+
+
 @qa_bp.route('/upload-status', methods=['GET'])
 @require_api_key_qa
 def check_sftp():
