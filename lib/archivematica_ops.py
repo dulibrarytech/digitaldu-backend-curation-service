@@ -38,10 +38,12 @@ logger.info() to a module logger.
 import logging
 import os
 import posixpath
+import random
 import shutil
 import stat
 import subprocess
 import threading
+import time
 
 import paramiko
 
@@ -99,22 +101,151 @@ def _run(argv):
 
 # --- paramiko helpers (replacing pysftp's put_r / walktree / cd / execute) --
 
+# Connection-setup retry budget (2026-07-29 burst hardening). A large
+# batch has several SSH sessions opening in quick succession (the
+# upload thread plus one check_sftp poll per in-flight row), and the
+# AM sshd's MaxStartups cap drops excess UNAUTHENTICATED connections —
+# surfacing as paramiko's "Error reading SSH protocol banner". Those
+# drops are transient by nature, so connection SETUP retries with
+# exponential backoff + jitter (so concurrent retries de-align rather
+# than re-bursting). Failures mid-transfer are NOT retried here — the
+# callers' own error paths (.upload_error marker, route error
+# envelopes) handle those.
+SFTP_CONNECT_ATTEMPTS = 4
+SFTP_CONNECT_BASE_DELAY_S = 2.0
+# Generous banner window: under MaxStartups pressure sshd may accept
+# the TCP connection but be slow to speak; paramiko's 15s default was
+# part of the failure signature.
+SFTP_BANNER_TIMEOUT_S = 60
+SFTP_TCP_TIMEOUT_S = 30
+SFTP_AUTH_TIMEOUT_S = 30
+
+# Polite-citizen throttles (2026-07-29 follow-up): the AM SFTP host is
+# vendor-managed, and a burst of logins reads like an attack. Two
+# module-level (per gunicorn worker) throttles:
+#
+#   SFTP_MAX_SESSIONS       — hard cap on CONCURRENT open SSH sessions
+#                             from this process (uploads + status
+#                             polls + cleanups all pass through
+#                             _open_sftp). Default 5.
+#   SFTP_CONNECT_MIN_INTERVAL_S — minimum spacing between successive
+#                             connection ATTEMPTS, so even sequential
+#                             polls never hammer sshd with rapid
+#                             logins. Default 1s.
+#
+# Per-process, not global: with gunicorn --workers 4 the theoretical
+# ceiling is 4x the cap — but the real session sources (the Node
+# worker's <=2 concurrent uploads plus one poll per in-flight row)
+# sit well under a single cap in practice; this is the backstop.
+SFTP_MAX_SESSIONS = int(os.getenv('SFTP_MAX_SESSIONS', '5'))
+SFTP_CONNECT_MIN_INTERVAL_S = float(os.getenv('SFTP_CONNECT_MIN_INTERVAL_S', '1.0'))
+SFTP_SLOT_ACQUIRE_TIMEOUT_S = 600  # > longest realistic poll pile-up
+
+_sftp_slots = threading.BoundedSemaphore(SFTP_MAX_SESSIONS)
+_sftp_pace_lock = threading.Lock()
+# None = no connect yet. NOT 0.0: time.monotonic()'s epoch is
+# platform-defined (near process start on macOS), so a 0.0 seed would
+# make the FIRST connect wait out the whole interval for nothing.
+_sftp_last_connect_at = [None]
+
+
+def _pace_connect():
+    """Sleep (under lock) so connection attempts stay >= the minimum
+    interval apart, process-wide. The first connect never waits —
+    pacing starts the clock, it doesn't delay an idle service."""
+    if SFTP_CONNECT_MIN_INTERVAL_S <= 0:
+        return
+    with _sftp_pace_lock:
+        last = _sftp_last_connect_at[0]
+        if last is not None:
+            wait = last + SFTP_CONNECT_MIN_INTERVAL_S - time.monotonic()
+            if wait > 0:
+                time.sleep(wait)
+        _sftp_last_connect_at[0] = time.monotonic()
+
+
 def _open_sftp():
-    """Open a paramiko SSH+SFTP session. Caller must close both."""
-    client = paramiko.SSHClient()
-    # Match legacy pysftp behavior: cnopts.hostkeys = None — i.e. accept any host key.
-    # NOTE: this is insecure against MITM. Prior service ran with the same posture.
-    # Migrate to known_hosts verification in a follow-up ticket.
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    client.connect(
-        hostname=sftp_host,
-        username=sftp_username,
-        password=sftp_password,
-        look_for_keys=False,
-        allow_agent=False,
+    """Open a paramiko SSH+SFTP session with bounded connect retries.
+
+    Caller must close both returned handles — closing the CLIENT
+    releases this process's session slot (see the close wrapper
+    below). Raises the last error after SFTP_CONNECT_ATTEMPTS failed
+    setups, or RuntimeError if no session slot frees up in time.
+    """
+    if not _sftp_slots.acquire(timeout=SFTP_SLOT_ACQUIRE_TIMEOUT_S):
+        raise RuntimeError(
+            'sftp session slots exhausted (%d in use) — refusing to open '
+            'another connection' % SFTP_MAX_SESSIONS
+        )
+    try:
+        return _open_sftp_unslotted()
+    except BaseException:
+        _sftp_slots.release()
+        raise
+
+
+def _release_slot_on_close(client):
+    """Arrange for the session slot to release exactly once when the
+    caller closes the client (every _open_sftp caller closes in a
+    finally block)."""
+    orig_close = client.close
+    released = [False]
+
+    def close_and_release():
+        try:
+            orig_close()
+        finally:
+            if not released[0]:
+                released[0] = True
+                _sftp_slots.release()
+
+    client.close = close_and_release
+
+
+def _open_sftp_unslotted():
+    last_err = None
+    for attempt in range(1, SFTP_CONNECT_ATTEMPTS + 1):
+        _pace_connect()
+        client = paramiko.SSHClient()
+        # Match legacy pysftp behavior: cnopts.hostkeys = None — i.e. accept any host key.
+        # NOTE: this is insecure against MITM. Prior service ran with the same posture.
+        # Migrate to known_hosts verification in a follow-up ticket.
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        try:
+            client.connect(
+                hostname=sftp_host,
+                username=sftp_username,
+                password=sftp_password,
+                look_for_keys=False,
+                allow_agent=False,
+                timeout=SFTP_TCP_TIMEOUT_S,
+                banner_timeout=SFTP_BANNER_TIMEOUT_S,
+                auth_timeout=SFTP_AUTH_TIMEOUT_S,
+            )
+            sftp = client.open_sftp()
+            _release_slot_on_close(client)
+            return client, sftp
+        except (paramiko.SSHException, OSError) as e:
+            last_err = e
+            try:
+                client.close()
+            except Exception:  # noqa: BLE001
+                pass
+            if attempt < SFTP_CONNECT_ATTEMPTS:
+                delay = (
+                    SFTP_CONNECT_BASE_DELAY_S
+                    * (2 ** (attempt - 1))
+                    * (0.5 + random.random())
+                )
+                logger.warning(
+                    'sftp connect attempt %d/%d failed (%s); retrying in %.1fs',
+                    attempt, SFTP_CONNECT_ATTEMPTS, e, delay,
+                )
+                time.sleep(delay)
+    logger.error(
+        'sftp connect failed after %d attempts: %s', SFTP_CONNECT_ATTEMPTS, last_err,
     )
-    sftp = client.open_sftp()
-    return client, sftp
+    raise last_err
 
 
 def _sftp_mkdir_p(sftp, remote_dir):
