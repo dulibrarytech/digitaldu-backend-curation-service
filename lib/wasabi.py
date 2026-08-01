@@ -196,11 +196,23 @@ class _FileProgress:
     the instance like a function; we keep the running total inside.
     """
 
-    def __init__(self, label, total_bytes):
+    def __init__(self, label, total_bytes, hook=None, hook_interval_s=3.0):
         self._label = label
         self._total = max(total_bytes, 1)
         self._sent = 0
         self._milestones = {25, 50, 75, 100}
+        # Optional live-progress hook: called as hook(bytes_sent,
+        # total_bytes), throttled to every `hook_interval_s` seconds
+        # (plus every milestone). Used by aip_ops to persist a
+        # progress file the copy-progress route serves — boto3 fires
+        # this callback per chunk, far too often to write through
+        # unthrottled. Hook errors are swallowed: progress reporting
+        # must never fail an upload.
+        self._hook = hook
+        self._hook_interval_s = hook_interval_s
+        # None = never fired; the first chunk always writes so the
+        # progress surface goes live as soon as bytes start moving.
+        self._hook_last = None
 
     def __call__(self, bytes_transferred):
         self._sent += bytes_transferred
@@ -213,6 +225,21 @@ class _FileProgress:
                 'wasabi upload %s — %d%% (%d/%d bytes)',
                 self._label, m, self._sent, self._total,
             )
+        if self._hook is not None:
+            now = time.monotonic()
+            if (
+                passed
+                or self._hook_last is None
+                or (now - self._hook_last) >= self._hook_interval_s
+            ):
+                self._hook_last = now
+                try:
+                    self._hook(self._sent, self._total)
+                except Exception:
+                    logger.debug(
+                        'progress hook failed for %s', self._label,
+                        exc_info=True,
+                    )
 
 
 def upload_directory(source_dir, folder):
@@ -410,7 +437,8 @@ def _resolve_bucket(bucket_config):
     return _parse_bucket(raw)
 
 
-def upload_fileobj(file_obj, key, expected_bytes=None, bucket_config=None):
+def upload_fileobj(file_obj, key, expected_bytes=None, bucket_config=None,
+                   progress_hook=None):
     """
     Stream-upload a file-like object to Wasabi at <bucket>/<base_prefix><key>.
 
@@ -427,6 +455,11 @@ def upload_fileobj(file_obj, key, expected_bytes=None, bucket_config=None):
         expected_bytes:  optional int — used only for progress logging.
                          If unknown, pass None and the callback skips
                          milestone logs.
+        progress_hook:   optional callable(bytes_sent, total_bytes),
+                         invoked (throttled — see _FileProgress) as the
+                         upload streams. Requires expected_bytes; with
+                         an unknown total there is no callback at all,
+                         so the hook is never fired.
         bucket_config:   optional override of which WASABI_*BUCKET env
                          value to use. AIP callers pass
                          config.WASABI_AIP_BUCKET so AIPs route to the
@@ -447,7 +480,8 @@ def upload_fileobj(file_obj, key, expected_bytes=None, bucket_config=None):
     client = _make_client()
 
     callback = (
-        _FileProgress(full_key, expected_bytes) if expected_bytes else None
+        _FileProgress(full_key, expected_bytes, hook=progress_hook)
+        if expected_bytes else None
     )
 
     logger.info(

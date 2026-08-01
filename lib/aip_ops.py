@@ -52,7 +52,11 @@ Naming:
   applied by lib.wasabi from WASABI_BUCKET.
 """
 
+import json
 import logging
+import os
+import re
+import tempfile
 import time
 
 import requests
@@ -113,6 +117,92 @@ def _resolve_wasabi_key(am_metadata):
     current_path = (am_metadata or {}).get('current_path') or ''
     last = current_path.rstrip('/').split('/')[-1]
     return last
+
+
+# --- copy-progress file ----------------------------------------------------
+#
+# Live byte progress for the /copy-to-wasabi call, persisted to a small
+# per-AIP JSON file so ANOTHER gunicorn worker can serve it from the
+# GET /copy-progress/<aip_uuid> route (workers are separate processes;
+# in-memory state is invisible across them). The uploading worker
+# writes it via a throttled _FileProgress hook; the file is deleted
+# when the copy settles, so "no file" cleanly means "no active copy".
+# All writes are best-effort — progress must never fail a copy.
+
+# Strict UUID shape (AM package UUIDs). Doubles as path-traversal
+# protection: the uuid becomes a filename component.
+_PROGRESS_UUID_RE = re.compile(
+    r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$',
+    re.IGNORECASE,
+)
+
+
+def _progress_path(aip_uuid):
+    """Progress-file path for a valid AIP uuid, else None."""
+    if not _PROGRESS_UUID_RE.match(aip_uuid or ''):
+        return None
+    return os.path.join(
+        tempfile.gettempdir(), 'aip-copy-progress', f'{aip_uuid.lower()}.json'
+    )
+
+
+def write_copy_progress(aip_uuid, bytes_sent, total_bytes):
+    """
+    Atomically persist {bytes_sent, total_bytes, updated_at}. Write to
+    a temp name + os.replace so a concurrent read never sees a torn
+    file. Swallows every error.
+    """
+    path = _progress_path(aip_uuid)
+    if not path:
+        return
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = f'{path}.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump({
+                'aip_uuid': aip_uuid.lower(),
+                'bytes_sent': int(bytes_sent),
+                'total_bytes': int(total_bytes),
+                'updated_at': int(time.time()),
+            }, f)
+        os.replace(tmp, path)
+    except Exception:
+        logger.debug(
+            'write_copy_progress failed aip_uuid=%s', aip_uuid, exc_info=True,
+        )
+
+
+def read_copy_progress(aip_uuid):
+    """Progress dict for an active copy, or None (no file / unreadable)."""
+    path = _progress_path(aip_uuid)
+    if not path:
+        return None
+    try:
+        with open(path, encoding='utf-8') as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else None
+    except FileNotFoundError:
+        return None
+    except Exception:
+        logger.debug(
+            'read_copy_progress failed aip_uuid=%s', aip_uuid, exc_info=True,
+        )
+        return None
+
+
+def clear_copy_progress(aip_uuid):
+    """Remove the progress file; missing is fine, errors are swallowed."""
+    path = _progress_path(aip_uuid)
+    if not path:
+        return
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+    except Exception:
+        logger.debug(
+            'clear_copy_progress failed aip_uuid=%s', aip_uuid, exc_info=True,
+        )
 
 
 def copy_aip_to_wasabi(aip_uuid, repo_uuid):
@@ -291,6 +381,14 @@ def copy_aip_to_wasabi(aip_uuid, repo_uuid):
             return out
 
     # --- Step 3: Stream-pipe AM → Wasabi --------------------------------
+    # Seed the copy-progress file at 0 bytes before the stream opens so
+    # the dashboard's side-poll shows a (0%) bar immediately, then let
+    # the throttled _FileProgress hook advance it as chunks upload. The
+    # finally-clear runs on EVERY exit — success, upload error, download
+    # error — so a dead copy never leaves a stale "in progress" file
+    # behind for the copy-progress route to serve.
+    if expected_bytes:
+        write_copy_progress(aip_uuid, 0, expected_bytes)
     try:
         with requests.get(
             _am_download_url(aip_uuid),
@@ -307,6 +405,10 @@ def copy_aip_to_wasabi(aip_uuid, repo_uuid):
                     dl.raw, key,
                     expected_bytes=expected_bytes,
                     bucket_config=config.WASABI_AIP_BUCKET,
+                    progress_hook=(
+                        lambda sent, total:
+                            write_copy_progress(aip_uuid, sent, total)
+                    ),
                 )
             except ClientError as e:
                 code = e.response.get('Error', {}).get('Code', 'unknown')
@@ -321,6 +423,8 @@ def copy_aip_to_wasabi(aip_uuid, repo_uuid):
         out['elapsed_ms'] = int((time.monotonic() - started) * 1000)
         out['error'] = f'am download failed: {e}'
         return out
+    finally:
+        clear_copy_progress(aip_uuid)
 
     out['ok'] = True
     out['bucket'] = uploaded.get('bucket') or bucket_name

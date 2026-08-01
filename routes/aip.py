@@ -119,6 +119,40 @@ def copy_to_wasabi():
     return jsonify(result), 200
 
 
+@aip_bp.route('/copy-progress/<aip_uuid>', methods=['GET'])
+@require_api_key_qa
+def copy_progress(aip_uuid):
+    """
+    Live byte progress for an in-flight /copy-to-wasabi call.
+
+    Returns 200 {ok, aip_uuid, bytes_sent, total_bytes, updated_at}
+    while a copy is streaming (the uploading worker maintains a
+    per-AIP progress file — see lib/aip_ops.write_copy_progress), and
+    404 {ok: false} when there is no active copy: not started yet,
+    already finished (the file is cleared on every exit), or an older
+    service build. Callers poll this NEXT TO the long synchronous
+    copy call, so it stays a cheap local file read — no AM or Wasabi
+    round-trips.
+
+    404 (not the 200+ok=false convention of the copy routes) because
+    "nothing to report" isn't a failure — the Node side treats any
+    non-200 as "no data" and just keeps its heartbeat.
+    """
+    aip_uuid = (aip_uuid or '').strip()
+    if not aip_ops._PROGRESS_UUID_RE.match(aip_uuid):
+        return jsonify({'ok': False, 'error': 'aip_uuid must be a UUID'}), 400
+    progress = aip_ops.read_copy_progress(aip_uuid)
+    if progress is None:
+        return jsonify({'ok': False, 'error': 'no active copy'}), 404
+    return jsonify({
+        'ok': True,
+        'aip_uuid': progress.get('aip_uuid') or aip_uuid.lower(),
+        'bytes_sent': progress.get('bytes_sent'),
+        'total_bytes': progress.get('total_bytes'),
+        'updated_at': progress.get('updated_at'),
+    }), 200
+
+
 @aip_bp.route('/list-objects', methods=['GET'])
 @require_api_key_qa
 def list_aip_objects():
