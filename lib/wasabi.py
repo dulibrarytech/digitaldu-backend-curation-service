@@ -13,29 +13,14 @@
 # limitations under the License.
 
 """
-Wasabi S3 operations.
+Wasabi S3 operations (boto3).
 
-Replaces the previous `os.system('aws s3 cp ...')` shellout in
-archivematica_ops.move_to_s3. Two reasons for the rewrite:
+Directory and stream uploads, presigned GETs, and the read-only listing
+helpers the archive-browser routes use. Auth comes from
+AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY or WASABI_PROFILE, against
+WASABI_ENDPOINT / WASABI_BUCKET.
 
-  1. The shellout had a silent data-loss bug: the caller checked
-     `if move_result == 1` against the raw return of `os.system`, which
-     on POSIX returns the shell-encoded status `(exit_code << 8) | signal`.
-     An AWS CLI exit code of 1 came back as 256 — the `== 1` check
-     was always false, so the caller would `shutil.rmtree(source)` and
-     delete the local files even when the upload had failed. Using
-     boto3 lets us return clean 0/1 from one place and raise on
-     unexpected errors.
-
-  2. The shellout had no observability. `os.system` discards stdout/
-     stderr by default (where it goes depends on how gunicorn was
-     started), so a failed upload left no trace anywhere. boto3 gives
-     us per-file logging, structured exceptions, and a Callback hook
-     for progress on large files.
-
-Auth is unchanged: same `WASABI_PROFILE` from `~/.aws/config`, same
-`WASABI_ENDPOINT` URL, same `WASABI_BUCKET` env var as before. No
-.env changes needed if those are already populated.
+Design history and rationale: repo/notes/CURATION_API_CODE_NOTES.md
 """
 
 import logging
@@ -56,16 +41,13 @@ import config
 
 logger = logging.getLogger(__name__)
 
-# Retry config applied to every S3 API call. "adaptive" mode adds
-# client-side backoff on top of the standard exponential retry, which
-# is the right default for Wasabi (rare throttling but it does happen
-# on large concurrent batches). 5 attempts × adaptive backoff caps a
-# transient flake's recovery at ~30s, well under our per-call budget.
+# Retry config applied to every S3 API call. Adaptive mode adds
+# client-side backoff on top of the standard exponential retry; 5
+# attempts caps a transient flake's recovery at roughly 30s.
 _RETRY_CONFIG = Config(
     retries={'max_attempts': 5, 'mode': 'adaptive'},
-    # Wasabi sometimes takes a beat to acknowledge large multipart
-    # uploads; bump from boto3's 60s default so we don't trip on
-    # slow-but-healthy network paths.
+    # Above boto3's 60s default — large multipart uploads can be slow
+    # to acknowledge on a healthy path.
     read_timeout=180,
     connect_timeout=30,
 )
@@ -73,9 +55,8 @@ _RETRY_CONFIG = Config(
 
 def _parse_bucket(raw):
     """
-    Extract bucket name + optional base key prefix from the WASABI_BUCKET
-    env value, which is historically stored in `s3://<bucket>[/<prefix>]/`
-    form (the AWS CLI command line shape).
+    Extract bucket name + optional base key prefix from a WASABI_BUCKET
+    env value. Accepts `s3://<bucket>[/<prefix>]/` or a bare bucket name.
 
     Returns (bucket_name, base_prefix). base_prefix is '' or a string
     ending in '/'.
@@ -92,15 +73,9 @@ def _parse_bucket(raw):
     return bucket, prefix.strip('/') + '/'
 
 
-# AWS_PROFILE / AWS_DEFAULT_PROFILE env vars cause boto3.Session() to
-# load a named profile from `~/.aws/config` during _setup_loader() —
-# EVEN WHEN aws_access_key_id + aws_secret_access_key are passed
-# explicitly. If the env-var-named profile isn't in the config file,
-# the constructor raises ProfileNotFound before we ever get a chance
-# to use the explicit credentials. The .env shape on the curation
-# host sets AWS_DEFAULT_PROFILE alongside the actual access keys, so
-# this trips for every recovery / cron / interactive invocation
-# unless we strip those env vars during Session construction.
+# These env vars must be popped while a Session is built from explicit
+# keys: set, they make boto3 load a named profile from ~/.aws/config even
+# when keys are passed, and raise ProfileNotFound if it is absent.
 _PROFILE_ENV_VARS = ('AWS_PROFILE', 'AWS_DEFAULT_PROFILE')
 
 
@@ -110,21 +85,12 @@ def _make_client():
 
     Three credential paths, in priority order:
 
-      1. Explicit env vars — AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY
-         (with optional AWS_DEFAULT_REGION). This is the v1 deployment
-         shape: keys live in `.env`, loaded by systemd's
-         EnvironmentFile= directive. Preferred because it does NOT
-         depend on `~/.aws/config` being present for whatever user
-         the process happens to run as.
-
-      2. Named profile — `WASABI_PROFILE` from `~/.aws/config`. Same
-         file the AWS CLI uses. Used only if env vars above are unset.
-
-      3. None — RuntimeError. No silent fallback to instance metadata.
-
-    Raises RuntimeError if no usable credentials are configured at
-    all, so the failure mode is loud rather than "uses some random
-    creds that happen to be on the host".
+      1. AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY (plus optional
+         AWS_DEFAULT_REGION).
+      2. WASABI_PROFILE, a named profile in `~/.aws/config`. Used only
+         when the keys above are unset.
+      3. Neither — RuntimeError. There is deliberately no fallback to
+         instance metadata or ambient host credentials.
     """
     if not config.WASABI_ENDPOINT:
         raise RuntimeError('WASABI_ENDPOINT is not configured')
@@ -142,20 +108,13 @@ def _make_client():
 
 def _client_from_keys():
     """
-    Build an S3 client from explicit access-key + secret. See
-    _PROFILE_ENV_VARS comment for why we pop those env vars
-    AROUND BOTH `boto3.Session()` AND `session.client()`.
+    Build an S3 client from explicit access-key + secret.
 
-    Earlier iterations only popped during Session() and restored
-    before client() — botocore's `create_client` then hit
-    `get_config_variable('ca_bundle')`, which goes through the same
-    `get_scoped_config()` machinery and triggered the same
-    ProfileNotFound. Keep the pop in effect through BOTH calls;
-    Python's `try/return/finally` runs `finally` after the return
-    value is computed but before control hands back to the caller,
-    so by the time upload_file() runs the env vars are restored
-    and the constructed client doesn't need them anyway (its
-    credentials are baked in at construction time).
+    _PROFILE_ENV_VARS stay popped across BOTH `boto3.Session()` AND
+    `session.client()` — client construction re-enters the same
+    profile-loading machinery, so popping around Session alone still
+    raises ProfileNotFound. The env vars are restored on return, and
+    the built client no longer needs them.
     """
     session_kwargs = {
         'aws_access_key_id': config.AWS_ACCESS_KEY_ID,
@@ -201,17 +160,14 @@ class _FileProgress:
         self._total = max(total_bytes, 1)
         self._sent = 0
         self._milestones = {25, 50, 75, 100}
-        # Optional live-progress hook: called as hook(bytes_sent,
-        # total_bytes), throttled to every `hook_interval_s` seconds
-        # (plus every milestone). Used by aip_ops to persist a
-        # progress file the copy-progress route serves — boto3 fires
-        # this callback per chunk, far too often to write through
-        # unthrottled. Hook errors are swallowed: progress reporting
-        # must never fail an upload.
+        # Optional live-progress hook, called as hook(bytes_sent,
+        # total_bytes) at every milestone and at most once per
+        # `hook_interval_s` otherwise (boto3 fires the callback per
+        # chunk). Hook errors are swallowed — progress reporting must
+        # never fail an upload.
         self._hook = hook
         self._hook_interval_s = hook_interval_s
-        # None = never fired; the first chunk always writes so the
-        # progress surface goes live as soon as bytes start moving.
+        # None = never fired; the first chunk always fires the hook.
         self._hook_last = None
 
     def __call__(self, bytes_transferred):
@@ -246,9 +202,8 @@ def upload_directory(source_dir, folder):
     """
     Recursively upload every regular file under `source_dir` to Wasabi.
 
-    Mirrors the prior AWS-CLI semantics: a file at `<source>/<rel>`
-    lands at the key `<base_prefix><folder>/<rel>` (POSIX-joined,
-    slashes regardless of host OS).
+    A file at `<source>/<rel>` lands at the key `<base_prefix><folder>/<rel>`
+    (POSIX-joined, forward slashes regardless of host OS).
 
     Args:
         source_dir: local directory to upload. Trailing slash optional.
@@ -270,22 +225,15 @@ def upload_directory(source_dir, folder):
         }
         `ok` is True iff every file succeeded AND at least one file
         was uploaded. An empty source directory returns ok=False with
-        no errors — we don't silently no-op a vanished source.
+        no errors — a vanished source is never a silent no-op.
 
-    2026-07-26 (003-ingested retirement, phase 1): every upload is now
-    verified with an immediate head_object size check. A file whose
-    remote size disagrees with the local size counts as FAILED even
-    though upload_file itself did not raise. Rationale: once the local
-    003-ingested copies are retired, this upload is the batch
-    snapshot's only custodian — "the SDK call returned" is not a
-    strong enough success signal to gate 002-ingest deletion on.
-    (The 2026-07-26 reconciliation found one 132 MB file truncated by
-    the parallel UNVERIFIED local copy path; verification is what
-    separates the surviving path from the retired one.)
+    Every upload is VERIFIED with an immediate head_object size check;
+    a remote size that disagrees with the local size counts as FAILED
+    even though upload_file did not raise. Callers gate deletion of the
+    local copy on this.
 
     Never raises for per-file errors — they're logged and counted.
-    Configuration errors (missing profile, bad endpoint) DO raise so
-    they fail loudly at startup or first call.
+    Configuration errors (missing profile, bad endpoint) DO raise.
     """
     started = time.monotonic()
     bucket, base_prefix = _parse_bucket(config.WASABI_BUCKET)
@@ -462,9 +410,7 @@ def upload_fileobj(file_obj, key, expected_bytes=None, bucket_config=None,
                          so the hook is never fired.
         bucket_config:   optional override of which WASABI_*BUCKET env
                          value to use. AIP callers pass
-                         config.WASABI_AIP_BUCKET so AIPs route to the
-                         right bucket; legacy callers (none — kept for
-                         symmetry) leave it None to target
+                         config.WASABI_AIP_BUCKET; None targets
                          config.WASABI_BUCKET.
 
     Returns:
@@ -578,8 +524,7 @@ def generate_presigned_url(key, ttl_seconds=900, bucket_config=None):
     different surface still works.
 
     `bucket_config` mirrors upload_fileobj — AIP callers pass
-    config.WASABI_AIP_BUCKET so the presigned URL points at the
-    same bucket Stage 6 uploaded to.
+    config.WASABI_AIP_BUCKET so the URL points at the AIP bucket.
 
     Returns the URL string. Raises on any cred / config failure so
     the caller (the route) can return ok=false with the message.
@@ -599,10 +544,8 @@ def list_prefixes(prefix, continuation_token=None, bucket_config=None,
     """
     One page of "subfolder" names under `prefix` (Delimiter='/').
 
-    Read-only. Used by the archive-browser routes (routes/archive.py)
-    to walk the batch archive's <collection>/<package>/<files> layout
-    one level at a time without ever listing the full 88k-object
-    bucket.
+    Read-only. Walks the batch archive's <collection>/<package>/<files>
+    layout one level at a time; never lists the whole bucket.
 
     Args:
         prefix              key prefix to list under ('' for the bucket
@@ -645,14 +588,11 @@ def search_prefixes(parent, q, continuation_token=None, bucket_config=None,
                     max_keys=1000):
     """
     One page of child "subfolder" names under `parent` whose names
-    START WITH `q` — a server-side S3 prefix search (2026-07-30).
+    START WITH `q` — a server-side S3 prefix search.
 
-    Built for the archive browser's package level: a migrated
-    collection can hold thousands of package folders, and the
-    client-side "filter loaded names" box could not see past the
-    loaded page — a freshly archived package looked missing when it
-    was merely pages deep. S3 prefix listing makes typing the start
-    of a package id an exact, bucket-side search.
+    Searches the whole bucket level, not just the loaded page, so the
+    archive browser can find a package in a collection holding
+    thousands of them.
 
     Args:
         parent   level prefix, '' or ending with '/'

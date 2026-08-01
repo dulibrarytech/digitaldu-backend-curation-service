@@ -13,21 +13,15 @@
 # limitations under the License.
 
 """
-Archivematica staging routes (legacy: digitaldu-backend-qa).
+Archivematica staging routes.
 
-URL prefix preserved as /api/v2/qa/ so the ingest service does not need code
-changes during cutover. Response shapes preserved verbatim from the legacy
-service — Stage 4 will normalize them to {result, errors}.
+Ready-stage QA checks and the staging moves the ingest service drives.
 
-2026-05-23 cancel-flow safety patch (curration-api-modified):
-  - `/move-to-ingest` now surfaces HTTP 409 when ops returns
-    result='move_in_progress' so the Node side can distinguish lock
-    contention from other failures.
-  - `/move-from-ingest-to-ready` accepts optional `?actor=<du_id>` for
-    cross-reference logging, and now maps the ops result to:
-        200 for success / already_in_ready
-        409 for move_in_progress (per-uuid lock held)
-        500 for move_failed / destination_create_failed / source_not_found
+CONTRACT: the /api/v2/qa/ prefix and every response shape below are
+consumed as-is by the ingest service — changing either is a breaking
+change for that caller.
+
+Design history and rationale: repo/notes/CURATION_API_CODE_NOTES.md
 """
 
 import json
@@ -175,10 +169,9 @@ def move_to_ingest():
     err = validate_segment(uuid, 'uuid') or validate_segment(folder, 'folder')
     if err:
         return json.dumps(['Bad Request: ' + err]), 400
-    # Note: legacy did not require `package`; preserved here so existing
-    # callers don't regress. ops.move_to_ingest tolerates None package
-    # by surfacing the error inside the move itself — but if one IS
-    # supplied, it must be a safe segment (it becomes a directory name).
+    # `package` is optional — ops.move_to_ingest surfaces a None package
+    # as an error inside the move. When supplied it must be a safe
+    # segment, since it becomes a directory name.
     if package is not None:
         pkg_err = validate_segment(package, 'package')
         if pkg_err:
@@ -192,9 +185,8 @@ def move_to_ingest():
 @require_api_key_qa
 def move_from_ingest_to_ready():
     """
-    Rollback inverse of /move-to-ingest. Used by the ingest service's:
-      - pre-ingest rollback action (legacy: ROLLED_BACK_TO_READY)
-      - return-to-packaging action (post-cancel cleanup)
+    Rollback inverse of /move-to-ingest. Used by the ingest service's
+    pre-ingest rollback and return-to-packaging actions.
 
     Required query params (all three):
       uuid    — directory name in 002-ingest (set by move_to_ingest)
@@ -209,9 +201,7 @@ def move_from_ingest_to_ready():
     Behavior summary (see lib/archivematica_ops.move_from_ingest_to_ready
     for full details):
       * Per-uuid lock prevents concurrent moves.
-      * Best-effort cleans the Archivematica SFTP staging copy first
-        (handles the case where Stage 2's move_to_sftp had progressed
-        before the cancel landed).
+      * Best-effort cleans the Archivematica SFTP staging copy first.
       * Moves the package back to 001-ready/<folder>/<package>;
         uri.txt is preserved so the folder reappears in /processed
         (Packaging and Ingesting dashboard view).
@@ -247,8 +237,7 @@ def move_from_ingest_to_ready():
 
     results = ops.move_from_ingest_to_ready(uuid, folder, package, actor=actor)
 
-    # Map the structured result to an HTTP status the Node side can
-    # branch on:
+    # Result -> HTTP status the caller branches on:
     #   move_in_progress       -> 409 Conflict (retry-friendly)
     #   move_failed / dest_*   -> 500 Internal Server Error
     #   everything else        -> 200 OK

@@ -52,7 +52,7 @@ def _extract_and_check_key():
 
 
 def require_api_key_qa(f):
-    """Legacy QA-shape auth decorator.
+    """QA-shape auth decorator.
 
     On failure: json.dumps(['Access denied.']), 403
     """
@@ -66,7 +66,7 @@ def require_api_key_qa(f):
 
 
 def require_api_key_astools(f):
-    """Legacy ASTools-shape auth decorator.
+    """ASTools-shape auth decorator.
 
     On failure: jsonify({'result': None, 'errors': [...]}), 401
     On server misconfiguration: jsonify({...}), 500

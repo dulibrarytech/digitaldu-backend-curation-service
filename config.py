@@ -16,9 +16,10 @@
 Central configuration for the curation API.
 
 All env vars are loaded once at module import and exposed as module-level
-attributes. Per-endpoint env-var checks remain in the route handlers (they
-existed in the legacy services and may catch deployment errors that startup
-validation misses).
+attributes. Route handlers additionally re-check the env vars they need,
+so a deployment gap surfaces per endpoint as well as at startup.
+
+Design history and rationale: repo/notes/CURATION_API_CODE_NOTES.md
 """
 
 import os
@@ -46,21 +47,12 @@ SFTP_PWD = os.getenv('SFTP_PWD')
 SFTP_REMOTE_PATH = os.getenv('SFTP_REMOTE_PATH')
 WASABI_ENDPOINT = os.getenv('WASABI_ENDPOINT')
 WASABI_BUCKET = os.getenv('WASABI_BUCKET')
-# Separate bucket for AIP-store operations (see lib/aip_ops.py +
-# routes/aip.py). DU's deployment uses TWO Wasabi buckets:
-#
-#   WASABI_BUCKET     → SFTP-staging archive (move_to_ingested writes
-#                       here; staff `<package>/` folders land at the
-#                       configured base prefix).
-#   WASABI_AIP_BUCKET → AM-produced AIP packages (Stage 6 writes here;
-#                       legacy migration's ~20k rows already live here).
-#
-# Conventional value in prod:
-#   WASABI_AIP_BUCKET=s3://library-repository/aip-store/
-#
-# Required for /api/v2/aip/* endpoints. If unset, those routes
-# refuse with ok=false rather than silently routing AIPs to the
-# SFTP-staging bucket.
+# DU's deployment uses TWO Wasabi buckets:
+#   WASABI_BUCKET     → batch archive (move_to_ingested writes here)
+#   WASABI_AIP_BUCKET → AM-produced AIP packages (Stage 6 writes here),
+#                       conventionally s3://library-repository/aip-store/
+# WASABI_AIP_BUCKET is REQUIRED by /api/v2/aip/*; unset, those routes
+# refuse with ok=false rather than writing AIPs to the batch bucket.
 WASABI_AIP_BUCKET = os.getenv('WASABI_AIP_BUCKET')
 WASABI_PROFILE = os.getenv('WASABI_PROFILE')
 UID = os.getenv('UID')
@@ -73,37 +65,21 @@ AWS_SECRET_ACCESS_KEY = os.getenv('AWS_SECRET_ACCESS_KEY')
 AWS_DEFAULT_REGION = os.getenv('AWS_DEFAULT_REGION')
 
 # --- Archivematica Storage Service (AIP retrieval) ---------------------------
-# Used by lib/aip_ops.py to fetch AM-produced AIPs and pipe them to
-# Wasabi (Stage 6 + backfill). NOT used by the existing
-# archivematica_ops.py — that one handles filesystem moves, not API
-# calls. These values are conventionally the same as the v2 ingest
-# worker's ARCHIVEMATICA_STORAGE_* env values (the AM Storage Service
-# only has one set of credentials per instance), so the simplest
-# setup is to copy them from repo-backend-v2's .env into the
-# curation service's .env.
-#
+# Used by lib/aip_ops.py to fetch AM-produced AIPs and pipe them to Wasabi.
 # Auth scheme is the AM Storage Service's ApiKey header:
 #   Authorization: ApiKey <username>:<api_key>
-#
-# All three are REQUIRED for the AIP endpoints (/api/v2/aip/*). If
-# any is unset, aip_ops.copy_aip_to_wasabi fails on the first HTTP
-# call with an auth/transport error rather than at import time, so
-# the failure surfaces in the v2 AIPs dashboard as a per-row error
-# string rather than crashing the worker.
+# Conventionally the same three values as repo-backend-v2's
+# ARCHIVEMATICA_STORAGE_* env. All three are REQUIRED by /api/v2/aip/*;
+# a missing one fails on the first HTTP call (surfacing as a per-row error
+# in the v2 AIPs dashboard), not at import time.
 ARCHIVEMATICA_STORAGE_API = os.getenv('ARCHIVEMATICA_STORAGE_API')
 ARCHIVEMATICA_STORAGE_USERNAME = os.getenv('ARCHIVEMATICA_STORAGE_USERNAME')
 ARCHIVEMATICA_STORAGE_API_KEY = os.getenv('ARCHIVEMATICA_STORAGE_API_KEY')
 
-# Read timeout (seconds) for the AM Storage Service /download/ stream
-# in aip_ops.copy_aip_to_wasabi. This bounds BOTH the time-to-first-
-# byte and any mid-stream silence. It must be GENEROUS: AM Storage
-# spends a long time preparing a package before the first byte arrives
-# (~68s observed for a 327 MB AIP, 2026-07-31 — hours for a 66 GB one),
-# and during that window the connection is silent by design. Too small
-# kills legitimate large-AIP downloads mid-prep; the pre-2026-07-31
-# open-ended value turned a genuinely dead AM into an invisible hang
-# bounded only by the caller's 12h budget. Default 6h. Set 0 to
-# restore the open-ended behavior.
+# Read timeout (seconds) for the AM Storage Service /download/ stream in
+# aip_ops.copy_aip_to_wasabi, bounding both time-to-first-byte and
+# mid-stream silence. Keep it GENEROUS — AM is silent while it prepares a
+# package, which takes hours at tens of GB. Default 6h; 0 = open-ended.
 try:
     AM_DOWNLOAD_READ_TIMEOUT_SECONDS = int(
         os.getenv('AM_DOWNLOAD_READ_TIMEOUT_SECONDS', '21600')

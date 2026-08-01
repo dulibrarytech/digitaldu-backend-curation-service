@@ -13,12 +13,16 @@
 # limitations under the License.
 
 """
-ArchivesSpace metadata routes (legacy: astools-web_v2).
+ArchivesSpace metadata routes.
 
-URL prefix preserved as /api/v1/astools/ so the ingest service does not need
-code changes during cutover. Helpers (`_validate_*`, `_build_cli_arguments`,
-`_write_serialized_files`) stay co-located with the make_digital_objects
-endpoint that owns them.
+Workspace listing, uri.txt state, and the make_digital_objects CLI
+runner. Its helpers (`_validate_*`, `_build_cli_arguments`,
+`_write_serialized_files`) stay co-located with that endpoint.
+
+CONTRACT: the /api/v1/astools/ prefix and the {result, errors} envelope
+are consumed as-is by the ingest service.
+
+Design history and rationale: repo/notes/CURATION_API_CODE_NOTES.md
 """
 
 import json
@@ -49,7 +53,7 @@ def get_workspace_packages():
     """
     Gets batch folders awaiting Make Digital Objects, with structure QA flags.
 
-    Response shape (feature-batch-packaging-qa):
+    Response shape:
         {
           "result": [
             {
@@ -65,17 +69,13 @@ def get_workspace_packages():
           "errors": []
         }
 
-    Differences from the legacy flat name list:
+    Listing rules:
       * Malformed batches (loose files, with or without packages) are
-        INCLUDED with error flags — previously they were silently
-        invisible. Completely EMPTY folders are the one exception:
-        hidden until staff put anything in them (2026-07-27 — a
-        just-created folder isn't a mistake yet).
+        INCLUDED, carrying error flags. Completely EMPTY folders are the
+        one exception and stay hidden.
       * Partially processed batches are included with an info flag.
-      * Package names are embedded, so callers no longer need a
-        follow-up /workspace/packages call per folder.
-    The Node consumer (repo-backend-v2 workspace.js) tolerates both the
-    object entries and the legacy strings, so this deploys independently.
+      * Package names are embedded, so no follow-up /workspace/packages
+        call per folder is needed.
 
     @return: JSON response with list of batch objects and errors
     """
@@ -91,8 +91,7 @@ def get_workspace_packages():
                 'errors': ['Server configuration error']
             }), 500
 
-        # Get workspace batches (folders needing processing + flagged
-        # malformed folders that the legacy scan silently skipped).
+        # Folders needing processing, plus flagged malformed folders.
         batches = batch_structure.get_workspace_batches(workspace)
 
         flagged = sum(1 for b in batches if b['structure_errors'])
@@ -191,10 +190,9 @@ def get_packages():
             'result': scan['packages'],
             'processed': scan['processed'],
             'structure_errors': scan['structure_errors'],
-            # Batch size (2026-07-30): the ASpace QA / Packaging views
-            # resolve folders through THIS endpoint (not /workspace),
-            # so the Size column was blank there until the scan's
-            # total_bytes rode along here too.
+            # Batch size: the ASpace QA / Packaging views resolve folders
+            # through THIS endpoint, not /workspace, so total_bytes has
+            # to ride along here too.
             'total_bytes': scan['total_bytes'],
             'errors': []
         }), 200

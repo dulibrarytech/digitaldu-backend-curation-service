@@ -38,11 +38,9 @@ def create_app():
     )
     config.validate_required()
 
-    # Wasabi reachability probe. Logs the outcome but does NOT block
-    # startup on a failure — the SFTP and local-fs endpoints still
-    # work without Wasabi, and a transient Wasabi outage shouldn't
-    # take down the whole curation API. Look for `wasabi probe OK`
-    # in journald to confirm cred + bucket auth are healthy on boot.
+    # Wasabi reachability probe. Logs the outcome but NEVER blocks startup:
+    # the SFTP and local-fs endpoints work without Wasabi. Look for
+    # `wasabi probe OK` in journald to confirm cred + bucket auth on boot.
     _probe_wasabi_at_startup()
 
     app = Flask(__name__)

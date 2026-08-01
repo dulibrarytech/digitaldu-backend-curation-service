@@ -17,22 +17,13 @@ Path-segment validation for QA route parameters.
 
 Every `folder` / `uuid` / `package` query param the qa routes accept is a
 SINGLE directory name that gets joined onto READY_PATH / INGEST_PATH /
-INGESTED_PATH and then handed to filesystem operations (and, historically,
-to `os.system('cp -R ' + folder ...)`). Two distinct risks follow from
-trusting those values:
+INGESTED_PATH and handed to filesystem operations.
 
-  1. Path traversal — `folder=../../etc` escaping the base directory.
-  2. Command injection — only relevant while a shell was involved.
-
-The command-injection vector is closed at the sink by switching the ops
-layer from `os.system(<string>)` to `subprocess.run([...], shell=False)`
-with a `--` end-of-options marker (see lib/archivematica_ops.py:_run). With
-no shell, metacharacters in a name (`;`, `|`, `$(...)`, spaces, ...) are
-inert — they become literal filename bytes. So this validator deliberately
-does NOT try to blocklist shell metacharacters (that would reject legal
-filenames and give a false sense that the *string* is the boundary). Its
-job is the remaining structural risk: keep each value a single, in-base
-path segment.
+Scope: this validator guards ONE risk — path traversal — by keeping each
+value a single, in-base path segment. It deliberately does not blocklist
+shell metacharacters; command injection is closed at the sink instead, by
+running external commands through subprocess with shell=False and a `--`
+end-of-options marker (lib/archivematica_ops.py:_run).
 
 A value is rejected if it is empty/None, longer than 255 chars, exactly
 `.`/`..`, begins with `-` (so it can never be read as a CLI flag even if a

@@ -250,14 +250,9 @@ def get_metadata_ready_folders(root_dir, target_filename='uri.txt'):
     Gets batch folders that HAVE been processed (i.e., have uri.txt file).
     This is the opposite of get_workspace_ready_folders.
 
-    2026-07-24 (feature-batch-packaging-qa, finding F8): the previous
-    implementation used an unbounded os.walk and derived the batch name
-    as basename(dirname(dirpath)). A uri.txt sitting loose in a batch
-    folder therefore reported the WORKSPACE directory's own name as a
-    "batch", and a uri.txt nested inside a package subfolder reported
-    the PACKAGE name — both produced phantom rows in the ASpace QA /
-    Packaging views. The scan is now bounded to exactly the expected
-    layout: <root>/<batch>/<package>/uri.txt.
+    The scan is bounded to exactly the expected layout —
+    <root>/<batch>/<package>/uri.txt — so a uri.txt at any other depth
+    cannot report a phantom batch name.
 
     @param root_dir: Root directory path to scan
     @param target_filename: Target file to check for (default: 'uri.txt')

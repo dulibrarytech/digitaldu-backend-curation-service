@@ -14,24 +14,22 @@
 
 """
 Upload MISSING 003-ingested files to Wasabi (remediation companion to
-scripts/reconcile_ingested_wasabi.py — see repo/INGESTED_RETIREMENT_PLAN.md).
+scripts/reconcile_ingested_wasabi.py).
 
-Purpose: the 2026-07-26 reconciliation found batches whose Wasabi copy is
-absent or incomplete (silent upload failures predating the 2026-05-24
-data-loss fix). This script closes those gaps using the service's own venv,
-boto3 client, and credential resolution — no AWS CLI required on the host.
+Closes the gaps that reconciliation reports — batches whose Wasabi copy is
+absent or incomplete — using the service's own venv, boto3 client, and
+credential resolution. No AWS CLI required on the host.
 
 Safety model:
   * DRY-RUN BY DEFAULT. Without --execute it only prints what it would
     upload. Nothing is ever deleted in any mode (uploads only).
   * Uploads ONLY files that are absent from the bucket. Files that exist
-    remotely at a DIFFERENT size (e.g. the B463 mismatch) are skipped and
-    reported unless --overwrite-mismatch is passed — a remote object that
-    differs from local needs human review, not a blind overwrite.
+    remotely at a DIFFERENT size are skipped and reported unless
+    --overwrite-mismatch is passed — a remote object that differs from
+    local needs human review, not a blind overwrite.
   * Every executed upload is immediately verified with head_object; a size
     disagreement counts the file as FAILED.
-  * Dot-prefixed files are excluded, matching wasabi.upload_directory's
-    filter (they were never part of the upload contract).
+  * Dot-prefixed files are excluded, matching wasabi.upload_directory.
 
 Batch selection (first match wins):
   --batch NAME [...]        explicit batch folder name(s)

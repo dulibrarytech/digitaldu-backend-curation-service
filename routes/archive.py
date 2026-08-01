@@ -17,9 +17,7 @@ Batch-archive browser routes (read-only).
 
 Serves the repov2 dashboard's "Ingested Batch Archive" admin view — a
 browse + per-file-download surface over the Wasabi batch archive
-(WASABI_BUCKET, layout `<collection>/<package>/<files>`), which replaced
-the retired local 003-ingested folder (repo/INGESTED_RETIREMENT_PLAN.md;
-design: repo/WASABI_ARCHIVE_BROWSER_PLAN.md).
+(WASABI_BUCKET, layout `<collection>/<package>/<files>`).
 
 READ-ONLY BY CONSTRUCTION: this blueprint contains listing calls and
 presigned-GET minting only. No write, delete, or copy operation exists
@@ -27,9 +25,8 @@ here, so no request through this surface can mutate the archive.
 
     GET  /api/v2/archive/collections
         → {result: {collections: [<name>, ...]}, errors: []}
-        Top-level prefixes. Follows pagination internally (the level is
-        ~a hundred names); no sizes/counts — computing those means
-        paginating every key in the bucket (see plan §4).
+        Top-level prefixes. Follows pagination internally. No sizes or
+        counts — computing those means paginating every key in the bucket.
 
     GET  /api/v2/archive/collections/<collection>/packages?token=
         → {result: {packages: [...], next_token}, errors: []}
@@ -38,11 +35,9 @@ here, so no request through this surface can mutate the archive.
     GET  /api/v2/archive/collections/<collection>/packages/<package>/files?token=
         → {result: {files: [{name, key, size, last_modified}],
                     folders: [<name>, ...], next_token}, errors: []}
-        Files directly inside the package. `folders` surfaces nested
-        directories (some historical batches have them) so the snapshot
-        is truthful; the dashboard renders them as a further level using
-        the same endpoint semantics via the `key`-style paths of their
-        files' parent — v1 keeps it simple and only lists one level.
+        Files directly inside the package — ONE level only. `folders`
+        names any nested directories (some historical batches have them)
+        so the snapshot is truthful, but does not descend into them.
 
     POST /api/v2/archive/download-url
         Body {"key": "<collection>/<package>/<file>", "ttl_seconds": 900}
@@ -52,6 +47,8 @@ here, so no request through this surface can mutate the archive.
         transit repo-backend-v2 or this service.
 
 Auth: shared X-API-Key (same scheme as /api/v2/qa/).
+
+Design history and rationale: repo/notes/CURATION_API_CODE_NOTES.md
 """
 
 import logging
@@ -119,7 +116,7 @@ def list_collections():
 def list_packages(collection):
     """One page of package folder names inside a collection.
 
-    Optional `q` = server-side S3 prefix search (2026-07-30): matches
+    Optional `q` = server-side S3 prefix search: matches
     package names STARTING WITH q, bucket-side — a migrated collection
     can hold thousands of packages, and the loaded-page filter could
     not see past pagination."""

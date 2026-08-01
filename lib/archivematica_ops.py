@@ -15,24 +15,11 @@
 """
 Archivematica staging operations.
 
-Renamed from `digitaldu-backend-qa/qa_lib.py`. SFTP backend changed from the
-abandoned pysftp library to paramiko (well-maintained). Logging changed from
-logger.info() to a module logger.
+Ready-stage QA checks, the local staging moves (001-ready -> 002-ingest
+-> Wasabi), the paramiko SFTP transfer to the Archivematica staging
+host, and the per-uuid lock that serializes moves for one collection.
 
-2026-05-23 cancel-flow safety patch (curration-api-modified):
-  - Per-uuid lock file added (`_lock_uuid` / `_unlock_uuid` / `_is_locked`)
-    so concurrent move operations on the same uuid can't corrupt state.
-  - `move_to_ingest` and `move_from_ingest_to_ready` now take/release the
-    lock around their disk work. Lock contention returns
-    result='move_in_progress' with no disk side effects.
-  - `move_from_ingest_to_ready` now best-effort calls clean_up_sftp BEFORE
-    the local move (closes the orphaned-SFTP-copy gap for post-cancel
-    rollback when Stage 2's move_to_sftp had already run). SFTP failure
-    is non-fatal — outcome recorded in `sftp_clean` field of the return.
-  - `move_from_ingest_to_ready` now accepts an optional `actor` kwarg
-    (the authenticated staff identifier, threaded in from the route)
-    and logs it at INFO for cross-reference with the ingest service's
-    tbl_ingest_events audit trail.
+Design history and rationale: repo/notes/CURATION_API_CODE_NOTES.md
 """
 
 import fcntl
@@ -53,14 +40,11 @@ from lib import wasabi
 
 logger = logging.getLogger(__name__)
 
-# Re-export config values under their legacy names so existing function bodies
-# continue to work without per-line edits.
+# Config values re-exported under the names the function bodies use.
+# config.INGESTED_PATH is deliberately absent: this layer no longer writes
+# the 003-ingested copy; only the retirement scripts read that path.
 ready_path = config.READY_PATH
 ingest_path = config.INGEST_PATH
-# NOTE: config.INGESTED_PATH still exists for the retirement tooling
-# (scripts/reconcile_ingested_wasabi.py, scripts/sync_missing_to_wasabi.py)
-# but the ops layer no longer reads it — the 003-ingested local archive
-# copy was retired 2026-07-26 (see move_to_ingested's docstring).
 sftp_host = config.SFTP_HOST
 sftp_username = config.SFTP_ID
 sftp_password = config.SFTP_PWD
@@ -78,17 +62,11 @@ errors_file = config.ERRORS_FILE
 def _run(argv):
     """Run an external command with NO shell.
 
-    Replaces the prior `os.system('cp -R ' + folder + ...)` form. Passing an
-    explicit argv list with shell=False means folder/uuid values reach
-    cp/rm/chown as single literal arguments — shell metacharacters in a
-    folder name (`;`, `|`, `$(...)`, spaces, ...) can no longer break out
-    into command execution. Callers pass a `--` end-of-options marker before
-    the operands so a value beginning with `-` can't be read as a flag.
+    Callers must pass an argv list, and a `--` end-of-options marker before
+    any operand that could begin with `-`.
 
-    The exit status is logged but not raised on, matching the legacy
-    os.system behavior (which discarded the status — callers that care, like
-    move_to_ingested's S3 gate, track success through other means). Returns
-    the CompletedProcess so a caller can inspect returncode if needed.
+    A non-zero exit is logged, not raised. Returns the CompletedProcess so
+    a caller can inspect returncode.
     """
     logger.info('exec: %s', ' '.join(argv))
     result = subprocess.run(argv, capture_output=True, text=True, check=False)
@@ -100,57 +78,33 @@ def _run(argv):
     return result
 
 
-# --- paramiko helpers (replacing pysftp's put_r / walktree / cd / execute) --
+# --- paramiko helpers --------------------------------------------------------
 
-# Connection-setup retry budget (2026-07-29 burst hardening). A large
-# batch has several SSH sessions opening in quick succession (the
-# upload thread plus one check_sftp poll per in-flight row), and the
-# AM sshd's MaxStartups cap drops excess UNAUTHENTICATED connections —
-# surfacing as paramiko's "Error reading SSH protocol banner". Those
-# drops are transient by nature, so connection SETUP retries with
-# exponential backoff + jitter (so concurrent retries de-align rather
-# than re-bursting). Failures mid-transfer are NOT retried here — the
-# callers' own error paths (.upload_error marker, route error
-# envelopes) handle those.
+# Connection-SETUP retry budget. Setup failures retry with exponential
+# backoff + jitter; failures mid-transfer are NOT retried here (callers
+# handle those via the .upload_error marker / route error envelopes).
 SFTP_CONNECT_ATTEMPTS = 4
 SFTP_CONNECT_BASE_DELAY_S = 2.0
-# Generous banner window: under MaxStartups pressure sshd may accept
-# the TCP connection but be slow to speak; paramiko's 15s default was
-# part of the failure signature.
 SFTP_BANNER_TIMEOUT_S = 60
 SFTP_TCP_TIMEOUT_S = 30
 SFTP_AUTH_TIMEOUT_S = 30
 
-# Polite-citizen throttles (2026-07-29 follow-up): the AM SFTP host is
-# vendor-managed, and a burst of logins reads like an attack. Two
-# module-level (per gunicorn worker) throttles:
-#
-#   SFTP_MAX_SESSIONS       — hard cap on CONCURRENT open SSH sessions
-#                             from this process (uploads + status
-#                             polls + cleanups all pass through
-#                             _open_sftp). Default 5.
-#   SFTP_CONNECT_MIN_INTERVAL_S — minimum spacing between successive
-#                             connection ATTEMPTS, so even sequential
-#                             polls never hammer sshd with rapid
-#                             logins. Default 1s.
-#
-# GLOBAL across gunicorn workers (2026-07-30): the first cut used a
-# threading.Semaphore, which is per-process — with --workers 4 the
-# real ceiling was 4x the cap and the vendor still saw bursts. The
-# slots are now flock()-backed lock files in SFTP_LOCK_DIR, so every
-# worker process on the host competes for the SAME SFTP_MAX_SESSIONS
-# slots. A slot is held for the lifetime of the SSH session and
-# releases when the caller closes the client (or the process dies —
-# the kernel drops flocks automatically, so a crashed worker can't
-# leak slots).
+# Throttles on connections to the vendor-managed AM SFTP host:
+#   SFTP_MAX_SESSIONS           — hard cap on CONCURRENT SSH sessions.
+#                                 Enforced HOST-wide (flock slot files in
+#                                 SFTP_LOCK_DIR), not per gunicorn worker.
+#   SFTP_CONNECT_MIN_INTERVAL_S — minimum spacing between connection
+#                                 ATTEMPTS, per process.
+# A slot is held for the lifetime of the SSH session and releases when the
+# caller closes the client, or when the process dies (the kernel drops the
+# flock), so slots cannot leak.
 SFTP_MAX_SESSIONS = int(os.getenv('SFTP_MAX_SESSIONS', '5'))
 SFTP_CONNECT_MIN_INTERVAL_S = float(os.getenv('SFTP_CONNECT_MIN_INTERVAL_S', '1.0'))
 SFTP_SLOT_ACQUIRE_TIMEOUT_S = 600  # > longest realistic poll pile-up
 SFTP_LOCK_DIR = os.getenv('SFTP_LOCK_DIR', '/tmp/curation-sftp-slots')
 _sftp_pace_lock = threading.Lock()
-# None = no connect yet. NOT 0.0: time.monotonic()'s epoch is
-# platform-defined (near process start on macOS), so a 0.0 seed would
-# make the FIRST connect wait out the whole interval for nothing.
+# None (not 0.0) = no connect yet — time.monotonic()'s epoch is platform-
+# defined, so a 0.0 seed would stall the first connect.
 _sftp_last_connect_at = [None]
 
 
@@ -172,8 +126,7 @@ def _pace_connect():
 def _acquire_global_slot():
     """Claim one of SFTP_MAX_SESSIONS flock-backed slot files, HOST-wide
     (all gunicorn workers share the same lock dir). Returns the held
-    fd. Raises RuntimeError when no slot frees within the timeout —
-    refusing loudly beats piling more logins onto the vendor's sshd."""
+    fd. Raises RuntimeError when no slot frees within the timeout."""
     os.makedirs(SFTP_LOCK_DIR, exist_ok=True)
     deadline = time.monotonic() + SFTP_SLOT_ACQUIRE_TIMEOUT_S
     while True:
@@ -239,9 +192,8 @@ def _open_sftp_unslotted():
     for attempt in range(1, SFTP_CONNECT_ATTEMPTS + 1):
         _pace_connect()
         client = paramiko.SSHClient()
-        # Match legacy pysftp behavior: cnopts.hostkeys = None — i.e. accept any host key.
-        # NOTE: this is insecure against MITM. Prior service ran with the same posture.
-        # Migrate to known_hosts verification in a follow-up ticket.
+        # Accepts any host key — insecure against MITM. Open item: move to
+        # known_hosts verification.
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         try:
             client.connect(
@@ -297,13 +249,12 @@ class UploadCancelled(Exception):
 
 
 def _sftp_put_r(sftp, local_dir, remote_dir, preserve_mtime=True, should_abort=None):
-    """Recursive directory upload (replaces pysftp.Connection.put_r).
+    """Recursive directory upload.
 
     `should_abort` (optional callable) is checked before every file AND
-    every ~8 MB inside a file (via paramiko's put callback) — raising
-    UploadCancelled aborts the transfer promptly even mid-way through a
-    single multi-GB file (2026-07-30: "Halt entire batch" cancelled the
-    queue rows but the background puts kept uploading to completion).
+    every ~8 MB inside a file (via paramiko's put callback); when it
+    returns True the transfer raises UploadCancelled, so a multi-GB file
+    aborts mid-way rather than at the next file boundary.
     """
     check_every = 256  # put callback fires per 32 KB chunk → ~8 MB
 
@@ -329,7 +280,7 @@ def _sftp_put_r(sftp, local_dir, remote_dir, preserve_mtime=True, should_abort=N
 
 
 def _sftp_walk(sftp, remote_dir, on_file=None, on_dir=None, on_other=None):
-    """Recursive walk over a remote directory (replaces pysftp.walktree)."""
+    """Recursive walk over a remote directory."""
     for entry in sftp.listdir_attr(remote_dir):
         full_path = posixpath.join(remote_dir, entry.filename)
         if stat.S_ISDIR(entry.st_mode):
@@ -345,21 +296,13 @@ def _sftp_walk(sftp, remote_dir, on_file=None, on_dir=None, on_other=None):
 
 
 def _ssh_exec(client, command):
-    """Run a shell command over SSH and return decoded stdout (replaces pysftp.execute).
+    """Run a shell command over SSH and return decoded stdout.
 
-    DEPRECATED (2026-05-23): the production Archivematica SFTP host
-    runs OpenSSH `internal-sftp` Subsystem — a restricted SFTP-only
-    sandbox with NO shell. paramiko's exec_command opens the channel,
-    the server immediately closes it, and stdout.read() returns b''
-    with NO exception raised. The result: callers think the command
-    succeeded; nothing actually ran.
-
-    Two callers used to depend on this: clean_up_sftp (rm -rf) and
-    check_sftp (du -h -s). Both have been rewritten to use pure SFTP
-    operations (sftp.remove, sftp.rmdir, sftp.stat). Helper retained
-    only for one-off diagnostic scripts that target a shell-enabled
-    host. Do NOT add new callers — see _sftp_rmtree below for the
-    correct pattern.
+    DEPRECATED — unusable against the production Archivematica host: it
+    runs an `internal-sftp` Subsystem with no shell, and the command
+    silently returns b'' instead of failing. Retained only for one-off
+    diagnostics against a shell-enabled host. Do NOT add new callers;
+    use the pure-SFTP helpers (_sftp_rmtree, _sftp_dir_size) instead.
     """
     stdin, stdout, stderr = client.exec_command(command)
     return stdout.read().decode('utf-8', errors='replace')
@@ -368,34 +311,14 @@ def _ssh_exec(client, command):
 def _sftp_rmtree(sftp, remote_dir):
     """Pure-SFTP recursive remove. Analogue to shutil.rmtree.
 
-    Why pure SFTP and not exec_command('rm -rf'): the production AM
-    SFTP host runs `internal-sftp` (no shell). See _ssh_exec docstring.
-    sftp.remove (SSH_FXP_REMOVE) and sftp.rmdir (SSH_FXP_RMDIR) are
-    part of the SFTP protocol itself and work against internal-sftp.
+    Walks the tree once, removes all files, then all directories
+    deepest-first, then `remote_dir` itself. Symlinks and other
+    non-directory entries are removed, never traversed.
 
-    Algorithm:
-      1. Walk the tree once, recording every file + directory path
-         under `remote_dir` (uses the existing _sftp_walk helper).
-      2. Remove all files first (rmdir refuses non-empty dirs).
-      3. Remove all directories deepest-first (sorted by path depth)
-         so children are gone before their parents.
-      4. Finally remove `remote_dir` itself.
-
-    Every individual remove is best-effort — an IOError on one entry
-    (permission / vanished / etc.) is logged at INFO and the walk
-    continues. The caller's contract is "leave the tree maximally
-    cleaned"; a single stuck file doesn't block the rest. The final
-    sftp.rmdir of `remote_dir` is also best-effort — if a leftover
-    entry remains, the parent stays and ops gets a chance to inspect.
-
-    Non-recursive entry types (symlinks, devices, FIFOs) get the
-    `on_other` branch from _sftp_walk and are treated as files: we
-    try sftp.remove on them. Pure SFTP doesn't traverse symlink
-    targets, which is safer than `rm -rf`'s default follow-symlinks
-    behavior on broken trees.
-
-    No return value — best-effort throughout. Caller can sftp.stat
-    after to confirm the tree is gone if they care.
+    Best-effort throughout and no return value: a failed remove is
+    logged at INFO and the walk continues, so one stuck entry leaves
+    the rest of the tree cleaned. Caller can sftp.stat afterwards to
+    confirm the tree is gone.
     """
     # 1. Walk + collect.
     files = []
@@ -465,12 +388,9 @@ def _sftp_dir_size(sftp, remote_dir):
 
 
 def _sftp_walk_with_attrs(sftp, remote_dir, on_file=None, on_dir=None):
-    """Variant of _sftp_walk that passes the SFTPAttributes object to
-    the callbacks alongside the full path. Used by _sftp_dir_size so
-    we can sum sizes without an extra round trip per file.
+    """Variant of _sftp_walk whose callbacks take (path, SFTPAttributes).
 
-    Kept separate from _sftp_walk so the original signature (callback
-    takes only the path) stays stable for existing callers.
+    Separate from _sftp_walk, whose callbacks take the path only.
     """
     for entry in sftp.listdir_attr(remote_dir):
         full_path = posixpath.join(remote_dir, entry.filename)
@@ -485,12 +405,10 @@ def _sftp_walk_with_attrs(sftp, remote_dir, on_file=None, on_dir=None):
         # counted in `du`-equivalent size either.
 
 
-# --- per-uuid lockfile (added 2026-05-23 for cancel-flow safety) -----------
+# --- per-uuid lockfile -------------------------------------------------------
 
-# Module-level threading lock guarding access to the disk-side lockfile
-# create/remove below. The lockfile itself is the durable cross-process
-# guard; this threading.Lock is just defensive against an in-process race
-# between the stat() and the open() inside _lock_uuid.
+# The on-disk lockfile is the cross-process guard; this threading.Lock only
+# closes the in-process race between the stat() and open() in _lock_uuid.
 _lock_table_lock = threading.Lock()
 
 
@@ -586,15 +504,9 @@ def _is_locked(uuid):
 def _list_packages(folder):
     """Non-hidden package DIRECTORIES inside 001-ready/<folder>.
 
-    2026-07-24 (feature-batch-packaging-qa, finding F3): the legacy
-    listers used bare os.listdir, so a stray file dropped directly in
-    the batch folder was treated as a package name — os.listdir(<file>)
-    then raised NotADirectoryError and the route returned a raw 500
-    (and check_package_names_threads would even RENAME the stray file).
-    Every ready-stage QA function now lists through this helper, which
-    keeps only real directories; loose files are reported separately
-    by _list_loose_files so staff get an actionable message instead of
-    a server error.
+    Every ready-stage QA function lists through this helper so that a
+    loose file in the batch folder is never mistaken for a package.
+    Loose files are reported separately by _list_loose_files.
     """
     base = ready_path + folder
     return [
@@ -719,9 +631,8 @@ def check_package_names(folder):
      if f.startswith('.') and os.path.isfile(ready_path + folder + '/' + f)]
     errors = []
 
-    # Loose files are structure mistakes, not packages — report them
-    # instead of renaming them (the thread helper used to lowercase a
-    # stray extensionless file as if it were a package folder).
+    # Loose files are structure mistakes, not packages — report them,
+    # never rename them.
     for loose in _list_loose_files(folder):
         errors.append(loose + ' is a file, not a package folder. Move it into a package folder.')
 
@@ -768,9 +679,8 @@ def check_file_names(folder):
     threads = []
     files_arr = []
     errors = []
-    # Defined before the loop: with zero packages (e.g. a folder holding
-    # only loose files) the loop never runs and the count must be 0, not
-    # an unbound name.
+    # Defined before the loop: with zero packages the loop never runs and
+    # the count must be 0, not an unbound name.
     local_file_count = 0
 
     try:
@@ -780,8 +690,7 @@ def check_file_names(folder):
         logger.info(e)
         logger.info('Unable to delete errors_file')
 
-    # Report loose files up front. Before the _list_packages fix (F3)
-    # these crashed the whole check with NotADirectoryError → HTTP 500.
+    # Report loose files up front.
     loose_files = _list_loose_files(folder)
     for loose in loose_files:
         errors.append(loose + ' is a file, not a package folder. Move it into a package folder.')
@@ -810,8 +719,8 @@ def check_file_names(folder):
         thread.join()
 
     try:
-        # Append (not replace) so structural errors collected above are
-        # not lost when the image-check error file exists.
+        # Append, never replace — the structural errors collected above
+        # must survive.
         with open(errors_file) as file_errors:
             errors.extend(file_errors.readlines())
     except Exception as e:
@@ -998,9 +907,8 @@ def move_to_ingest(uuid, folder, package):
     '''
     Moves folder from ready to ingest folder and renames it using pid.
 
-    Protected by the per-uuid lock (added 2026-05-23) — if another op
-    (e.g. an in-flight move_from_ingest_to_ready cancel rollback)
-    holds the lock, returns `move_in_progress` without touching disk.
+    Protected by the per-uuid lock: if another op holds it, returns
+    `move_in_progress` without touching disk.
 
     @param: uuid
     @param: folder
@@ -1017,9 +925,8 @@ def move_to_ingest(uuid, folder, package):
 
     try:
         # create collection uuid folder in 002-ingest folder
-        # (the lock helper already created the dir if needed, but the
-        # legacy behavior is to create with mode=0o777 explicitly —
-        # preserve it.)
+        # (the lock helper may already have created it; the explicit
+        # mode=0o777 create is part of the contract)
         try:
             if not os.path.exists(ingest_path + uuid):
                 os.mkdir(ingest_path + uuid, mode)
@@ -1073,12 +980,9 @@ def move_from_ingest_to_ready(uuid, folder, package, actor=None):
         view) for re-submit.
 
     Audit:
-      * `actor` (optional) is logged at INFO. Pass the authenticated
-        staff identifier so this entry can be correlated with the
-        ingest service's tbl_ingest_events audit trail. The query
-        param is consumed by the route handler and threaded through
-        here; never trust it for authz (the X-API-Key header is
-        the gate).
+      * `actor` (optional) is logged at INFO for correlation with the
+        ingest service's tbl_ingest_events trail. It is a client-supplied
+        label — never an authz input (the X-API-Key header is the gate).
 
     @param: uuid
     @param: folder
@@ -1138,12 +1042,9 @@ def move_from_ingest_to_ready(uuid, folder, package, actor=None):
             return dict(result='source_not_found', errors=errors, sftp_clean=sftp_clean)
 
         # ---- Best-effort SFTP cleanup ----
-        # Clean up the Archivematica SFTP staging copy first. If the worker
-        # had progressed past Stage 2's move_to_sftp, a partial (or
-        # complete) copy exists on the AM side; if we don't clean it up
-        # here, staff have to delete it manually. The cleanup is
-        # best-effort — failure is logged + recorded in the result but
-        # never blocks the local move.
+        # Remove the Archivematica SFTP staging copy (partial or complete)
+        # BEFORE the local move. Best-effort: failure is logged and recorded
+        # in sftp_clean but never blocks the local move.
         try:
             sftp_clean['attempted'] = True
             clean_up_sftp(uuid, package)
@@ -1221,9 +1122,7 @@ def move_from_ingest_to_ready(uuid, folder, package, actor=None):
 
 # Sentinel dropped into the local 002-ingest/<uuid> staging dir by the
 # background upload worker when the SFTP put fails. check_sftp surfaces it
-# as message='upload_failed' so the Node poller can halt the row at once
-# instead of waiting out the upload timeout. A dotfile in this dir, like
-# the existing .lock — it travels with the directory and AM ignores it.
+# as message='upload_failed' so the Node poller can halt the row at once.
 UPLOAD_ERROR_MARKER = '.upload_error'
 
 
@@ -1236,19 +1135,18 @@ UPLOAD_CANCEL_MARKER = '.upload_cancel'
 
 
 def _upload_cancel_marker_path(pid):
-    """Path of the cancel-request sentinel. Flag FILE (not memory) on
-    purpose: the put runs in a daemon thread of whichever gunicorn
-    worker took the original request, and the cancel request can land
-    on any other worker — the filesystem is the cross-process signal."""
+    """Path of the cancel-request sentinel. A FILE, not memory: the put
+    thread and the cancel request can land on different gunicorn
+    workers, so the filesystem is the cross-process signal."""
     return os.path.join(ingest_path + pid, UPLOAD_CANCEL_MARKER)
 
 
 def request_upload_cancel(pid):
-    """Ask an in-flight put for `pid` to stop (2026-07-30: 'Halt entire
-    batch' cancelled the queue rows but the background puts kept going).
+    """Ask an in-flight put for `pid` to stop.
+
     Best-effort and idempotent: writes the sentinel; the put checks it
-    per file and every ~8 MB within a file. No-op result if there's no
-    staging dir (nothing is uploading from it)."""
+    per file and every ~8 MB within a file. Returns message='no_staging_dir'
+    when there is no staging dir (nothing can be uploading from it)."""
     staging = ingest_path + pid
     if not os.path.isdir(staging):
         return dict(message='no_staging_dir')
@@ -1266,14 +1164,10 @@ def _put_lock_path(pid):
     return os.path.join(SFTP_LOCK_DIR, 'put-%s.lock' % pid)
 
 
-# Per-package single-flight registry (2026-07-30): a Node worker
-# restart mid-batch re-dispatches rows and re-calls move_to_sftp while
-# the PREVIOUS daemon thread for the same package may still be
-# uploading — duplicate concurrent puts of the same tree, extra SSH
-# sessions, and a burst the Node side can't even see. This process's
-# in-flight puts are tracked here; a second start for the same pid is
-# a no-op ('upload_already_running'). Per-process is the right scope:
-# whichever gunicorn worker took the original request owns the thread.
+# Per-package single-flight registry for THIS process: a second
+# move_to_sftp for a pid already uploading here is a no-op
+# ('upload_already_running'). Host-wide single-flight is the put lock
+# in _do_sftp_put.
 _sftp_puts_in_flight = set()
 _sftp_puts_lock = threading.Lock()
 
@@ -1281,22 +1175,17 @@ _sftp_puts_lock = threading.Lock()
 def _do_sftp_put(pid):
     """Background worker: the actual recursive SFTP put.
 
-    Runs in the daemon thread started by move_to_sftp so the HTTP request
-    returns immediately and the Node side can poll check_sftp for live byte
-    progress while the transfer runs. Opens its own SFTP connection (the
-    request's connection is long gone by the time this executes). On failure
-    it writes the .upload_error marker into the local staging dir; check_sftp
-    reports that to the poller, which halts the row.
+    Runs in the daemon thread started by move_to_sftp, and opens its own
+    SFTP connection. On failure it writes the .upload_error marker into
+    the local staging dir; check_sftp reports that to the poller, which
+    halts the row.
     """
     marker = _upload_error_marker_path(pid)
 
-    # CROSS-PROCESS single-flight (2026-07-30): the in-memory registry
-    # in move_to_sftp only covers THIS worker process; a re-dispatch
-    # landing on a different gunicorn worker started a second put of
-    # the same tree — paramiko's post-put verify then caught the other
-    # put's truncation as "size mismatch in put! 0 != N". The flock is
-    # the host-wide guard: if another process holds the put lock for
-    # this pid, bow out and let that put finish.
+    # HOST-wide single-flight: if another process already holds the put
+    # lock for this pid, bow out and let that put finish. Concurrent puts
+    # of one tree corrupt each other (paramiko's post-put verify reports
+    # "size mismatch in put!").
     os.makedirs(SFTP_LOCK_DIR, exist_ok=True)
     put_lock_fd = os.open(_put_lock_path(pid), os.O_CREAT | os.O_RDWR, 0o644)
     try:
@@ -1359,25 +1248,14 @@ def _do_sftp_put(pid):
 def move_to_sftp(pid):
     """Kick off the recursive SFTP put in a BACKGROUND thread; return at once.
 
-    The put is long-running (minutes to ~30 min for big batches). The legacy
-    implementation did it synchronously, so the Node upload stage — which
-    awaits move_to_sftp and only THEN polls check_sftp for byte progress —
-    never saw the upload in flight: the whole transfer happened inside this
-    call, the poll ran after it had already finished, and the dashboard sat
-    on "UPLOADING" with no progress bar the entire time. Backgrounding the
-    put lets the poller observe the remote dir growing
-    (remote_package_size_bytes) against the local total
-    (local_package_size_bytes) and render a live %.
+    Fire-and-don't-wait: the caller gets a response immediately and the
+    put runs for minutes to ~30 min. Progress and completion are observed
+    only through check_sftp — remote file count reaching the local count,
+    or remote_package_size_bytes against local_package_size_bytes for a
+    byte-accurate %. Failure surfaces through the .upload_error marker.
 
-    Mirrors move_to_ingest's fire-and-don't-wait contract. Completion is
-    observed by the poller via check_sftp (remote file count reaching the
-    local count); failure via the .upload_error marker check_sftp surfaces.
-
-    Single-flight per package: if this process already has a put
-    running for `pid`, DON'T start another — a Node-side restart
-    re-dispatches rows and used to double up concurrent puts of the
-    same tree (2026-07-30). The poller can't tell the difference and
-    doesn't need to: the running put keeps making progress either way.
+    Single-flight per package: if this process already has a put running
+    for `pid`, no second put is started.
 
     @param: pid
     @returns: Dictionary (message='upload_started'|'upload_already_running')
@@ -1431,30 +1309,19 @@ def check_sftp(uuid, local_file_count):
         try:
             _sftp_walk(sftp, remote_package, on_file=store_files_name, on_dir=store_dir_name, on_other=store_other_file_types)
         except IOError:
-            # The remote package dir doesn't exist yet — the background put
-            # (move_to_sftp) is just starting and hasn't created it. Report
-            # 0 files arrived (in_progress) so the poller keeps waiting
-            # instead of seeing a 500. _sftp_dir_size below already tolerates
-            # the missing dir (returns 0).
+            # The remote package dir doesn't exist yet (the background put
+            # hasn't created it). Report 0 files arrived — in_progress — so
+            # the poller keeps waiting instead of seeing a 500.
             del file_names[:]
         remote_file_count = len(file_names)
 
-        # Sum file sizes via pure SFTP. The legacy `du -h -s` call
-        # was broken on the production AM SFTP host (internal-sftp
-        # rejects exec_command — see _ssh_exec docstring), so the
-        # `remote_package_size` field was silently empty. The Node
-        # side doesn't surface this to staff today, but the
-        # accurate byte sum is useful for logs + future use.
+        # Byte sums for the upload %: the Node side divides remote by local.
         remote_package_size_bytes = _sftp_dir_size(sftp, remote_package)
         remote_package_size = _human_size(remote_package_size_bytes)
 
-        # Local total for the same uuid staging dir (002-ingest/<uuid> —
-        # the source move_to_sftp pushes to sftp_path/<uuid>). The Node
-        # side divides remote_package_size_bytes by this to render a byte-
-        # accurate upload %, which advances smoothly even for a single
-        # large file (the remote file grows during the put). 0 when the
-        # local dir is gone/unreadable — the caller treats that as
-        # "unknown total" and falls back to the file-count readout.
+        # Local total for the same uuid staging dir. 0 when the dir is
+        # gone or unreadable — the caller reads that as "unknown total"
+        # and falls back to the file-count readout.
         local_package_size_bytes = _local_dir_size(ingest_path + uuid)
 
         if int(local_file_count) == remote_file_count:
@@ -1473,10 +1340,8 @@ def check_sftp(uuid, local_file_count):
 def _local_dir_size(path):
     """Sum of regular-file sizes under a local directory, in bytes.
 
-    Used by check_sftp to report the upload *total* for the byte-accurate
-    progress %. Symlinks are skipped (match get_total_batch_size). Returns
-    0 if the path is missing or unreadable — the Node side treats a 0
-    total as "unknown" and the dashboard falls back to the file count.
+    Symlinks are skipped. Returns 0 if the path is missing or unreadable;
+    callers treat a 0 total as "unknown".
     """
     total = 0
     try:
@@ -1496,9 +1361,8 @@ def _local_dir_size(path):
 def _human_size(num_bytes):
     """Format a byte count to a `du -h`-style short string.
 
-    Matches the legacy contract: short ASCII (e.g. "12K", "3.4M",
-    "1.2G", "8B"). Single decimal place for >= 1 KiB to match GNU
-    du's default. Returns "0" for 0 (du's output for empty).
+    Short ASCII, e.g. "8B", "12K", "3.4M", "1.2G"; one decimal place at
+    >= 1 KiB; "0" for zero.
     """
     if not num_bytes:
         return '0'
@@ -1518,34 +1382,19 @@ def move_to_ingested(uuid, folder):
     Archives a completed batch's packages to Wasabi S3 and, on VERIFIED
     success, removes the local 002-ingest staging copy.
 
-    2026-07-26 (003-ingested retirement, phase 3 — see
-    repo/INGESTED_RETIREMENT_PLAN.md): the local `003-ingested/` archive
-    copy is NO LONGER WRITTEN. The `cp -R` that produced it was never
-    verified — the 2026-07-26 reconciliation of the 7.2 TB backlog found
-    its one corrupt file was truncated by that very copy path — while the
-    Wasabi upload below IS verified per file (head_object size check in
-    wasabi.upload_directory) and gates the source cleanup. The Wasabi
-    batch archive is the sole batch-snapshot custodian from here on;
-    preservation-grade redundancy lives in the AIP chain (Wasabi
-    aip-store + DuraCloud + AM storage).
+    Uploads only 002-ingest/<uuid>/, to keys `<folder-without-new_>/<rel>`.
+    No local `003-ingested/` copy is written — the Wasabi batch archive is
+    the sole batch-snapshot custodian (preservation redundancy lives in the
+    AIP chain: Wasabi aip-store + DuraCloud + AM storage).
 
-    This also retires the old two-branch layout (per-file cp when the
-    ingested folder existed / whole-folder rename when it didn't). Both
-    branches produced the same S3 keys — `<folder-without-new_>/<rel>` —
-    which is what this single path uploads. The rename variant also
-    uploaded ALL of 002-ingest with an empty prefix, which would have
-    swept any concurrent ingest's staging dir into the wrong keys; the
-    unified path uploads only 002-ingest/<uuid>/.
-
-    On S3 failure the source is left in place (2026-05-24 data-loss fix
-    invariant: cleanup ONLY on verified success) and the caller — repov2
-    Stage 5 — records a FAILED archive_to_wasabi job so staff see it in
-    Job History. The remedy is re-running the archive after the cause is
-    fixed; nothing is lost.
+    INVARIANT: the staging copy is removed ONLY after a per-file verified
+    upload (head_object size check in wasabi.upload_directory). On any S3
+    failure the source is left in place and the caller records a FAILED
+    archive_to_wasabi job; re-running the archive is the remedy.
 
     @param: uuid    directory name in 002-ingest (the collection pid)
     @param: folder  batch folder name (used, minus `new_`, as the S3 prefix)
-    @returns: Dictionary {result, errors} — same contract as before:
+    @returns: Dictionary {result, errors}:
         result 'packages_moved_to_ingested_folder' on success,
                'packages_not_moved_to_ingested_folder' otherwise.
     """
@@ -1559,11 +1408,9 @@ def move_to_ingested(uuid, folder):
         errors.append('ERROR: Source not found in 002-ingest (move_to_ingested)')
         return dict(result=result, errors=errors)
 
-    # Legacy side effect preserved: re-open the 001-ready batch folder's
-    # permissions so staff can keep adding packages to an in-progress
-    # collection. Best-effort — the folder may already be gone when the
-    # last package of a batch completes (chown failure is logged by _run
-    # and ignored, matching the previous behavior).
+    # Re-open the 001-ready batch folder's permissions so staff can keep
+    # adding packages to an in-progress collection. Best-effort: the folder
+    # may already be gone, and a chown failure is logged and ignored.
     reset_permissions(folder)
 
     try:
@@ -1571,8 +1418,7 @@ def move_to_ingested(uuid, folder):
         if move_result != 0:
             errors.append('ERROR: Unable to move packages to wasabi s3')
         else:
-            # Verified upload (per-file head_object check inside
-            # wasabi.upload_directory) — only now is the staging copy
+            # Upload verified per file — only now is the staging copy
             # safe to remove.
             shutil.rmtree(source)
             result = 'packages_moved_to_ingested_folder'
@@ -1603,35 +1449,23 @@ def reset_permissions(folder):
 
 def move_to_s3(source, folder):
     """
-    Upload a local directory tree to the configured Wasabi S3 bucket.
+    Upload a local directory tree to the configured Wasabi S3 bucket
+    (lib/wasabi.py, using WASABI_PROFILE / WASABI_ENDPOINT / WASABI_BUCKET).
 
-    Replaces the prior `os.system('aws s3 cp ...')` shellout. The new
-    implementation lives in `lib/wasabi.py` and uses boto3 directly
-    against the same WASABI_PROFILE / WASABI_ENDPOINT / WASABI_BUCKET
-    env vars — auth is unchanged from the CLI version.
-
-    Two improvements over the shellout:
-      - Every upload logs start, per-file size + key, per-file 25/50/
-        75/100% milestones for large files, and an END summary with
-        elapsed_ms and byte total. Staff can audit any upload via
-        `journalctl -u curation-service | grep wasabi`.
-      - The return code is a clean 0/1: 0 on full success, 1 on any
-        per-file failure or transport error. Fixes the prior data-loss
-        bug where os.system's encoded shell status was misinterpreted
-        and the caller deleted the local source even on a failed upload.
+    Each upload logs start, per-file size + key, 25/50/75/100% milestones
+    for large files, and an END summary with elapsed_ms and byte total:
+    `journalctl -u curation-service | grep wasabi`.
 
     @param  source — local directory to upload (recursive walk).
     @param  folder — S3 key prefix segment for this batch.
-    @returns int   — 0 success, 1 failure. Maintains the legacy 0/1
-                     contract the caller (`move_to_ingested`) expects.
+    @returns int   — 0 on full success, 1 on any per-file failure or
+                     transport error. Callers gate cleanup on this.
     """
     try:
         result = wasabi.upload_directory(source, folder)
     except RuntimeError as e:
-        # Config-level error (missing WASABI_PROFILE etc). Surface
-        # cleanly without crashing the route handler — the caller's
-        # `if move_result != 0` branch records it in the errors[]
-        # response.
+        # Config-level error (missing WASABI_PROFILE etc) — return 1 rather
+        # than raising, so the route handler reports it in errors[].
         logger.error('move_to_s3: configuration error: %s', e)
         return 1
     if result['ok']:
@@ -1659,13 +1493,7 @@ def clean_up_sftp(pid, archival_package):
                                                          e.g. concurrent
                                                          batch ingest)
 
-    2026-05-23 patch: previously only the FILES inside the package
-    directory were deleted (legacy `cd <target> && rm <pkg>/*`),
-    leaving empty `<pid>/<package>/` and `<pid>/` directories behind.
-    Staff saw orphaned "0" / "q-N" folders on the AM SFTP host after
-    every cancel + return-to-packaging cycle. The new chained command
-    removes the package tree entirely and best-effort prunes the
-    `<pid>` parent.
+    Idempotent: a package path that is already gone is a no-op.
 
     :param pid              curation-API per-ingest identifier (the
                             qa_uuid the worker passes to move_to_sftp
@@ -1681,9 +1509,7 @@ def clean_up_sftp(pid, archival_package):
         target = sftp_path + '/' + pid
         pkg_path = target + '/' + archival_package
 
-        # Idempotency: if the package path doesn't exist on the
-        # server (already cleaned up, or never uploaded), nothing
-        # to do. sftp.stat raises IOError when the path is missing.
+        # Already cleaned up, or never uploaded — nothing to do.
         try:
             sftp.stat(pkg_path)
         except IOError:
@@ -1694,17 +1520,12 @@ def clean_up_sftp(pid, archival_package):
             return
 
         # Recursive remove of the package tree (files + subdirs +
-        # the package dir itself). Pure SFTP — see _sftp_rmtree
-        # for why we don't use shell exec.
+        # the package dir itself).
         _sftp_rmtree(sftp, pkg_path)
 
-        # Best-effort prune of the empty <pid> parent. sftp.rmdir
-        # raises IOError if the directory still has sibling packages
-        # (e.g. a concurrent batch ingest under the same collection
-        # uuid). That's the right behavior — leave the parent for
-        # the active siblings to use. The legacy shell version
-        # achieved this with `rmdir; 2>/dev/null`; same semantics,
-        # just plumbed through the SFTP error code.
+        # Best-effort prune of the empty <pid> parent. sftp.rmdir raises
+        # IOError while sibling packages remain — leave the parent for
+        # them.
         try:
             sftp.rmdir(target)
             logger.info(

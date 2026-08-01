@@ -15,11 +15,9 @@
 """
 AIP-store routes — v2 ingest Stage 6 entry points.
 
-The repo-backend-v2 ingester calls these two endpoints to copy AM-
-produced AIP packages from Archivematica Storage Service to Wasabi S3
-(replacing the one-time DuraCloud → Wasabi migration that produced
-tbl_aip_store's ~20k legacy rows). The Node side stays language-
-agnostic; all Wasabi credential handling + boto3 work stays here.
+The repo-backend-v2 ingester calls these endpoints to copy AM-produced
+AIP packages from Archivematica Storage Service to Wasabi S3. All
+Wasabi credential handling and boto3 work stays on this side.
 
 Endpoints:
 
@@ -32,7 +30,7 @@ Endpoints:
         boto3 upload_fileobj. Idempotent: a second call for an
         aip_uuid whose key already exists in Wasabi at the expected
         size is a no-op that still returns ok=true with the existing
-        metadata. This makes Stage 6 retries safe.
+        metadata, which is what makes caller retries safe.
 
     POST /api/v2/aip/presigned-url
         Body: {"key": "<wasabi-object-key>", "ttl_seconds": 900}
@@ -49,10 +47,11 @@ Endpoints:
 
         One page (up to 1000) of the AIP-store bucket's full flat
         inventory — key + size only. Consumed by repo-backend-v2's
-        scripts/backfill_aip_sizes.js to fill tbl_aip_store.bytes for
-        legacy rows without a per-object round-trip.
+        scripts/backfill_aip_sizes.js.
 
 Auth: shared X-API-Key (same scheme as /api/v2/qa/).
+
+Design history and rationale: repo/notes/CURATION_API_CODE_NOTES.md
 """
 
 import logging
@@ -79,10 +78,8 @@ def copy_to_wasabi():
     Copy a single AM-produced AIP from Archivematica Storage Service
     into Wasabi. See module docstring for the wire contract.
 
-    Errors return 200 with ok=false rather than non-2xx so the Node
-    side can distinguish "your call was bad" (400) from "we tried and
-    it didn't work" (200 + ok=false). This matches the response
-    shape the existing health/wasabi endpoint already uses.
+    CONTRACT: a bad request is 400; a failed attempt is 200 with
+    ok=false, never a 5xx.
     """
     body = request.get_json(silent=True) or {}
     aip_uuid = (body.get('aip_uuid') or '').strip()
@@ -96,12 +93,9 @@ def copy_to_wasabi():
     try:
         result = aip_ops.copy_aip_to_wasabi(aip_uuid=aip_uuid, repo_uuid=repo_uuid)
     except Exception as e:
-        # aip_ops.copy_aip_to_wasabi catches all expected failure
-        # modes and returns a result dict; if something unexpected
-        # blows up we still want to return 200 + ok=false so the
-        # Node side records the row as failed (rather than 500-ing
-        # and pushing the ingester into a transport-error retry
-        # loop).
+        # Unexpected failures still return 200 + ok=false, so the caller
+        # records the row as failed instead of entering a transport-error
+        # retry loop.
         elapsed_ms = int((time.monotonic() - started) * 1000)
         logger.exception(
             'copy_to_wasabi: unhandled exception aip_uuid=%s repo_uuid=%s',
@@ -128,15 +122,13 @@ def copy_progress(aip_uuid):
     Returns 200 {ok, aip_uuid, bytes_sent, total_bytes, updated_at}
     while a copy is streaming (the uploading worker maintains a
     per-AIP progress file — see lib/aip_ops.write_copy_progress), and
-    404 {ok: false} when there is no active copy: not started yet,
-    already finished (the file is cleared on every exit), or an older
-    service build. Callers poll this NEXT TO the long synchronous
-    copy call, so it stays a cheap local file read — no AM or Wasabi
-    round-trips.
+    404 {ok: false} when there is no active copy — not started, or
+    already finished (the file is cleared on every exit).
 
-    404 (not the 200+ok=false convention of the copy routes) because
-    "nothing to report" isn't a failure — the Node side treats any
-    non-200 as "no data" and just keeps its heartbeat.
+    Cheap local file read only: no AM or Wasabi round-trips, since
+    callers poll this alongside the long synchronous copy call. The 404
+    departs from the copy routes' 200+ok=false convention; callers treat
+    any non-200 as "no data".
     """
     aip_uuid = (aip_uuid or '').strip()
     if not aip_ops._PROGRESS_UUID_RE.match(aip_uuid):

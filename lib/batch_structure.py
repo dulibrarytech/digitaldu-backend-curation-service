@@ -13,7 +13,7 @@
 # limitations under the License.
 
 """
-Batch structure QA scan (feature-batch-packaging-qa).
+Batch structure QA scan.
 
 Staff assemble ingest batches by hand:
 
@@ -24,20 +24,16 @@ Staff assemble ingest batches by hand:
             <package_b>/
                 file1.pdf
 
-Common mistakes (files dropped directly into the collection folder, empty
-package folders, extra nesting) previously either made a batch invisible in
-the Make Digital Objects view or silently dropped content from the ingest.
-See repo/BATCH_PACKAGING_QA_FINDINGS.md for the full review.
-
-This module is the single source of truth for structure classification:
+This module is the single source of truth for structure classification —
+files dropped directly into the collection folder, empty package folders,
+extra nesting:
 
   * scan_batch(batch_path)      — one pass over a batch, returns package
                                   names, processed (uri.txt) names, and a
                                   list of structure-error flags.
-  * get_workspace_batches(root) — replacement for the flat name list the
-                                  /workspace endpoint used to return.
-                                  Crucially, malformed batches are INCLUDED
-                                  (flagged) instead of silently skipped.
+  * get_workspace_batches(root) — the batch list behind the /workspace
+                                  endpoint. Malformed batches are INCLUDED
+                                  and flagged, never skipped.
 
 Design constraints (large batches: ~100 packages x hundreds of files each):
 
@@ -64,6 +60,8 @@ Flag codes (severity in parentheses):
 
 The server reports codes + raw items only. Staff-facing wording lives in
 the dashboard views (repo-backend-v2), which own tone and language.
+
+Design history and rationale: repo/notes/CURATION_API_CODE_NOTES.md
 """
 
 import logging
@@ -267,27 +265,22 @@ def get_workspace_batches(root_dir):
     """
     Lists batches for the Make Digital Objects view, with structure flags.
 
-    Replaces get_workspace_ready_folders' flat name list. Inclusion rules:
+    Inclusion rules:
 
       * all packages missing uri.txt      -> included (the normal case)
-      * loose files (with or without      -> INCLUDED with error flags.
-        packages)                            (The old scan silently skipped
-        these, so a batch of loose files never appeared anywhere —
-        finding F1.)
-      * COMPLETELY EMPTY folder           -> hidden (2026-07-27). Staff
-        create the collection folder first and fill it afterwards;
-        flagging it "no packages" during that window is noise. It
-        appears — and gets its structure QA — as soon as it contains
-        anything (a package folder or a loose file). Unreadable
-        folders stay visible: a permission problem is not "empty".
+      * loose files (with or without      -> INCLUDED with error flags
+        packages)
+      * COMPLETELY EMPTY folder           -> hidden. Staff create the
+        collection folder first and fill it afterwards, so an empty one
+        is not yet a mistake; it appears, with its structure QA, as soon
+        as it holds a package folder or a loose file. Unreadable folders
+        stay VISIBLE — a permission problem is not "empty".
       * partially processed               -> included with an info flag
-        (previously vanished from this view with no explanation — F6).
-      * fully processed                   -> excluded, as before; those
-        batches belong to the ASpace QA / Packaging views, which surface
-        the same flags via the /workspace/packages response.
+      * fully processed                   -> excluded; those batches
+        belong to the ASpace QA / Packaging views, which surface the
+        same flags via the /workspace/packages response.
 
-    Skips hidden folders and folders named 'ready' (case-insensitive),
-    matching the legacy scan.
+    Skips hidden folders and folders named 'ready' (case-insensitive).
 
     @param root_dir: WORKSPACE directory path
     @return: List of scan_batch dictionaries, sorted by batch name

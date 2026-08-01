@@ -662,13 +662,10 @@ def process_batch(base_path: Path, no_kaltura_id: bool, no_caption: bool,
     Processes every subdirectory of base_path, continuing past
     per-package failures.
 
-    2026-07-27: failures are now COLLECTED and returned instead of only
-    logged. Historically the batch loop swallowed every per-package
-    exception (duplicate component IDs, uncataloged items, ...) and the
-    script still exited 0 — the web route then reported success and
-    staff only discovered the un-generated uri.txt at Description QA.
-    main() now exits non-zero when this returns any failures, which the
-    curation route and the dashboard already treat as a failed run.
+    Per-package failures (duplicate component IDs, uncataloged items,
+    ...) are COLLECTED and returned, not just logged: main() exits
+    non-zero when any are returned, which the curation route and the
+    dashboard treat as a failed run.
 
     @return: (failures, total) where failures is [(subdir_name, error
              message), ...] and total is the number of subdirectories

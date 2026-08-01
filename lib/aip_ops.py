@@ -38,18 +38,12 @@ Idempotency:
   and the second call short-circuits.
 
 Naming:
-  The Wasabi key follows the legacy convention so the dashboard's
-  JOIN with tbl_aip_store rows from the original migration stays
-  symmetric:
+  The Wasabi key is <basename-of-am-current-path> with NO directory
+  prefix — the shape tbl_aip_store.aip holds, which the dashboard's
+  JOIN depends on. The bucket-level prefix, if any, is applied by
+  lib.wasabi from the bucket env value.
 
-      <basename-of-am-current-path>
-
-  where the basename is e.g.
-  "17246c64-6344-44a9-a903-057524b3ec2e_M123.03.0038.0007.00001-43968b10-18e3-4976-b8ff-3fe9dfaadaf2.7z"
-
-  No directory prefix in the key — same shape as the legacy
-  tbl_aip_store.aip column. The bucket-level prefix (if any) is
-  applied by lib.wasabi from WASABI_BUCKET.
+Design history and rationale: repo/notes/CURATION_API_CODE_NOTES.md
 """
 
 import json
@@ -67,8 +61,7 @@ from lib import wasabi
 
 logger = logging.getLogger(__name__)
 
-# AM Storage Service uses ApiKey header auth (legacy username:key).
-# Mirror the format the existing archivematica_ops.py uses.
+# AM Storage Service uses ApiKey header auth: `ApiKey <username>:<key>`.
 def _am_storage_auth_header():
     return {
         'Authorization': (
@@ -80,14 +73,9 @@ def _am_storage_auth_header():
 
 def _am_storage_base():
     """Normalize ARCHIVEMATICA_STORAGE_API to a host base WITHOUT the
-    /api suffix. The two repos grew different env conventions —
-    repo-backend-v2 stores `https://host:8000/api/` (and appends
-    `v2/...`), while this module appends the full `/api/v2/...` path.
-    An operator mirroring the repov2 value here (the natural move, and
-    exactly what the deploy doc suggested) produced
-    `.../api/api/v2/file/<uuid>/` — which AM answers with a clean 404
-    for EVERY AIP (2026-07-30 staging incident, masqueraded as
-    "AIP not found in AM Storage Service"). Accept both shapes."""
+    /api suffix, so both env shapes work: `https://host:8000` and
+    repo-backend-v2's `https://host:8000/api/`. A doubled `/api/api/`
+    path makes AM answer 404 for every AIP."""
     base = (config.ARCHIVEMATICA_STORAGE_API or '').rstrip('/')
     if base.endswith('/api'):
         base = base[:-len('/api')]
@@ -122,12 +110,10 @@ def _resolve_wasabi_key(am_metadata):
 # --- copy-progress file ----------------------------------------------------
 #
 # Live byte progress for the /copy-to-wasabi call, persisted to a small
-# per-AIP JSON file so ANOTHER gunicorn worker can serve it from the
-# GET /copy-progress/<aip_uuid> route (workers are separate processes;
-# in-memory state is invisible across them). The uploading worker
-# writes it via a throttled _FileProgress hook; the file is deleted
-# when the copy settles, so "no file" cleanly means "no active copy".
-# All writes are best-effort — progress must never fail a copy.
+# per-AIP JSON file so any gunicorn worker can serve GET
+# /copy-progress/<aip_uuid>. The file is deleted when the copy settles,
+# so "no file" means "no active copy". All writes are best-effort —
+# progress must never fail a copy.
 
 # Strict UUID shape (AM package UUIDs). Doubles as path-traversal
 # protection: the uuid becomes a filename component.
@@ -221,10 +207,8 @@ def copy_aip_to_wasabi(aip_uuid, repo_uuid):
         }
     """
     started = time.monotonic()
-    # Entry marker — before this existed, an attempt that failed (or
-    # hung) ahead of the upload phase left ZERO curation-side log
-    # lines, which made the 2026-07-31 stalled-copy incident invisible
-    # from this service's logs.
+    # Entry marker: every attempt must leave a curation-side log line,
+    # including one that fails or hangs before the upload phase.
     logger.info(
         'copy_aip_to_wasabi START aip_uuid=%s repo_uuid=%s',
         aip_uuid, repo_uuid,
@@ -239,12 +223,8 @@ def copy_aip_to_wasabi(aip_uuid, repo_uuid):
         'repo_uuid': repo_uuid,
     }
 
-    # Refuse if the AIP-store bucket isn't configured. Falling back
-    # to WASABI_BUCKET here would silently route AIPs into the SFTP-
-    # staging archive (the curation host has BOTH buckets in play and
-    # they target different storage tiers). Better to fail loudly so
-    # the operator sets WASABI_AIP_BUCKET than to spend a multi-GB
-    # upload writing to the wrong place.
+    # Refuse if the AIP-store bucket isn't configured — never fall back
+    # to WASABI_BUCKET, which is a different storage tier.
     if not config.WASABI_AIP_BUCKET:
         out['elapsed_ms'] = int((time.monotonic() - started) * 1000)
         out['error'] = (
@@ -258,13 +238,8 @@ def copy_aip_to_wasabi(aip_uuid, repo_uuid):
         )
         return out
 
-    # Refuse if AM Storage Service env values are missing. The same
-    # philosophy: an unhandled AttributeError (or worse, a 401 from
-    # AM on every call) is harder to triage than a clean error
-    # string surfaced in the v2 AIPs dashboard. The three values
-    # are required as a set — if any is missing, AM authentication
-    # would fail. Listing each missing var in the error helps the
-    # operator know exactly what to add to the .env.
+    # The three AM Storage values are required as a set. Refuse up front,
+    # naming each missing var, rather than failing later on a 401.
     missing_am_env = [
         name for name, val in (
             ('ARCHIVEMATICA_STORAGE_API', config.ARCHIVEMATICA_STORAGE_API),
@@ -317,11 +292,9 @@ def copy_aip_to_wasabi(aip_uuid, repo_uuid):
         out['error'] = 'am storage returned non-JSON body'
         return out
 
-    # AM reports `status` for stored packages: UPLOADED, DEL_REQ, etc.
-    # We only want to copy UPLOADED. A stage-6 row that arrives here
-    # while AM is still finalizing (rare; AM was already polled to
-    # INGEST_COMPLETE) is a temporary error — Stage 6 retry will
-    # pick it up on a later tick.
+    # AM reports `status` for stored packages (UPLOADED, DEL_REQ, ...).
+    # Only UPLOADED is copyable; anything else is a temporary error the
+    # caller's retry picks up on a later tick.
     am_status = (meta.get('status') or '').upper()
     if am_status and am_status != 'UPLOADED':
         out['elapsed_ms'] = int((time.monotonic() - started) * 1000)
@@ -341,10 +314,8 @@ def copy_aip_to_wasabi(aip_uuid, repo_uuid):
         return out
 
     # --- Step 2: Idempotency probe --------------------------------------
-    # If the object already exists at the expected size, short-circuit.
-    # This makes Stage 6 retries safe (a crashed mid-upload comes back
-    # here and no-ops). bucket_config pins this to WASABI_AIP_BUCKET so
-    # we're checking the AIP-store bucket, not the SFTP-staging bucket.
+    # An object already present at the expected size short-circuits the
+    # copy, which is what makes caller retries safe.
     try:
         head = wasabi.head_object(key, bucket_config=config.WASABI_AIP_BUCKET)
     except Exception as e:
@@ -374,8 +345,7 @@ def copy_aip_to_wasabi(aip_uuid, repo_uuid):
             )
             return out
         # Size mismatch — the prior upload was partial or corrupted.
-        # Delete and re-upload. Logged loudly so an operator can
-        # cross-reference if this happens often.
+        # Delete and re-upload, logged at WARNING.
         logger.warning(
             'copy_aip_to_wasabi SIZE_MISMATCH key=%s existing=%s expected=%s — '
             'deleting and re-uploading',
@@ -389,20 +359,15 @@ def copy_aip_to_wasabi(aip_uuid, repo_uuid):
             return out
 
     # --- Step 3: Stream-pipe AM → Wasabi --------------------------------
-    # Seed the copy-progress file at 0 bytes before the stream opens so
-    # the dashboard's side-poll shows a (0%) bar immediately, then let
-    # the throttled _FileProgress hook advance it as chunks upload. The
-    # finally-clear runs on EVERY exit — success, upload error, download
-    # error — so a dead copy never leaves a stale "in progress" file
-    # behind for the copy-progress route to serve.
+    # Seed the progress file at 0 bytes before the stream opens so the
+    # dashboard shows a bar immediately; the throttled hook advances it.
+    # The finally-clear runs on EVERY exit, so a dead copy never leaves a
+    # stale "in progress" file for the copy-progress route to serve.
     if expected_bytes:
         write_copy_progress(aip_uuid, 0, expected_bytes)
-    # Bound the download's silence. The read timeout covers time-to-
-    # first-byte AND mid-stream gaps; AM Storage preps large packages
-    # for a long time before the first byte (hours at tens of GB), so
-    # the budget is generous — but finite, so a genuinely dead AM
-    # yields a fast, logged, retryable failure instead of a silent
-    # hang bounded only by the caller's 12h budget (2026-07-31).
+    # Bound the download's silence: the read timeout covers time-to-first-
+    # byte AND mid-stream gaps. Generous but finite — AM is silent while
+    # it prepares a large package, yet a dead AM must still fail.
     read_timeout_s = config.AM_DOWNLOAD_READ_TIMEOUT_SECONDS
     dl_timeout = (30, read_timeout_s if read_timeout_s and read_timeout_s > 0 else None)
     logger.info(
