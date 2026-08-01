@@ -1,4 +1,4 @@
-# digitaldu-backend-curation-service
+# Digital Archives Manager @ DU Curation Service
 
 Flask service that owns the **on-host filesystem + Wasabi S3 + SFTP**
 side of the DigitalDU ingest pipeline. Called from
@@ -211,6 +211,13 @@ Fill in:
   keys are unset).
 - `WORKSPACE`, `ASPACE_USERNAME`, `ASPACE_PASSWORD`, `SCRIPT_PATH`,
   `LOG_PATH` — ArchivesSpace-side config.
+- `DEFAULT_URL` — ArchivesSpace API base URL, read straight from the
+  environment by `lib/make_digital_object.py`. Required: without it that
+  script exits 1 during validation and
+  `/api/v1/astools/make-digital-objects` returns a 500 on every call.
+  Optional companions: `TESTING_URL` (used when a request sets
+  `test=true`; falls back to `DEFAULT_URL`, so test runs otherwise hit
+  production) and `ASPACE_REPOSITORY_ID` (default `2`).
 
 `config.py` validates the required ones (`API_KEY` today) at boot
 and raises `RuntimeError` listing any missing var. Per-endpoint env
