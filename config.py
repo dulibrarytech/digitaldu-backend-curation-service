@@ -94,6 +94,23 @@ ARCHIVEMATICA_STORAGE_API = os.getenv('ARCHIVEMATICA_STORAGE_API')
 ARCHIVEMATICA_STORAGE_USERNAME = os.getenv('ARCHIVEMATICA_STORAGE_USERNAME')
 ARCHIVEMATICA_STORAGE_API_KEY = os.getenv('ARCHIVEMATICA_STORAGE_API_KEY')
 
+# Read timeout (seconds) for the AM Storage Service /download/ stream
+# in aip_ops.copy_aip_to_wasabi. This bounds BOTH the time-to-first-
+# byte and any mid-stream silence. It must be GENEROUS: AM Storage
+# spends a long time preparing a package before the first byte arrives
+# (~68s observed for a 327 MB AIP, 2026-07-31 — hours for a 66 GB one),
+# and during that window the connection is silent by design. Too small
+# kills legitimate large-AIP downloads mid-prep; the pre-2026-07-31
+# open-ended value turned a genuinely dead AM into an invisible hang
+# bounded only by the caller's 12h budget. Default 6h. Set 0 to
+# restore the open-ended behavior.
+try:
+    AM_DOWNLOAD_READ_TIMEOUT_SECONDS = int(
+        os.getenv('AM_DOWNLOAD_READ_TIMEOUT_SECONDS', '21600')
+    )
+except ValueError:
+    AM_DOWNLOAD_READ_TIMEOUT_SECONDS = 21600
+
 # --- ArchivesSpace ---------------------
 WORKSPACE = os.getenv('WORKSPACE')
 ASPACE_USERNAME = os.getenv('ASPACE_USERNAME')

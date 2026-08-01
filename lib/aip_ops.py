@@ -221,6 +221,14 @@ def copy_aip_to_wasabi(aip_uuid, repo_uuid):
         }
     """
     started = time.monotonic()
+    # Entry marker — before this existed, an attempt that failed (or
+    # hung) ahead of the upload phase left ZERO curation-side log
+    # lines, which made the 2026-07-31 stalled-copy incident invisible
+    # from this service's logs.
+    logger.info(
+        'copy_aip_to_wasabi START aip_uuid=%s repo_uuid=%s',
+        aip_uuid, repo_uuid,
+    )
     out = {
         'ok': False,
         'bucket': None,
@@ -389,17 +397,36 @@ def copy_aip_to_wasabi(aip_uuid, repo_uuid):
     # behind for the copy-progress route to serve.
     if expected_bytes:
         write_copy_progress(aip_uuid, 0, expected_bytes)
+    # Bound the download's silence. The read timeout covers time-to-
+    # first-byte AND mid-stream gaps; AM Storage preps large packages
+    # for a long time before the first byte (hours at tens of GB), so
+    # the budget is generous — but finite, so a genuinely dead AM
+    # yields a fast, logged, retryable failure instead of a silent
+    # hang bounded only by the caller's 12h budget (2026-07-31).
+    read_timeout_s = config.AM_DOWNLOAD_READ_TIMEOUT_SECONDS
+    dl_timeout = (30, read_timeout_s if read_timeout_s and read_timeout_s > 0 else None)
+    logger.info(
+        'copy_aip_to_wasabi requesting AM download aip_uuid=%s '
+        'expected_bytes=%s read_timeout_s=%s — first byte can take a '
+        'long time for large AIPs; silence here is AM preparing the '
+        'package', aip_uuid, expected_bytes, dl_timeout[1],
+    )
     try:
         with requests.get(
             _am_download_url(aip_uuid),
             headers=_am_storage_auth_header(),
             stream=True,
-            timeout=(30, None),  # connect 30s, read open-ended
+            timeout=dl_timeout,
         ) as dl:
             if dl.status_code != 200:
                 out['elapsed_ms'] = int((time.monotonic() - started) * 1000)
                 out['error'] = f'am download returned HTTP {dl.status_code}'
                 return out
+            logger.info(
+                'copy_aip_to_wasabi AM download streaming aip_uuid=%s '
+                'first_byte_after_ms=%d',
+                aip_uuid, int((time.monotonic() - started) * 1000),
+            )
             try:
                 uploaded = wasabi.upload_fileobj(
                     dl.raw, key,
