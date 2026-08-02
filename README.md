@@ -12,7 +12,7 @@
 
 ### Background
 
-Flask service that owns the **on-host filesystem + Wasabi S3 + SFTP** side of the University of Denver Libraries' digital repository ingest pipeline. It is called over HTTP from [repo-backend-v2](https://github.com/dulibrarytech/repo-backend-v2) (the Node.js ingest worker) and performs the storage and filesystem work that backend can't — or shouldn't — do directly: staging and QAing package folders on the Archivematica SFTP drop, creating ArchivesSpace digital objects, copying AIPs to the Wasabi preservation tier, and minting the presigned URLs the staff dashboard serves. It is the sole holder of the Wasabi (boto3) credentials; the Node side carries only a URL and an API key. Deploy the two services together — an ingest run cannot complete without both.
+Flask service that owns the **on-host filesystem + Wasabi S3 + SFTP** side of the University of Denver Libraries' digital repository ingest pipeline. It is called over HTTP from [repo-backend-v2](https://github.com/dulibrarytech/repo-backend-v2) (the Node.js ingest worker) and performs the storage and filesystem work that backend can't — or shouldn't — do directly: staging and QAing package folders on the Archivematica SFTP drop, creating ArchivesSpace digital objects, copying AIPs to the Wasabi storage tier, and minting the presigned URLs the staff dashboard serves. It is the sole holder of the Wasabi (boto3) credentials; the Node side carries only a URL and an API key. Deploy the two services together — an ingest run cannot complete without both.
 
 ### Contributing
 
@@ -235,8 +235,8 @@ A Flask application (blueprints + gunicorn under systemd) exposing a private HTT
 | --- | --- |
 | **[repo-backend-v2](https://github.com/dulibrarytech/repo-backend-v2)** (Node) | The only caller. Drives every route as part of the pre-ingest workspace and the six-stage ingest pipeline. Holds `CURATION_API` + `CURATION_API_KEY`, nothing else. |
 | **Archivematica SFTP daemon** | Ingest drop target. Staged batches are pushed to the `internal-sftp` subsystem via paramiko; cleanup removes a package's files and parent dir after success. |
-| **Wasabi S3 — batch archive** | Post-ingest backup of the `002-ingest` staging copy (`WASABI_BUCKET`). |
-| **Wasabi S3 — AIP store** | Preservation tier for Archivematica AIPs (`WASABI_AIP_BUCKET`), plus the presigned download URLs the dashboard serves. |
+| **Wasabi S3 — batch backup** | Post-ingest backup of the `002-ingest` staging copy (`WASABI_BUCKET`). |
+| **Wasabi S3 — AIP store** | Storage tier for Archivematica AIPs (`WASABI_AIP_BUCKET`), plus the presigned download URLs the dashboard serves. |
 | **ArchivesSpace** | Digital-object creation via the bundled `lib/make_digital_object.py` CLI; `uri.txt` per package is the output. |
 | **Local filesystem** | `WORKSPACE` (staff-assembled batches), `READY_PATH` (`001-ready`), `INGEST_PATH` (`002-ingest`). |
 
@@ -252,58 +252,6 @@ Stage 6 (aip_store)  → /api/v2/aip/*      (copy-to-wasabi, presigned-url)
 ```
 
 At the end of a successful ingest, the batch's `002-ingest` staging copy is backed up **straight to Wasabi** — every uploaded file is verified with a `head_object` size check, and the staging copy is removed only after that verification passes.
-
-### Endpoints
-
-Four blueprints. All application routes are auth-required (`X-API-Key` header, or legacy `?api_key=` query string); the health routes are not.
-
-#### `/api/v2/qa/*` — Archivematica side
-
-| Endpoint | Purpose |
-|---|---|
-| `GET /list-ready-folders` | List folders in `READY_PATH` |
-| `GET /package-names` | Packages inside a ready folder |
-| `GET /check-package-names`, `/check-file-names`, `/check-uri-txt` | Validation helpers |
-| `GET /get-total-batch-size`, `/package-file-count` | Size / count helpers |
-| `GET /move-to-ingest` | Move a package from `001-ready` to `002-ingest` |
-| `GET /move-from-ingest-to-ready` | Rollback move (used by Node rollback flow) |
-| `GET /move-to-sftp` | Push staged batch to AM's SFTP source |
-| `GET /upload-status` | Poll SFTP upload progress |
-| `GET /move-to-ingested` | After-success archive of `002-ingest/<uuid>/` to Wasabi (per-file verified; staging copy removed only on verified success) |
-| `GET /cleanup_sftp` | Remove a package's files + parent dir from SFTP |
-| `GET /reset_permissions` | chown ready folder back to service user |
-| `GET /set-collection-folder`, `/check-collection-folder` | Folder naming helpers |
-| `GET /get-uri-txt` | Read uri.txt from a package |
-
-#### `/api/v1/astools/*` — ArchivesSpace side
-
-| Endpoint | Purpose |
-|---|---|
-| `GET /workspace` | List batches awaiting Make Digital Objects, **with structure-QA flags** (see [Batch structure QA](#batch-structure-qa)). Returns batch objects `{name, packages, processed, structure_errors}` — malformed batches are included and flagged rather than silently skipped (exception: completely empty folders stay hidden until staff put anything in them). |
-| `GET /workspace/packages` | Package names in one batch (`result` = sorted name array) + piggybacked `processed` and `structure_errors` |
-| `GET /workspace/packages/files` | Per-package file listings |
-| `GET /processed` | List batches with `uri.txt` (scan bounded to `batch/package/uri.txt` depth) |
-| `GET /workspace/uri`, `/check-uri-txt` | URI helpers |
-| `POST /make-digital-objects` | Launch the ASpace digital-object creation CLI |
-| `POST /revert-to-make-digital-objects` | Delete `uri.txt` from every package (returns the batch to the MDO view) |
-
-#### `/api/v2/aip/*` — AIP store
-
-| Endpoint | Purpose |
-|---|---|
-| `POST /copy-to-wasabi` | Stream an AM Storage Service AIP into the `WASABI_AIP_BUCKET` (idempotent via size-checked `head_object` probe) |
-| `GET /copy-progress/<aip_uuid>` | Poll byte progress of an in-flight copy |
-| `GET /list-objects` | List AIP-store objects under a prefix |
-| `POST /presigned-url` | Mint a presigned GET URL for an AIP download |
-
-#### `/api/v2/archive/*` — batch archive browse
-
-| Endpoint | Purpose |
-|---|---|
-| `GET /collections` | Collections present in the batch-archive bucket |
-| `GET /collections/<collection>/packages` | Packages within a collection |
-| `GET /collections/<collection>/packages/<package>/files` | One page of files (and nested folders) inside a package |
-| `POST /download-url` | Mint a presigned GET URL for an archived file |
 
 #### Health endpoints (no auth)
 
