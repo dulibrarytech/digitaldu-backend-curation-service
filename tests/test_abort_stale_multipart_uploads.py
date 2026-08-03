@@ -26,7 +26,11 @@ from botocore.exceptions import ClientError  # noqa: E402
 from scripts import abort_stale_multipart_uploads as hygiene  # noqa: E402
 
 
-NOW = datetime(2026, 7, 31, 12, 0, 0, tzinfo=timezone.utc)
+# Anchor fixture ages to REAL now: the script computes its cutoff from
+# datetime.now(), so a fixed date here rots — a "1-day-old" upload
+# frozen at an absolute date becomes stale for real within days of
+# writing the test (bitten 2026-08-01).
+NOW = datetime.now(timezone.utc)
 
 
 def _upload(key, age_days, upload_id='u-1'):

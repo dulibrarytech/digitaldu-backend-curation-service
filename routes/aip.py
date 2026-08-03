@@ -65,6 +65,7 @@ import config
 from auth import require_api_key_qa
 from lib import wasabi
 from lib import aip_ops
+from lib import duracloud_ops
 
 logger = logging.getLogger(__name__)
 
@@ -108,6 +109,48 @@ def copy_to_wasabi():
             'bytes': None,
             'elapsed_ms': elapsed_ms,
             'error': f'unhandled: {e}',
+        }), 200
+
+    return jsonify(result), 200
+
+
+@aip_bp.route('/copy-from-duracloud', methods=['POST'])
+@require_api_key_qa
+def copy_from_duracloud():
+    """
+    Failover twin of /copy-to-wasabi: same body, same response
+    envelope (plus source='duracloud'), but the AIP bytes come from
+    DuraCloud's aip-store replica instead of AM Storage Service —
+    chunk-reassembled and MD5-verified against the .dura-manifest.
+    Used when AM's download path cannot serve large AIPs.
+    """
+    body = request.get_json(silent=True) or {}
+    aip_uuid = (body.get('aip_uuid') or '').strip()
+    repo_uuid = (body.get('repo_uuid') or '').strip()
+    if not aip_uuid:
+        return jsonify({'ok': False, 'error': 'aip_uuid is required'}), 400
+    if not repo_uuid:
+        return jsonify({'ok': False, 'error': 'repo_uuid is required'}), 400
+
+    started = time.monotonic()
+    try:
+        result = duracloud_ops.copy_aip_from_duracloud(
+            aip_uuid=aip_uuid, repo_uuid=repo_uuid
+        )
+    except Exception as e:
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        logger.exception(
+            'copy_from_duracloud: unhandled exception aip_uuid=%s repo_uuid=%s',
+            aip_uuid, repo_uuid,
+        )
+        return jsonify({
+            'ok': False,
+            'bucket': None,
+            'key': None,
+            'bytes': None,
+            'elapsed_ms': elapsed_ms,
+            'error': f'unhandled: {e}',
+            'source': 'duracloud',
         }), 200
 
     return jsonify(result), 200

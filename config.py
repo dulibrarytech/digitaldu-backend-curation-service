@@ -87,6 +87,18 @@ try:
 except ValueError:
     AM_DOWNLOAD_READ_TIMEOUT_SECONDS = 21600
 
+# --- DuraCloud (AIP-copy failover source) -----------------------------------
+# AM replicates every AIP to DuraCloud's aip-store space; when AM's own
+# /download/ endpoint can't serve a large AIP (observed 2026-07-31:
+# silent hangs, then 502s at 66-75 GB), lib/duracloud_ops.py copies the
+# AIP to Wasabi FROM DuraCloud instead. Conventionally the same three
+# values as repo-backend-v2's DURACLOUD_* env. Optional — when unset,
+# only the /aip/copy-from-duracloud route refuses; the AM path is
+# unaffected.
+DURACLOUD_API = os.getenv('DURACLOUD_API')
+DURACLOUD_USER = os.getenv('DURACLOUD_USER')
+DURACLOUD_PWD = os.getenv('DURACLOUD_PWD')
+
 # --- ArchivesSpace ---------------------
 WORKSPACE = os.getenv('WORKSPACE')
 ASPACE_USERNAME = os.getenv('ASPACE_USERNAME')
