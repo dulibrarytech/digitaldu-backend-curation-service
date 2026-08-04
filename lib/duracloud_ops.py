@@ -52,6 +52,7 @@ of which source served the bytes.
 
 import hashlib
 import logging
+import tempfile
 import time
 import xml.etree.ElementTree as ET
 
@@ -157,157 +158,183 @@ class ChunkVerificationError(Exception):
     """A chunk's bytes did not match its manifest MD5/size."""
 
 
+
 class ChunkStreamReader:
     """
-    File-like reader that concatenates DuraCloud chunk streams into one
-    continuous byte stream, verifying and self-healing as it goes.
+    File-like reader that serves DuraCloud chunks as one continuous,
+    VERIFIED byte stream.
 
-    boto3's upload_fileobj drives this via read(n); when the current
-    chunk is exhausted its MD5 + byte count are checked against the
-    manifest (raising ChunkVerificationError on mismatch — which
-    aborts the upload immediately instead of after 66 GB), then the
-    next chunk's HTTP stream is opened lazily. A whole-file MD5 is
-    accumulated in parallel; call verify_total() after EOF.
+    Verify-before-forward (2026-08-02, production incident): each chunk
+    is first downloaded in full to an anonymous temp spool file, its
+    byte count and manifest MD5 are verified, and only then are its
+    bytes served onward to boto3's upload_fileobj. A chunk that arrives
+    corrupt (observed live: correct size, wrong MD5 — an upstream
+    transient; an independent re-download hashed clean) is simply
+    re-downloaded, up to `max_chunk_retries` times. The earlier design
+    verified AFTER the bytes had gone to Wasabi, so one bad chunk killed
+    a 67-chunk copy; now it costs one ~1 GB re-download.
 
-    TRUNCATION RESUME (2026-08-02): urllib3 1.x does not enforce
-    Content-Length on raw reads, so a connection cut mid-chunk looks
-    like a clean EOF — observed in production as a chunk arriving
-    999,876,870 of 1,000,000,000 bytes. When a stream ends short of
-    the chunk's known size, the reader RESUMES it with an HTTP Range
-    request from the exact byte offset (DuraCloud serves 206) instead
-    of failing the whole copy; both MD5 accumulators simply continue.
-    Across 67 chunks, per-chunk resume is the difference between
-    routine completion and coin-flip odds. Bounded by
-    `max_resumes` per chunk; only a persistent short chunk raises.
+    Silent truncation is handled INSIDE each download: urllib3 1.x does
+    not enforce Content-Length on raw reads, so a connection cut mid-
+    chunk looks like a clean EOF (observed live: 999,876,870 of
+    1,000,000,000 bytes). A short stream resumes via HTTP Range from
+    the exact offset (DuraCloud serves 206), up to `max_resumes` times
+    per download attempt.
+
+    The whole-file MD5 accumulates over SERVED (verified) bytes; call
+    verify_total() after EOF. Nothing is held in memory beyond an 8 MB
+    read buffer — the spool lives on disk (tempfile.TemporaryFile:
+    anonymous, auto-deleted, at most one chunk ≈ 1 GB at a time).
 
     `open_stream(chunk_id, offset=0)` is injected for testability;
     production passes _open_dc_stream.
     """
 
-    def __init__(self, chunks, open_stream, max_resumes=5):
+    _READ_SIZE = 8 * 1024 * 1024
+
+    def __init__(self, chunks, open_stream, max_resumes=5,
+                 max_chunk_retries=3, spool_dir=None):
         self._chunks = chunks
         self._open_stream = open_stream
         self._max_resumes = max_resumes
+        self._max_chunk_retries = max_chunk_retries
+        self._spool_dir = spool_dir
         self._chunk_index = -1
-        self._current = None          # active urllib3 response stream
-        self._current_response = None  # owning requests.Response (for close)
-        self._chunk_hash = None
-        self._chunk_bytes = 0
-        self._chunk_resumes = 0
+        self._buffer = None  # verified spool file for the current chunk
         self.total_hash = hashlib.md5()
         self.bytes_read = 0
-
-    def _expected_chunk_bytes(self):
-        return self._chunks[self._chunk_index]['bytes']
-
-    def _open_current(self, offset):
-        chunk = self._chunks[self._chunk_index]
-        response = self._open_stream(chunk['chunk_id'], offset)
-        self._current_response = response
-        self._current = response.raw
-        # Size unknown (single-object path without an AM-reported size):
-        # adopt the server's Content-Length so truncation is detectable
-        # and resumable there too.
-        if chunk['bytes'] is None and offset == 0:
-            try:
-                length = int(getattr(response, 'headers', {}).get('Content-Length'))
-                if length > 0:
-                    chunk['bytes'] = length
-            except (TypeError, ValueError):
-                pass
-
-    def _advance(self):
-        """Close the finished chunk (verifying it) and open the next."""
-        if self._current is not None:
-            self._verify_current()
-            self._current_response.close()
-            self._current = None
-            self._current_response = None
-        self._chunk_index += 1
-        if self._chunk_index >= len(self._chunks):
-            return False
-        self._chunk_hash = hashlib.md5()
-        self._chunk_bytes = 0
-        self._chunk_resumes = 0
-        self._open_current(0)
-        return True
-
-    def _resume_current(self):
-        """
-        The active chunk EOF'd short of its known size — reopen it at
-        the current byte offset (HTTP Range). Returns False when the
-        resume budget is spent (caller then fails verification with the
-        precise byte counts).
-        """
-        chunk = self._chunks[self._chunk_index]
-        if self._chunk_resumes >= self._max_resumes:
-            return False
-        self._chunk_resumes += 1
-        logger.warning(
-            'duracloud chunk truncated — resuming %s at offset %d '
-            '(resume %d/%d)',
-            chunk['chunk_id'], self._chunk_bytes,
-            self._chunk_resumes, self._max_resumes,
-        )
-        self._current_response.close()
-        self._open_current(self._chunk_bytes)
-        return True
-
-    def _verify_current(self):
-        chunk = self._chunks[self._chunk_index]
-        # bytes=None means "size unknown" (single-object path without an
-        # AM-reported size) — skip the per-chunk size check.
-        if chunk['bytes'] is not None and self._chunk_bytes != chunk['bytes']:
-            raise ChunkVerificationError(
-                f'chunk {chunk["chunk_id"]}: got {self._chunk_bytes} bytes, '
-                f'manifest says {chunk["bytes"]}'
-            )
-        digest = self._chunk_hash.hexdigest()
-        if chunk['md5'] and digest != chunk['md5']:
-            raise ChunkVerificationError(
-                f'chunk {chunk["chunk_id"]}: md5 {digest} != manifest {chunk["md5"]}'
-            )
 
     def read(self, size=-1):
         """
         Return up to `size` bytes (all remaining when size < 0); b''
-        only at true end-of-stream — boto3's EOF signal.
+        only at true end-of-stream — boto3's EOF signal. Bytes returned
+        here have ALREADY passed chunk verification.
         """
         if size is not None and size < 0:
             pieces = []
             while True:
-                piece = self.read(8 * 1024 * 1024)
+                piece = self.read(self._READ_SIZE)
                 if not piece:
                     break
                 pieces.append(piece)
             return b''.join(pieces)
         while True:
-            if self._current is None:
-                if self._chunk_index >= len(self._chunks):
+            if self._buffer is None:
+                if not self._load_next_chunk():
                     return b''
-                if not self._advance():
-                    return b''
-            data = self._current.read(size)
+            data = self._buffer.read(size)
             if data:
-                self._chunk_hash.update(data)
-                self._chunk_bytes += len(data)
                 self.total_hash.update(data)
                 self.bytes_read += len(data)
                 return data
-            # Stream ended. Short of the chunk's known size = a silent
-            # truncation (urllib3 1.x does not raise) — resume via Range
-            # while budget remains; _verify_current fails it precisely
-            # once the budget is spent.
-            expected = self._expected_chunk_bytes()
-            if (
-                expected is not None
-                and self._chunk_bytes < expected
-                and self._resume_current()
-            ):
-                continue
-            # Chunk exhausted — verify it, open the next, loop to read.
-            if not self._advance():
-                return b''
+            # Current chunk fully served — release its spool, move on.
+            self._buffer.close()
+            self._buffer = None
+
+    def _load_next_chunk(self):
+        """
+        Download + verify the next chunk into the spool. False at end
+        of the chunk list; raises ChunkVerificationError only once the
+        per-chunk retry budget is exhausted.
+        """
+        self._chunk_index += 1
+        if self._chunk_index >= len(self._chunks):
+            return False
+        chunk = self._chunks[self._chunk_index]
+        last_err = None
+        for attempt in range(1, self._max_chunk_retries + 1):
+            try:
+                self._buffer = self._download_and_verify(chunk)
+                return True
+            except ChunkVerificationError as e:
+                last_err = e
+                logger.warning(
+                    'duracloud chunk failed verification '
+                    '(attempt %d/%d) — re-downloading: %s',
+                    attempt, self._max_chunk_retries, e,
+                )
+            except (requests.RequestException, RuntimeError) as e:
+                last_err = e
+                logger.warning(
+                    'duracloud chunk download failed '
+                    '(attempt %d/%d) — re-downloading: %s',
+                    attempt, self._max_chunk_retries, e,
+                )
+        raise ChunkVerificationError(
+            f'chunk {chunk["chunk_id"]}: still failing after '
+            f'{self._max_chunk_retries} attempts: {last_err}'
+        )
+
+    def _download_and_verify(self, chunk):
+        """
+        One full download attempt for one chunk: stream to a temp
+        spool (resuming truncations via Range), then verify byte count
+        + MD5. Returns the spool rewound to 0; raises on any mismatch.
+        """
+        spool = tempfile.TemporaryFile(dir=self._spool_dir, prefix='dc-chunk-')
+        try:
+            chunk_hash = hashlib.md5()
+            got = 0
+            resumes = 0
+            expected = chunk['bytes']
+            response = self._open_stream(chunk['chunk_id'], 0)
+            try:
+                # Size unknown (single-object path without an AM-reported
+                # size): adopt the server's Content-Length so truncation
+                # is detectable + resumable there too.
+                if expected is None:
+                    try:
+                        length = int(
+                            getattr(response, 'headers', {}).get('Content-Length')
+                        )
+                        if length > 0:
+                            expected = length
+                            chunk['bytes'] = length
+                    except (TypeError, ValueError):
+                        pass
+                while True:
+                    data = response.raw.read(self._READ_SIZE)
+                    if data:
+                        spool.write(data)
+                        chunk_hash.update(data)
+                        got += len(data)
+                        continue
+                    # EOF. Short of the known size = silent truncation —
+                    # resume from the exact offset while budget remains.
+                    if (
+                        expected is not None
+                        and got < expected
+                        and resumes < self._max_resumes
+                    ):
+                        resumes += 1
+                        logger.warning(
+                            'duracloud chunk truncated — resuming %s at '
+                            'offset %d (resume %d/%d)',
+                            chunk['chunk_id'], got, resumes, self._max_resumes,
+                        )
+                        response.close()
+                        response = self._open_stream(chunk['chunk_id'], got)
+                        continue
+                    break
+            finally:
+                response.close()
+
+            if expected is not None and got != expected:
+                raise ChunkVerificationError(
+                    f'chunk {chunk["chunk_id"]}: got {got} bytes, '
+                    f'manifest says {expected}'
+                )
+            digest = chunk_hash.hexdigest()
+            if chunk['md5'] and digest != chunk['md5']:
+                raise ChunkVerificationError(
+                    f'chunk {chunk["chunk_id"]}: md5 {digest} != '
+                    f'manifest {chunk["md5"]}'
+                )
+            spool.seek(0)
+            return spool
+        except BaseException:
+            spool.close()
+            raise
 
     def verify_total(self, expected_md5, expected_bytes):
         """Whole-file check after EOF; raises ChunkVerificationError."""
@@ -322,10 +349,10 @@ class ChunkStreamReader:
             )
 
     def close(self):
-        if self._current_response is not None:
-            self._current_response.close()
-            self._current = None
-            self._current_response = None
+        if self._buffer is not None:
+            self._buffer.close()
+            self._buffer = None
+
 
 
 def _open_dc_stream(content_id, offset=0):

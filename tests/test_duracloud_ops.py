@@ -186,6 +186,33 @@ class ChunkStreamReaderTests(unittest.TestCase):
         )
         self.assertEqual(reader.read(-1), b'whatever-length')
 
+    def test_corrupt_chunk_is_redownloaded_and_never_forwarded(self):
+        """
+        Production case 2026-08-02 #2: a chunk arrived at the right SIZE
+        but the wrong MD5 (upstream transient — an independent
+        re-download hashed clean). Verify-before-forward must catch it
+        in the spool, re-download just that chunk, and serve only the
+        clean bytes — the consumer never sees the corrupt attempt.
+        """
+        chunks = [b'0123456789', b'abcdefghij']
+        manifest = dc.parse_manifest(_manifest_xml(chunks))
+        attempts = {'c-0': 0}
+
+        def open_stream(cid, offset=0):
+            if cid == 'c-0':
+                attempts['c-0'] += 1
+                if attempts['c-0'] == 1:
+                    # Same length, wrong bytes — the observed failure.
+                    return FakeStreamResponse(b'CORRUPTED!'[offset:])
+            return FakeStreamResponse({'c-0': chunks[0], 'c-1': chunks[1]}[cid][offset:])
+
+        reader = dc.ChunkStreamReader(manifest['chunks'], open_stream)
+        out = reader.read(-1)
+        self.assertEqual(out, b'0123456789abcdefghij')
+        self.assertEqual(attempts['c-0'], 2)  # one corrupt + one clean
+        # Whole-file hash contains only the verified bytes.
+        reader.verify_total(manifest['md5'], manifest['total_bytes'])
+
     def test_truncated_chunk_resumes_via_range_and_completes(self):
         """
         Production case 2026-08-02: a chunk's stream ended 123 KB short
