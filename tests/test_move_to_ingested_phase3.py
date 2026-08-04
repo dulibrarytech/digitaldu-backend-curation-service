@@ -40,7 +40,7 @@ class MoveToIngestedPhase3Tests(unittest.TestCase):
         self._patches = [
             patch.object(ops, 'ready_path', self.ready),
             patch.object(ops, 'ingest_path', self.ingest),
-            # reset_permissions shells out to chown; neutralize it.
+            # reset_permissions shells out to chgrp/chmod; neutralize it.
             patch.object(ops, 'reset_permissions', lambda folder: 'ok'),
         ]
         for p in self._patches:

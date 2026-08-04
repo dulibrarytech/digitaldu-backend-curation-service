@@ -52,7 +52,6 @@ sftp_path = config.SFTP_REMOTE_PATH
 wasabi_endpoint = config.WASABI_ENDPOINT
 wasabi_bucket = config.WASABI_BUCKET
 wasabi_profile = config.WASABI_PROFILE
-uid = config.UID
 gid = config.GID
 errors_file = config.ERRORS_FILE
 
@@ -1410,7 +1409,7 @@ def move_to_ingested(uuid, folder):
 
     # Re-open the 001-ready batch folder's permissions so staff can keep
     # adding packages to an in-progress collection. Best-effort: the folder
-    # may already be gone, and a chown failure is logged and ignored.
+    # may already be gone, and a chgrp/chmod failure is logged and ignored.
     reset_permissions(folder)
 
     try:
@@ -1431,15 +1430,37 @@ def move_to_ingested(uuid, folder):
 
 def reset_permissions(folder):
     """
-    Resets ready folder permissions so that staff is able to add more packages
+    Restores staff group access on a 001-ready batch folder so staff can
+    keep adding packages to an in-progress collection.
+
+    Recursively sets the group to GID (the shared staff group, e.g.
+    `domain users`) and grants group rwX. The owner is deliberately left
+    untouched: batches are created by different individual staff accounts,
+    so the pre-2026-08 `chown -R UID:GID` here flattened every batch to
+    one fixed owner (and with the template placeholder 1001:1001, to an
+    id that maps to no account at all). UID is no longer read.
+
+    Privilege note: chgrp on files the service user does not own needs
+    CAP_CHOWN; on its own files it needs membership in GID (e.g.
+    `SupplementaryGroups=` in the systemd unit).
+
+    Best-effort: the folder may already be gone, and any failure is
+    logged and ignored — _run logs non-zero exits at WARNING.
+
     @param: folder
-    :returns: void
+    :returns: String status message
     """
 
     message = 'Permissions changed'
 
+    if not gid:
+        logger.warning('reset_permissions: GID not configured; skipping')
+        return 'Unable to reset permissions'
+
     try:
-        _run(['chown', '-R', '--', uid + ':' + gid, ready_path + folder])
+        target = ready_path + folder
+        _run(['chgrp', '-R', '--', gid, target])
+        _run(['chmod', '-R', '--', 'g+rwX', target])
     except Exception as e:
         logger.info(e)
         message = 'Unable to reset permissions'

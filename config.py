@@ -55,7 +55,9 @@ WASABI_BUCKET = os.getenv('WASABI_BUCKET')
 # refuse with ok=false rather than writing AIPs to the batch bucket.
 WASABI_AIP_BUCKET = os.getenv('WASABI_AIP_BUCKET')
 WASABI_PROFILE = os.getenv('WASABI_PROFILE')
-UID = os.getenv('UID')
+# Numeric gid of the shared staff group (e.g. `domain users`) that
+# reset_permissions restores on 001-ready batch folders. UID is retired:
+# batch owners are individual staff accounts and are never rewritten.
 GID = os.getenv('GID')
 ERRORS_FILE = os.getenv('ERRORS_FILE')
 BATCH_SIZE_LIMIT = os.getenv('BATCH_SIZE_LIMIT')

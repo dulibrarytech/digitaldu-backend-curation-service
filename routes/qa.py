@@ -314,7 +314,7 @@ def move_to_ingested():
 @require_api_key_qa
 def reset_permissions():
     folder = request.args.get('folder')
-    # `folder` is joined onto READY_PATH and passed to chown inside
+    # `folder` is joined onto READY_PATH and passed to chgrp/chmod inside
     # ops.reset_permissions — validate it as a safe single path segment.
     err = validate_segment(folder, 'folder')
     if err:
