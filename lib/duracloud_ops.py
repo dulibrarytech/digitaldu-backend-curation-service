@@ -160,7 +160,7 @@ class ChunkVerificationError(Exception):
 class ChunkStreamReader:
     """
     File-like reader that concatenates DuraCloud chunk streams into one
-    continuous byte stream, verifying as it goes.
+    continuous byte stream, verifying and self-healing as it goes.
 
     boto3's upload_fileobj drives this via read(n); when the current
     chunk is exhausted its MD5 + byte count are checked against the
@@ -169,20 +169,52 @@ class ChunkStreamReader:
     next chunk's HTTP stream is opened lazily. A whole-file MD5 is
     accumulated in parallel; call verify_total() after EOF.
 
-    `open_stream(chunk_id)` is injected for testability; production
-    passes _open_dc_stream.
+    TRUNCATION RESUME (2026-08-02): urllib3 1.x does not enforce
+    Content-Length on raw reads, so a connection cut mid-chunk looks
+    like a clean EOF — observed in production as a chunk arriving
+    999,876,870 of 1,000,000,000 bytes. When a stream ends short of
+    the chunk's known size, the reader RESUMES it with an HTTP Range
+    request from the exact byte offset (DuraCloud serves 206) instead
+    of failing the whole copy; both MD5 accumulators simply continue.
+    Across 67 chunks, per-chunk resume is the difference between
+    routine completion and coin-flip odds. Bounded by
+    `max_resumes` per chunk; only a persistent short chunk raises.
+
+    `open_stream(chunk_id, offset=0)` is injected for testability;
+    production passes _open_dc_stream.
     """
 
-    def __init__(self, chunks, open_stream):
+    def __init__(self, chunks, open_stream, max_resumes=5):
         self._chunks = chunks
         self._open_stream = open_stream
+        self._max_resumes = max_resumes
         self._chunk_index = -1
         self._current = None          # active urllib3 response stream
         self._current_response = None  # owning requests.Response (for close)
         self._chunk_hash = None
         self._chunk_bytes = 0
+        self._chunk_resumes = 0
         self.total_hash = hashlib.md5()
         self.bytes_read = 0
+
+    def _expected_chunk_bytes(self):
+        return self._chunks[self._chunk_index]['bytes']
+
+    def _open_current(self, offset):
+        chunk = self._chunks[self._chunk_index]
+        response = self._open_stream(chunk['chunk_id'], offset)
+        self._current_response = response
+        self._current = response.raw
+        # Size unknown (single-object path without an AM-reported size):
+        # adopt the server's Content-Length so truncation is detectable
+        # and resumable there too.
+        if chunk['bytes'] is None and offset == 0:
+            try:
+                length = int(getattr(response, 'headers', {}).get('Content-Length'))
+                if length > 0:
+                    chunk['bytes'] = length
+            except (TypeError, ValueError):
+                pass
 
     def _advance(self):
         """Close the finished chunk (verifying it) and open the next."""
@@ -194,12 +226,31 @@ class ChunkStreamReader:
         self._chunk_index += 1
         if self._chunk_index >= len(self._chunks):
             return False
-        chunk = self._chunks[self._chunk_index]
-        response = self._open_stream(chunk['chunk_id'])
-        self._current_response = response
-        self._current = response.raw
         self._chunk_hash = hashlib.md5()
         self._chunk_bytes = 0
+        self._chunk_resumes = 0
+        self._open_current(0)
+        return True
+
+    def _resume_current(self):
+        """
+        The active chunk EOF'd short of its known size — reopen it at
+        the current byte offset (HTTP Range). Returns False when the
+        resume budget is spent (caller then fails verification with the
+        precise byte counts).
+        """
+        chunk = self._chunks[self._chunk_index]
+        if self._chunk_resumes >= self._max_resumes:
+            return False
+        self._chunk_resumes += 1
+        logger.warning(
+            'duracloud chunk truncated — resuming %s at offset %d '
+            '(resume %d/%d)',
+            chunk['chunk_id'], self._chunk_bytes,
+            self._chunk_resumes, self._max_resumes,
+        )
+        self._current_response.close()
+        self._open_current(self._chunk_bytes)
         return True
 
     def _verify_current(self):
@@ -243,6 +294,17 @@ class ChunkStreamReader:
                 self.total_hash.update(data)
                 self.bytes_read += len(data)
                 return data
+            # Stream ended. Short of the chunk's known size = a silent
+            # truncation (urllib3 1.x does not raise) — resume via Range
+            # while budget remains; _verify_current fails it precisely
+            # once the budget is spent.
+            expected = self._expected_chunk_bytes()
+            if (
+                expected is not None
+                and self._chunk_bytes < expected
+                and self._resume_current()
+            ):
+                continue
             # Chunk exhausted — verify it, open the next, loop to read.
             if not self._advance():
                 return b''
@@ -266,18 +328,31 @@ class ChunkStreamReader:
             self._current_response = None
 
 
-def _open_dc_stream(content_id):
-    """Open a streamed GET for one DuraCloud content item (200 only)."""
+def _open_dc_stream(content_id, offset=0):
+    """
+    Open a streamed GET for one DuraCloud content item. offset > 0
+    resumes mid-item via an HTTP Range request (DuraCloud answers 206)
+    — used by ChunkStreamReader to continue a silently-truncated chunk
+    from the exact byte it stopped at. A 200 to a ranged request would
+    mean the server replayed the WHOLE item; treating that as success
+    would corrupt the reassembled stream, so it is rejected.
+    """
+    headers = {}
+    if offset > 0:
+        headers['Range'] = f'bytes={offset}-'
     response = requests.get(
         _dc_url(content_id),
         auth=_dc_auth(),
+        headers=headers,
         stream=True,
         timeout=_DC_TIMEOUT,
     )
-    if response.status_code != 200:
+    expected_status = 206 if offset > 0 else 200
+    if response.status_code != expected_status:
         response.close()
         raise RuntimeError(
-            f'duracloud GET {content_id} returned HTTP {response.status_code}'
+            f'duracloud GET {content_id} (offset={offset}) returned '
+            f'HTTP {response.status_code}, expected {expected_status}'
         )
     return response
 
@@ -474,18 +549,30 @@ def copy_aip_from_duracloud(aip_uuid, repo_uuid):
                         f'{content_id}'
                     )
                 return done(str(e))
-            with dl:
-                reader = ChunkStreamReader(
-                    [{
-                        'index': 0,
-                        'chunk_id': content_id,
-                        # None disables the per-chunk size check when AM
-                        # didn't report a size; no manifest = no MD5.
-                        'bytes': expected_bytes,
-                        'md5': '',
-                    }],
-                    lambda _cid: dl,
-                )
+            # First open is handed to the reader; truncation RESUMES
+            # re-open the same contentId with a Range offset. The reader
+            # adopts the response's Content-Length when AM gave no size,
+            # so truncation is detectable on this path too.
+            first = {'response': dl}
+
+            def open_single(_cid, offset=0):
+                pre_opened = first.pop('response', None)
+                if offset == 0 and pre_opened is not None:
+                    return pre_opened
+                return _open_dc_stream(content_id, offset)
+
+            reader = ChunkStreamReader(
+                [{
+                    'index': 0,
+                    'chunk_id': content_id,
+                    # None = size unknown until the reader adopts the
+                    # response Content-Length; no manifest = no MD5.
+                    'bytes': expected_bytes,
+                    'md5': '',
+                }],
+                open_single,
+            )
+            try:
                 uploaded = wasabi.upload_fileobj(
                     reader, key,
                     expected_bytes=expected_bytes,
@@ -496,6 +583,8 @@ def copy_aip_from_duracloud(aip_uuid, repo_uuid):
                     raise ChunkVerificationError(
                         f'total bytes {reader.bytes_read} != expected {expected_bytes}'
                     )
+            finally:
+                reader.close()
         else:
             reader = ChunkStreamReader(manifest['chunks'], _open_dc_stream)
             try:

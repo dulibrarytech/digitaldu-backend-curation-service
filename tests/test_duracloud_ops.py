@@ -55,8 +55,9 @@ def _manifest_xml(chunks, total=None, md5=None):
 class FakeStreamResponse:
     """requests.Response stand-in exposing .raw with read(n)."""
 
-    def __init__(self, payload):
+    def __init__(self, payload, headers=None):
         self.raw = io.BytesIO(payload)
+        self.headers = headers or {}
         self.closed = False
 
     def close(self):
@@ -135,7 +136,7 @@ class ChunkStreamReaderTests(unittest.TestCase):
         return (
             dc.ChunkStreamReader(
                 manifest['chunks'],
-                lambda cid: FakeStreamResponse(payloads[cid]),
+                lambda cid, offset=0: FakeStreamResponse(payloads[cid][offset:]),
             ),
             manifest,
         )
@@ -181,9 +182,68 @@ class ChunkStreamReaderTests(unittest.TestCase):
     def test_unknown_size_skips_per_chunk_size_check(self):
         reader = dc.ChunkStreamReader(
             [{'index': 0, 'chunk_id': 'c-0', 'bytes': None, 'md5': ''}],
-            lambda _cid: FakeStreamResponse(b'whatever-length'),
+            lambda _cid, offset=0: FakeStreamResponse(b'whatever-length'),
         )
         self.assertEqual(reader.read(-1), b'whatever-length')
+
+    def test_truncated_chunk_resumes_via_range_and_completes(self):
+        """
+        Production case 2026-08-02: a chunk's stream ended 123 KB short
+        with a clean-looking EOF (urllib3 1.x doesn't enforce
+        Content-Length). The reader must resume with a Range offset and
+        finish the chunk — MD5s continuing across the seam — instead of
+        failing the whole 67-chunk copy.
+        """
+        chunks = [b'0123456789', b'abcdefghij']
+        manifest = dc.parse_manifest(_manifest_xml(chunks))
+        payloads = {'c-0': chunks[0], 'c-1': chunks[1]}
+        opens = []
+
+        def open_stream(cid, offset=0):
+            opens.append((cid, offset))
+            payload = payloads[cid][offset:]
+            if cid == 'c-0' and offset == 0:
+                payload = payload[:6]  # truncate first attempt
+            return FakeStreamResponse(payload)
+
+        reader = dc.ChunkStreamReader(manifest['chunks'], open_stream)
+        out = reader.read(-1)
+        self.assertEqual(out, b'0123456789abcdefghij')
+        reader.verify_total(manifest['md5'], manifest['total_bytes'])
+        self.assertIn(('c-0', 6), opens)  # resumed at the exact offset
+
+    def test_resume_budget_exhaustion_fails_with_byte_counts(self):
+        chunks = [b'0123456789']
+        manifest = dc.parse_manifest(_manifest_xml(chunks))
+
+        def always_truncated(cid, offset=0):
+            return FakeStreamResponse(b'01234'[offset:] if offset < 5 else b'')
+
+        reader = dc.ChunkStreamReader(
+            manifest['chunks'], always_truncated, max_resumes=2
+        )
+        with self.assertRaises(dc.ChunkVerificationError) as ctx:
+            reader.read(-1)
+        self.assertIn('got 5 bytes', str(ctx.exception))
+
+    def test_unknown_size_adopts_content_length_and_resumes(self):
+        """Single-object path: no manifest size, but the response's
+        Content-Length makes truncation detectable + resumable."""
+        payload = b'full-payload-bytes'
+
+        def open_stream(_cid, offset=0):
+            body = payload[offset:]
+            if offset == 0:
+                body = body[:7]  # truncated first attempt
+            return FakeStreamResponse(
+                body, headers={'Content-Length': str(len(payload))}
+            )
+
+        reader = dc.ChunkStreamReader(
+            [{'index': 0, 'chunk_id': 'c-0', 'bytes': None, 'md5': ''}],
+            open_stream,
+        )
+        self.assertEqual(reader.read(-1), payload)
 
 
 class CopyFlowTests(unittest.TestCase):
@@ -251,7 +311,7 @@ class CopyFlowTests(unittest.TestCase):
 
         with patch.object(dc.requests, 'get', side_effect=fake_get), \
                 patch.object(dc, '_open_dc_stream',
-                             side_effect=lambda cid: FakeStreamResponse(payloads[cid])), \
+                             side_effect=lambda cid, offset=0: FakeStreamResponse(payloads[cid][offset:])), \
                 patch.object(wasabi, 'head_object',
                              return_value={'exists': False, 'bucket': 'aip-bucket'}), \
                 patch.object(wasabi, 'upload_fileobj', side_effect=fake_upload):
@@ -279,13 +339,13 @@ class CopyFlowTests(unittest.TestCase):
 
         with patch.object(dc.requests, 'get', side_effect=fake_get), \
                 patch.object(dc, '_open_dc_stream',
-                             side_effect=lambda cid: FakeStreamResponse(payloads[cid])), \
+                             side_effect=lambda cid, offset=0: FakeStreamResponse(payloads[cid][offset:])), \
                 patch.object(wasabi, 'head_object',
                              return_value={'exists': False, 'bucket': 'aip-bucket'}), \
-                patch.object(wasabi, 'upload_fileobj',
-                             side_effect=lambda reader, *a, **kw: {'bytes': len(reader.read(-1))}), \
                 patch.object(wasabi, 'delete_object',
-                             side_effect=lambda key, **kw: deleted.append(key)):
+                             side_effect=lambda key, **kw: deleted.append(key)), \
+                patch.object(wasabi, 'upload_fileobj',
+                             side_effect=lambda reader, *a, **kw: {'bytes': len(reader.read(-1))}):
             result = dc.copy_aip_from_duracloud(AIP_UUID, 'pid-1')
 
         self.assertFalse(result['ok'])
@@ -301,7 +361,7 @@ class CopyFlowTests(unittest.TestCase):
                 return M()
             return self._am_meta(10)
 
-        def raise_404(_cid):
+        def raise_404(_cid, offset=0):
             raise RuntimeError('duracloud GET x returned HTTP 404')
 
         with patch.object(dc.requests, 'get', side_effect=fake_get), \
@@ -345,7 +405,7 @@ class CopyFlowTests(unittest.TestCase):
 
         with patch.object(dc.requests, 'get', side_effect=fake_get), \
                 patch.object(dc, '_open_dc_stream',
-                             side_effect=lambda cid: FakeStreamResponse(payloads[cid])), \
+                             side_effect=lambda cid, offset=0: FakeStreamResponse(payloads[cid][offset:])), \
                 patch.object(wasabi, 'head_object',
                              return_value={'exists': False, 'bucket': 'aip-bucket'}), \
                 patch.object(wasabi, 'upload_fileobj',
