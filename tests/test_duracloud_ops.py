@@ -186,6 +186,28 @@ class ChunkStreamReaderTests(unittest.TestCase):
         )
         self.assertEqual(reader.read(-1), b'whatever-length')
 
+    def test_reads_fill_requested_size_across_chunk_boundaries(self):
+        """
+        s3transfer builds one S3 part per read() call and S3 rejects
+        non-final parts under 5 MiB at CompleteMultipartUpload
+        (2026-08-02 EntityTooSmall at 99%). Every read must therefore
+        return the FULL requested size across chunk boundaries; only
+        the final read may be short.
+        """
+        chunks = [b'0123456789', b'abcdefghij', b'KLMNO']  # 10+10+5 = 25
+        reader, manifest = self._reader(chunks)
+        reads = []
+        while True:
+            piece = reader.read(8)
+            if not piece:
+                break
+            reads.append(piece)
+        # Every read except the last is exactly the requested 8 bytes,
+        # even though 8 never divides the 10-byte chunks.
+        self.assertEqual([len(r) for r in reads], [8, 8, 8, 1])
+        self.assertEqual(b''.join(reads), b'0123456789abcdefghijKLMNO')
+        reader.verify_total(manifest['md5'], manifest['total_bytes'])
+
     def test_corrupt_chunk_is_redownloaded_and_never_forwarded(self):
         """
         Production case 2026-08-02 #2: a chunk arrived at the right SIZE

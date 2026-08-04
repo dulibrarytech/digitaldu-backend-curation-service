@@ -206,11 +206,21 @@ class ChunkStreamReader:
 
     def read(self, size=-1):
         """
-        Return up to `size` bytes (all remaining when size < 0); b''
-        only at true end-of-stream — boto3's EOF signal. Bytes returned
-        here have ALREADY passed chunk verification.
+        Return EXACTLY `size` bytes until true end-of-stream (all
+        remaining when size < 0); only the final read is short, and b''
+        signals EOF. Bytes returned here have ALREADY passed chunk
+        verification.
+
+        Filling the full `size` ACROSS chunk boundaries is load-bearing
+        (2026-08-02, EntityTooSmall at 99%): s3transfer builds each S3
+        part from a SINGLE read() call and treats a short return as a
+        complete part — and S3 requires every part except the last to
+        be >= 5 MiB, validated only at CompleteMultipartUpload. A
+        reader that returns short at each 1 GB chunk boundary hands
+        s3transfer a ~1.67 MiB part per chunk (1e9 mod 8 MiB), so a
+        67-chunk upload runs to 100% and then fails Complete.
         """
-        if size is not None and size < 0:
+        if size is None or size < 0:
             pieces = []
             while True:
                 piece = self.read(self._READ_SIZE)
@@ -218,18 +228,23 @@ class ChunkStreamReader:
                     break
                 pieces.append(piece)
             return b''.join(pieces)
-        while True:
+        pieces = []
+        remaining = size
+        while remaining > 0:
             if self._buffer is None:
                 if not self._load_next_chunk():
-                    return b''
-            data = self._buffer.read(size)
-            if data:
-                self.total_hash.update(data)
-                self.bytes_read += len(data)
-                return data
-            # Current chunk fully served — release its spool, move on.
-            self._buffer.close()
-            self._buffer = None
+                    break
+            data = self._buffer.read(remaining)
+            if not data:
+                # Current chunk fully served — release its spool.
+                self._buffer.close()
+                self._buffer = None
+                continue
+            self.total_hash.update(data)
+            self.bytes_read += len(data)
+            pieces.append(data)
+            remaining -= len(data)
+        return b''.join(pieces)
 
     def _load_next_chunk(self):
         """
