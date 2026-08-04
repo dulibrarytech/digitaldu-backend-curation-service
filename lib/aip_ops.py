@@ -379,7 +379,10 @@ def copy_aip_to_wasabi(aip_uuid, repo_uuid):
     try:
         with requests.get(
             _am_download_url(aip_uuid),
-            headers=_am_storage_auth_header(),
+            # identity: raw reads must see entity bytes, not a
+            # negotiated gzip stream (see duracloud_ops 2026-08-02).
+            headers={**_am_storage_auth_header(),
+                     'Accept-Encoding': 'identity'},
             stream=True,
             timeout=dl_timeout,
         ) as dl:

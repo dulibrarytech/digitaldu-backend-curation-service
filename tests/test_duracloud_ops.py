@@ -273,6 +273,60 @@ class ChunkStreamReaderTests(unittest.TestCase):
         self.assertEqual(reader.read(-1), payload)
 
 
+class OpenStreamEncodingTests(unittest.TestCase):
+    """
+    _open_dc_stream must force identity encoding and refuse anything
+    else. Root cause of the 2026-08-02 corruption incidents: requests
+    advertises gzip by default, DuraCloud's Apache compresses the
+    chunk, and raw reads then consume the gzip stream — ~0.012% short
+    for incompressible .7z data ("truncation"), or, after a Range
+    resume splices an identity tail onto a gzip prefix, EXACTLY the
+    manifest size with a wrong MD5.
+    """
+
+    def setUp(self):
+        for name, value in (
+            ('DURACLOUD_API', 'archivesdu.duracloud.org/durastore/'),
+            ('DURACLOUD_USER', 'u'),
+            ('DURACLOUD_PWD', 'p'),
+        ):
+            p = patch.object(config, name, value)
+            p.start()
+            self.addCleanup(p.stop)
+
+    def _fake_response(self, status=200, headers=None):
+        class R:
+            status_code = status
+            raw = io.BytesIO(b'x')
+
+            def close(self):
+                pass
+        R.headers = headers or {}
+        return R()
+
+    def test_requests_identity_and_accepts_identity_response(self):
+        seen = {}
+
+        def fake_get(url, **kwargs):
+            seen.update(kwargs)
+            return self._fake_response(headers={})
+
+        with patch.object(dc.requests, 'get', side_effect=fake_get):
+            dc._open_dc_stream('aip-store/x/y.7z')
+        self.assertEqual(seen['headers']['Accept-Encoding'], 'identity')
+
+    def test_refuses_gzip_response(self):
+        with patch.object(
+            dc.requests, 'get',
+            return_value=self._fake_response(
+                headers={'Content-Encoding': 'gzip'}
+            ),
+        ):
+            with self.assertRaises(RuntimeError) as ctx:
+                dc._open_dc_stream('aip-store/x/y.7z')
+        self.assertIn('Content-Encoding gzip', str(ctx.exception))
+
+
 class CopyFlowTests(unittest.TestCase):
     def setUp(self):
         patches = [

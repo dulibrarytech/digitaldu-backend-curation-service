@@ -42,9 +42,9 @@ Layout facts (verified live against durastore, 2026-08-01):
     a content MD5, so the streaming hash computed here is the
     load-bearing integrity check.
 
-Nothing is written to local disk: chunks are streamed sequentially
-through one continuous reader into wasabi.upload_fileobj, exactly like
-the AM path pipes its download. The shared copy-progress file (see
+Chunks are staged one at a time through a ~1 GB temp spool (verify-
+before-forward; see ChunkStreamReader) and served to
+wasabi.upload_fileobj as one continuous verified stream. The shared copy-progress file (see
 aip_ops.write_copy_progress) is reused, so the dashboard's progress
 bar and the Node side's copy-progress poll work unchanged regardless
 of which source served the bytes.
@@ -364,7 +364,15 @@ def _open_dc_stream(content_id, offset=0):
     mean the server replayed the WHOLE item; treating that as success
     would corrupt the reassembled stream, so it is rejected.
     """
-    headers = {}
+    # Accept-Encoding: identity is LOAD-BEARING. requests defaults to
+    # advertising gzip, and DuraCloud's Apache obliges — our raw reads
+    # then consume the COMPRESSED stream: ~0.012% short of the manifest
+    # size for incompressible .7z chunks (the "truncation" incident),
+    # and a Range resume splices an identity tail onto a gzip prefix
+    # that can sum to EXACTLY the manifest size with a wrong MD5 (the
+    # corruption incidents, 2026-08-02). Identity keeps wire bytes ==
+    # entity bytes, which also makes Range offsets byte-exact.
+    headers = {'Accept-Encoding': 'identity'}
     if offset > 0:
         headers['Range'] = f'bytes={offset}-'
     response = requests.get(
@@ -380,6 +388,16 @@ def _open_dc_stream(content_id, offset=0):
         raise RuntimeError(
             f'duracloud GET {content_id} (offset={offset}) returned '
             f'HTTP {response.status_code}, expected {expected_status}'
+        )
+    encoding = (response.headers.get('Content-Encoding') or 'identity').lower()
+    if encoding not in ('identity', ''):
+        response.close()
+        raise RuntimeError(
+            f'duracloud GET {content_id} returned Content-Encoding '
+            f'{encoding} despite Accept-Encoding: identity - refusing: '
+            f'raw reads of an encoded stream corrupt the byte offsets '
+            f'(2026-08-02 incident: gzip prefix + Range identity tail '
+            f'summed to exactly the manifest size with a wrong MD5)'
         )
     return response
 
