@@ -33,3 +33,7 @@ boto3==1.35.49            # pulls botocore + s3transfer + jmespath
 # ArchivesSpace side
 ArchivesSnake==0.9.1      # verify latest compatible release before deploy
 python-magic==0.4.27
+
+# TIFF->JPG derivatives (lib/convert_ops.py). pyvips is the future swap
+# if Pillow's whole-image decode ever hurts on oversize scans.
+Pillow==11.0.0

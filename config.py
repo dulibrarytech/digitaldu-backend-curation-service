@@ -101,6 +101,23 @@ DURACLOUD_API = os.getenv('DURACLOUD_API')
 DURACLOUD_USER = os.getenv('DURACLOUD_USER')
 DURACLOUD_PWD = os.getenv('DURACLOUD_PWD')
 
+# --- TIFF->JPG derivatives (routes/convert.py, lib/convert_ops.py) ----------
+# Where derivative JPGs are written/served — a directory on the 9TB share.
+# Optional: when unset, the convert routes refuse per-request; the rest of
+# the app is unaffected.
+DERIVATIVE_STORAGE_PATH = os.getenv('DERIVATIVE_STORAGE_PATH')
+# Refuse conversions (HTTP 507) below this much free space (default 10GB) —
+# a full volume writes 0-byte files while reporting success (2026-08-04).
+DERIVATIVE_MIN_FREE_BYTES = int(
+    os.getenv('DERIVATIVE_MIN_FREE_BYTES', str(10 * 1024 * 1024 * 1024))
+)
+# JPEG quality for generated derivatives (they are the IIIF zoom source).
+DERIVATIVE_JPEG_QUALITY = int(os.getenv('DERIVATIVE_JPEG_QUALITY', '85'))
+# Refuse sources larger than this (DuraCloud chunks >1GB objects anyway).
+DERIVATIVE_MAX_SOURCE_BYTES = int(
+    os.getenv('DERIVATIVE_MAX_SOURCE_BYTES', str(2 * 1024 * 1024 * 1024))
+)
+
 # --- ArchivesSpace ---------------------
 WORKSPACE = os.getenv('WORKSPACE')
 ASPACE_USERNAME = os.getenv('ASPACE_USERNAME')
