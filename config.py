@@ -101,6 +101,23 @@ DURACLOUD_API = os.getenv('DURACLOUD_API')
 DURACLOUD_USER = os.getenv('DURACLOUD_USER')
 DURACLOUD_PWD = os.getenv('DURACLOUD_PWD')
 
+# AIPs at or above this size are copied FROM DURACLOUD BY DEFAULT
+# (Artefactual's recommendation, 2026-08-03: download large AIPs
+# directly from DuraCloud — the Storage Service /download/ path is not
+# suited to them; it hung, then 502'd, at 66-75 GB). Default 1 GB —
+# the same threshold at which DuraCloud chunks content, so "large"
+# here means exactly "chunked in DuraCloud". Below the threshold the
+# AM path is used as before (fast, no chunk overhead). Set 0 to
+# disable routing (AM always, except explicit retry-from-DuraCloud).
+# Requires DURACLOUD_* above; when unconfigured, routing is skipped
+# with a warning and the AM path is used.
+try:
+    AIP_DURACLOUD_THRESHOLD_BYTES = int(
+        os.getenv('AIP_DURACLOUD_THRESHOLD_BYTES', '1000000000')
+    )
+except ValueError:
+    AIP_DURACLOUD_THRESHOLD_BYTES = 1000000000
+
 # --- TIFF->JPG derivatives (routes/convert.py, lib/convert_ops.py) ----------
 # Where derivative JPGs are written/served — a directory on the 9TB share.
 # Optional: when unset, the convert routes refuse per-request; the rest of

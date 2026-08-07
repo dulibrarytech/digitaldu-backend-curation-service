@@ -313,6 +313,38 @@ def copy_aip_to_wasabi(aip_uuid, repo_uuid):
         out['error'] = 'could not derive Wasabi key from AM current_path'
         return out
 
+    # --- Large-AIP routing: DuraCloud is the DEFAULT source ------------
+    # Artefactual's recommendation (2026-08-03) after the SS /download/
+    # path hung and then 502'd on 66-75 GB AIPs: retrieve large AIPs
+    # directly from DuraCloud. Routing here (rather than in the caller)
+    # means EVERY consumer of this function — Stage 6, the backfill
+    # tool, dashboard retries — inherits the policy. The DuraCloud copy
+    # is also the stronger path: chunk + whole-file MD5 verification
+    # against the .dura-manifest vs the AM path's size-only check.
+    # A not-yet-replicated AIP surfaces as a retryable "not found in
+    # DuraCloud" error — the caller's retry budget covers replication
+    # lag, and staff can always retry later from the AIPs dashboard.
+    threshold = config.AIP_DURACLOUD_THRESHOLD_BYTES
+    if threshold and expected_bytes and expected_bytes >= threshold:
+        # Local import: duracloud_ops imports this module (progress
+        # helpers, AM URL builders), so a top-level import would be
+        # circular.
+        from lib import duracloud_ops
+        if duracloud_ops.is_configured():
+            logger.info(
+                'copy_aip_to_wasabi ROUTING to duracloud aip_uuid=%s '
+                'size=%s >= threshold=%s',
+                aip_uuid, expected_bytes, threshold,
+            )
+            return duracloud_ops.copy_aip_from_duracloud(aip_uuid, repo_uuid)
+        logger.warning(
+            'copy_aip_to_wasabi: aip %s is %s bytes (>= %s) but DuraCloud '
+            'is not configured — falling back to the AM download path, '
+            'which is unreliable at this size. Set DURACLOUD_* in the '
+            'curation .env.',
+            aip_uuid, expected_bytes, threshold,
+        )
+
     # --- Step 2: Idempotency probe --------------------------------------
     # An object already present at the expected size short-circuits the
     # copy, which is what makes caller retries safe.
