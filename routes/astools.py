@@ -740,6 +740,14 @@ def _build_cli_arguments(
     if validated_data.get('no_kaltura'):
         args.append('--no_kaltura_id')
 
+    # Kaltura filename→entry-id mapping. Passed as an explicit path so
+    # the CLI script never has to guess where the mapping lives — the
+    # old contract (a serialized_files.json the script found implicitly)
+    # broke because the route, the script, and the systemd unit each
+    # assumed a different directory.
+    if serialized_file_path:
+        args.extend(['--serialized_files', str(serialized_file_path)])
+
     if validated_data.get('no_caption'):
         args.append('--no_caption')
 
@@ -873,24 +881,17 @@ def make_digital_objects():
                     'errors': ['Server configuration error: log path inaccessible']
                 }), 500
 
-        # Handle Kaltura file serialization securely
+        # Kaltura mapping: written to a per-request temp dir and handed to
+        # the CLI via --serialized_files. The temp dir is removed in the
+        # finally block below, after the (synchronous) script run.
         serialized_file_path = None
         if validated_data['is_kaltura'] and validated_data['files']:
-            # Create temporary directory for serialized files
             temp_dir = Path(tempfile.mkdtemp(prefix='astools_'))
             serialized_file_path = _write_serialized_files(
                 validated_data['files'],
                 temp_dir
             )
             logger.info(f'Created serialized files at: {serialized_file_path}')
-
-            # Copy serialized files to the batch directory for the CLI script
-            # (CLI script expects serialized_files.json in working directory)
-            import shutil
-            # target_serialized_path = batch_path / 'serialized_files.json'
-            target_serialized_path = 'serialized_files.json'
-            shutil.copy2(serialized_file_path, target_serialized_path)
-            logger.info(f'Copied serialized files to batch directory')
 
         # Build CLI arguments (secure list-based execution)
         cli_args = _build_cli_arguments(

@@ -127,12 +127,20 @@ def magic_to_as(file_format_name: str) -> str:
     return format_mapping.get(file_format_name, file_format_name)
 
 
-def get_kaltura_id_from_file(filename: str, serialized_file_path: str = 'serialized_files.json') -> Optional[str]:
+def get_kaltura_id_from_file(filename: str, serialized_file_path: str,
+                             package_name: Optional[str] = None) -> Optional[str]:
     """
     Retrieves Kaltura ID for a specific file from serialized JSON.
 
+    Entries are matched by exact filename. When both the entry and the
+    caller carry a package name, the packages must also match — this
+    prevents a file in one package from picking up the entry ID of an
+    identically named file in another package of the same batch.
+    Entries without a package (legacy callers) match on filename alone.
+
     @param filename: Name of file to look up
     @param serialized_file_path: Path to JSON file with Kaltura mappings
+    @param package_name: Package the file belongs to (optional)
     @return: Kaltura entry ID or None if not found
     """
     try:
@@ -145,17 +153,20 @@ def get_kaltura_id_from_file(filename: str, serialized_file_path: str = 'seriali
         with open(serialized_file_path, 'r') as json_file:
             json_data = json.load(json_file)
 
-            logger.debug(f'Loaded {len(json_data)} entries from serialized_files.json')
+            logger.debug(f'Loaded {len(json_data)} entries from serialized files JSON')
 
             for item in json_data:
-                item_file = item.get('file')
-                if filename == item_file:
-                    kaltura_id = item.get('entry_id')
-                    if kaltura_id:
-                        logger.info(f'Found Kaltura ID for {filename}: {kaltura_id}')
-                        return kaltura_id
-                    else:
-                        logger.warning(f'File {filename} found in mapping but entry_id is empty')
+                if filename != item.get('file'):
+                    continue
+                item_package = item.get('package')
+                if item_package and package_name and item_package != package_name:
+                    continue
+                kaltura_id = item.get('entry_id')
+                if kaltura_id:
+                    logger.info(f'Found Kaltura ID for {filename}: {kaltura_id}')
+                    return kaltura_id
+                else:
+                    logger.warning(f'File {filename} found in mapping but entry_id is empty')
 
         logger.warning(f'No Kaltura ID found for {filename} in {serialized_file_path}')
         return None
@@ -168,7 +179,8 @@ def get_kaltura_id_from_file(filename: str, serialized_file_path: str = 'seriali
         return None
 
 
-def process_files(ref: str, path: str, no_kaltura_id: bool, no_caption: bool, no_publish: bool):
+def process_files(ref: str, path: str, no_kaltura_id: bool, no_caption: bool,
+                  no_publish: bool, serialized_path: Optional[str] = None):
     """
     Processes files in directory and creates/updates digital object components.
 
@@ -177,6 +189,8 @@ def process_files(ref: str, path: str, no_kaltura_id: bool, no_caption: bool, no
     @param no_kaltura_id: Skip Kaltura ID attachment
     @param no_caption: Skip caption prompts
     @param no_publish: Do not publish components
+    @param serialized_path: Path to the Kaltura filename→entry-id JSON
+                            (None disables Kaltura ID attachment)
     """
     try:
         logger.info('Fetching digital object tree...')
@@ -202,7 +216,7 @@ def process_files(ref: str, path: str, no_kaltura_id: bool, no_caption: bool, no
         for file in files:
             _process_single_file(
                 file, path_obj, ref, tree,
-                no_kaltura_id, no_caption, no_publish
+                no_kaltura_id, no_caption, no_publish, serialized_path
             )
 
     except Exception as e:
@@ -217,7 +231,8 @@ def _process_single_file(
         tree: Dict,
         no_kaltura_id: bool,
         no_caption: bool,
-        no_publish: bool
+        no_publish: bool,
+        serialized_path: Optional[str] = None
 ):
     """
     Processes a single file to create or update digital object component.
@@ -229,6 +244,7 @@ def _process_single_file(
     @param no_kaltura_id: Skip Kaltura ID attachment
     @param no_caption: Skip caption prompts
     @param no_publish: Do not publish component
+    @param serialized_path: Path to the Kaltura filename→entry-id JSON
     """
     try:
         path_to_file = path_obj / filename
@@ -241,14 +257,16 @@ def _process_single_file(
         file_size = path_to_file.stat().st_size
         file_size_bytes = file_size if file_size < 2147483647 else ''
 
-        # Get Kaltura ID if applicable
-        # serialized_files.json is located in the same directory as the script (written by web.py)
+        # Kaltura IDs attach only when the caller supplied a mapping via
+        # --serialized_files. There is deliberately NO fallback location:
+        # the old implicit script-directory lookup meant every run read
+        # whatever stale mapping a previous run left behind, which could
+        # silently stamp a wrong entry ID on a filename collision.
         kaltura_id = None
-        if not no_kaltura_id:
-            script_dir = Path(__file__).parent.resolve()
-            serialized_path = str(script_dir / 'serialized_files.json')
-            logger.debug(f'Looking for serialized_files.json at: {serialized_path}')
-            kaltura_id = get_kaltura_id_from_file(filename, serialized_path)
+        if not no_kaltura_id and serialized_path:
+            kaltura_id = get_kaltura_id_from_file(
+                filename, serialized_path, package_name=path_obj.name
+            )
 
         # Check if file already exists in tree
         make_new = True
@@ -657,7 +675,7 @@ def as_log(message: str):
 
 
 def process_batch(base_path: Path, no_kaltura_id: bool, no_caption: bool,
-                  no_publish: bool):
+                  no_publish: bool, serialized_path: Optional[str] = None):
     """
     Processes every subdirectory of base_path, continuing past
     per-package failures.
@@ -682,7 +700,7 @@ def process_batch(base_path: Path, no_kaltura_id: bool, no_caption: bool,
     failures = []
     for subdir in subdirs:
         try:
-            process(subdir, no_kaltura_id, no_caption, no_publish)
+            process(subdir, no_kaltura_id, no_caption, no_publish, serialized_path)
         except Exception as e:
             logger.error(f'Failed to process {subdir.name}: {str(e)}')
             failures.append((subdir.name, str(e)))
@@ -708,7 +726,8 @@ def report_batch_failures(failures, total):
     as_log('Packages that already succeeded are unaffected and are re-checked on the next run.')
 
 
-def process(path: Path, no_kaltura_id: bool, no_caption: bool, no_publish: bool):
+def process(path: Path, no_kaltura_id: bool, no_caption: bool, no_publish: bool,
+            serialized_path: Optional[str] = None):
     """
     Main processing function for a single directory.
 
@@ -716,13 +735,14 @@ def process(path: Path, no_kaltura_id: bool, no_caption: bool, no_publish: bool)
     @param no_kaltura_id: Skip Kaltura ID attachment
     @param no_caption: Skip caption prompts
     @param no_publish: Do not publish components
+    @param serialized_path: Path to the Kaltura filename→entry-id JSON
     """
     try:
         logger.info(f'Processing: {path.name}')
 
         uri = check_uri_txt(path)
         ref = check_digital_object(uri)
-        process_files(ref, str(path), no_kaltura_id, no_caption, no_publish)
+        process_files(ref, str(path), no_kaltura_id, no_caption, no_publish, serialized_path)
 
         logger.info(f'Successfully processed: {path.name}')
 
@@ -785,6 +805,12 @@ def main():
             help='Do not attach Kaltura IDs to digital object components'
         )
         parser.add_argument(
+            '--serialized_files',
+            help='Path to a JSON file mapping filenames to Kaltura entry IDs '
+                 '([{"package": ..., "file": ..., "entry_id": ...}, ...]). '
+                 'Kaltura IDs are only attached when this is provided.'
+        )
+        parser.add_argument(
             '--no_caption',
             action='store_true',
             help='Do not prompt for captions (non-interactive mode)'
@@ -819,13 +845,27 @@ def main():
         AS = ASpace(baseurl=baseurl, username=args.user, password=args.password)
         logger.info('Successfully connected to ArchivesSpace')
 
+        # Resolve the Kaltura mapping file, if one was supplied. A missing
+        # file is a hard configuration error rather than a warning — the
+        # caller explicitly asked for Kaltura stamping, so continuing
+        # without it would silently produce components with no entry IDs
+        # (the exact failure this flag exists to prevent).
+        serialized_path = None
+        if args.serialized_files and not args.no_kaltura_id:
+            serialized_path = str(Path(args.serialized_files).resolve())
+            if not os.path.isfile(serialized_path):
+                raise ValueError(
+                    f'--serialized_files not found: {serialized_path}'
+                )
+
         # Process path(s)
         if args.batch:
             logger.info('Running in batch mode')
             base_path = get_path(args.path, config['WORKSPACE'])
 
             failures, total = process_batch(
-                base_path, args.no_kaltura_id, args.no_caption, args.no_publish
+                base_path, args.no_kaltura_id, args.no_caption, args.no_publish,
+                serialized_path
             )
             if failures:
                 # Per-package failures (duplicate component IDs,
@@ -842,7 +882,8 @@ def main():
                 sys.exit(2)
         else:
             path = get_path(args.path, config['WORKSPACE'])
-            process(path, args.no_kaltura_id, args.no_caption, args.no_publish)
+            process(path, args.no_kaltura_id, args.no_caption, args.no_publish,
+                    serialized_path)
 
         logger.info('Script completed successfully')
 
