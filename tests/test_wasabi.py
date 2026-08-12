@@ -16,6 +16,7 @@ the data-loss-bug fix in archivematica_ops.move_to_ingested (verified
 indirectly via the move_to_s3 shim's 0/1 contract).
 """
 
+import io
 import os
 import shutil
 import tempfile
@@ -63,6 +64,63 @@ class ParseBucketTest(unittest.TestCase):
             wasabi._parse_bucket('')
         with self.assertRaises(RuntimeError):
             wasabi._parse_bucket(None)
+
+
+class TransferConfigForTest(unittest.TestCase):
+    """
+    Part-size scaling for large streams (2026-08-05 incident: S3 allows
+    at most 10,000 multipart parts; boto3's default 8 MiB parts cap any
+    non-seekable upload at 80 GiB — part 10,001 is rejected with
+    InvalidArgument. boto3 auto-scales only for file uploads, where it
+    knows the size; our verified chunk stream must scale explicitly).
+    """
+
+    MIB = 1024 * 1024
+
+    def test_unknown_size_returns_none(self):
+        self.assertIsNone(wasabi._transfer_config_for(None))
+        self.assertIsNone(wasabi._transfer_config_for(0))
+
+    def test_small_sizes_keep_the_default_chunksize(self):
+        # 66.16 GB — the production AIP that fit in 7,888 default parts.
+        cfg = wasabi._transfer_config_for(66_163_797_416)
+        self.assertEqual(cfg.multipart_chunksize, 8 * self.MIB)
+
+    def test_100gb_scales_to_10mib_parts(self):
+        cfg = wasabi._transfer_config_for(100_000_000_000)
+        self.assertEqual(cfg.multipart_chunksize, 10 * self.MIB)
+
+    def test_part_count_stays_within_10000_across_size_sweep(self):
+        # 80 GiB (the old hard ceiling), 100 GB, 250 GB, 1 TB, 5 TB.
+        for size in (
+            85_899_345_920,
+            100_000_000_000,
+            250_000_000_000,
+            1_000_000_000_000,
+            5_000_000_000_000,
+        ):
+            cfg = wasabi._transfer_config_for(size)
+            chunk = cfg.multipart_chunksize
+            parts = -(-size // chunk)  # ceil division
+            self.assertLessEqual(parts, 10_000, f'size={size}')
+            self.assertEqual(chunk % self.MIB, 0, f'size={size}')
+
+    def test_upload_fileobj_passes_scaled_config_to_boto3(self):
+        captured = {}
+
+        class FakeClient:
+            def upload_fileobj(self, fileobj, bucket, key, Callback=None,
+                               Config=None):
+                captured['config'] = Config
+
+        with patch.object(wasabi, '_make_client', return_value=FakeClient()), \
+                patch.object(config, 'WASABI_BUCKET', 's3://bucket/'):
+            wasabi.upload_fileobj(
+                io.BytesIO(b'x'), 'k', expected_bytes=100_000_000_000
+            )
+        self.assertEqual(
+            captured['config'].multipart_chunksize, 10 * self.MIB
+        )
 
 
 class UploadDirectoryTest(unittest.TestCase):

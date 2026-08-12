@@ -29,6 +29,7 @@ import posixpath
 import time
 
 import boto3
+from boto3.s3.transfer import TransferConfig
 from botocore.config import Config
 from botocore.exceptions import (
     BotoCoreError,
@@ -385,6 +386,37 @@ def _resolve_bucket(bucket_config):
     return _parse_bucket(raw)
 
 
+# S3 protocol: a multipart upload may contain at most 10,000 parts. At
+# boto3's default 8 MiB multipart_chunksize that caps any single upload
+# at 80 GiB (~85.9 GB) — part 10,001 is rejected with InvalidArgument
+# ("Part number must be an integer between 1 and 10000"), hit in
+# production 2026-08-05 by AIPs bigger than the 66-75 GB ones that
+# squeaked under (7,888 / 8,991 parts). boto3 auto-scales the part size
+# for FILE uploads, where it knows the total size — but our verified
+# chunk stream is non-seekable, so it cannot adapt on its own. We DO
+# know the exact size (AM metadata / DuraCloud manifest), so scale the
+# part size ourselves.
+_S3_MAX_PARTS = 10_000
+_DEFAULT_CHUNKSIZE = 8 * 1024 * 1024
+_MIB = 1024 * 1024
+
+
+def _transfer_config_for(expected_bytes):
+    """
+    TransferConfig whose multipart_chunksize keeps `expected_bytes`
+    within S3's 10,000-part limit: ceil(size / 10,000), floored at the
+    8 MiB default, rounded up to a whole MiB (rounding up only ever
+    REDUCES the part count). None when the size is unknown — boto3's
+    defaults apply, same as before.
+    """
+    if not expected_bytes or expected_bytes <= 0:
+        return None
+    min_chunk = -(-int(expected_bytes) // _S3_MAX_PARTS)  # ceil division
+    chunksize = max(_DEFAULT_CHUNKSIZE, min_chunk)
+    chunksize = -(-chunksize // _MIB) * _MIB  # round up to whole MiB
+    return TransferConfig(multipart_chunksize=chunksize)
+
+
 def upload_fileobj(file_obj, key, expected_bytes=None, bucket_config=None,
                    progress_hook=None):
     """
@@ -430,11 +462,19 @@ def upload_fileobj(file_obj, key, expected_bytes=None, bucket_config=None,
         if expected_bytes else None
     )
 
+    transfer_config = _transfer_config_for(expected_bytes)
     logger.info(
-        'wasabi upload_fileobj START key=%s expected_bytes=%s',
+        'wasabi upload_fileobj START key=%s expected_bytes=%s chunksize=%s',
         full_key, expected_bytes,
+        transfer_config.multipart_chunksize if transfer_config else 'default',
     )
-    client.upload_fileobj(file_obj, bucket, full_key, Callback=callback)
+    if transfer_config is not None:
+        client.upload_fileobj(
+            file_obj, bucket, full_key,
+            Callback=callback, Config=transfer_config,
+        )
+    else:
+        client.upload_fileobj(file_obj, bucket, full_key, Callback=callback)
     logger.info('wasabi upload_fileobj END key=%s', full_key)
     return {
         'bucket': bucket,
