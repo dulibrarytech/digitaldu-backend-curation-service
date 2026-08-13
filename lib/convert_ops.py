@@ -73,6 +73,20 @@ class SourceNotFound(ConvertError):
     status = 404
 
 
+class UnreadableSource(ConvertError):
+    """
+    The fetched bytes cannot be decoded as an image. Almost always a
+    corrupt/truncated copy at rest in the dip-store, not a service
+    fault: B463.01.0007.0007.0037.00001.tif (2026-08-12) was stored as
+    a 103MB prefix of a 146MB TIFF and failed every retry as an
+    anonymous 500 until the bytes were pulled and diffed by hand. 422
+    so the repov2 queue records a per-source verdict, not a server
+    error.
+    """
+
+    status = 422
+
+
 class InsufficientStorage(ConvertError):
     status = 507
 
@@ -185,7 +199,23 @@ def fetch_tiff(full_path):
 
     if not data:
         raise ConvertError('dip-store returned an empty body for %s' % full_path)
+    if declared and len(data) != declared:
+        # A short body that urllib3 didn't reject: distinguish in-transit
+        # truncation from corruption at rest before anyone diffs bytes.
+        raise ConvertError(
+            'dip-store fetch truncated in transit for %s: received %d of '
+            '%d declared bytes — retry may succeed' % (full_path, len(data), declared)
+        )
     return data
+
+
+# Pillow's decode-side failures for damaged sources. Deliberately NOT a
+# bare Exception: MemoryError and friends are genuine server faults and
+# must keep surfacing as 500s. UnidentifiedImageError subclasses OSError;
+# ValueError covers tag-level damage ("Invalid dimensions" — the
+# truncated-at-upload signature, since these TIFFs keep their IFD at the
+# file tail); SyntaxError covers malformed headers.
+_DECODE_ERRORS = (OSError, ValueError, SyntaxError)
 
 
 def convert_to_jpeg(tiff_bytes):
@@ -193,14 +223,24 @@ def convert_to_jpeg(tiff_bytes):
     Decode a TIFF and return JPEG bytes at DERIVATIVE_JPEG_QUALITY.
     Non-RGB modes (CMYK scans, palette, greyscale+alpha) are normalized
     to RGB — JPEG has no alpha, and Pillow raises on some modes
-    otherwise.
+    otherwise. Undecodable bytes raise UnreadableSource (422): the
+    source object is damaged, and the queue error should say so instead
+    of a generic 500.
     """
     quality = int(getattr(config, 'DERIVATIVE_JPEG_QUALITY', 85) or 85)
-    with Image.open(io.BytesIO(tiff_bytes)) as image:
-        if image.mode not in ('RGB', 'L'):
-            image = image.convert('RGB')
-        out = io.BytesIO()
-        image.save(out, format='JPEG', quality=quality)
+    try:
+        with Image.open(io.BytesIO(tiff_bytes)) as image:
+            if image.mode not in ('RGB', 'L'):
+                image = image.convert('RGB')
+            out = io.BytesIO()
+            image.save(out, format='JPEG', quality=quality)
+    except _DECODE_ERRORS as error:
+        raise UnreadableSource(
+            'source TIFF is undecodable (%s: %s) — the dip-store copy is '
+            'likely corrupt or truncated; compare its size and checksum '
+            'against the original before requeueing'
+            % (type(error).__name__, error)
+        ) from error
     jpeg = out.getvalue()
     if not jpeg:
         raise ConvertError('conversion produced no output')

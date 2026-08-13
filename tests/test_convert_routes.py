@@ -143,13 +143,46 @@ def test_convert_source_over_cap_is_400(client, monkeypatch):
     assert response.status_code == 400
 
 
-def test_convert_corrupt_tiff_is_500_and_writes_nothing(client, tmp_path, monkeypatch):
+def test_convert_corrupt_tiff_is_422_and_writes_nothing(client, tmp_path, monkeypatch):
     monkeypatch.setattr(
         convert_ops.requests, 'get',
         lambda *a, **k: FakeResponse(data=b'this is not a tiff'),
     )
     response = client.post('/api/v1/convert/tiff', json=PAYLOAD, headers=AUTH)
+    assert response.status_code == 422
+    assert 'undecodable' in response.get_json()['message']
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_convert_truncated_tiff_is_422_naming_corruption(client, tmp_path, monkeypatch):
+    # The 2026-08-12 incident shape: a valid TIFF stored as a prefix of
+    # itself. The magic bytes survive, the directory does not.
+    truncated = tiny_tiff_bytes()[:20]
+    monkeypatch.setattr(
+        convert_ops.requests, 'get',
+        lambda *a, **k: FakeResponse(data=truncated),
+    )
+    response = client.post('/api/v1/convert/tiff', json=PAYLOAD, headers=AUTH)
+    assert response.status_code == 422
+    body = response.get_json()
+    assert body['error'] is True
+    assert 'corrupt or truncated' in body['message']
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_convert_short_fetch_is_500_naming_transit_truncation(client, tmp_path, monkeypatch):
+    # Body shorter than the declared content-length: in-transit loss,
+    # distinct from corruption at rest (worth a retry, so not 422).
+    data = tiny_tiff_bytes()
+    monkeypatch.setattr(
+        convert_ops.requests, 'get',
+        lambda *a, **k: FakeResponse(
+            data=data, headers={'content-length': str(len(data) + 10)},
+        ),
+    )
+    response = client.post('/api/v1/convert/tiff', json=PAYLOAD, headers=AUTH)
     assert response.status_code == 500
+    assert 'truncated in transit' in response.get_json()['message']
     assert list(tmp_path.iterdir()) == []
 
 
