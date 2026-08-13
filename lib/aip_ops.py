@@ -296,6 +296,14 @@ def copy_aip_to_wasabi(aip_uuid, repo_uuid):
     # Only UPLOADED is copyable; anything else is a temporary error the
     # caller's retry picks up on a later tick.
     am_status = (meta.get('status') or '').upper()
+    if am_status == 'DELETED':
+        # Terminal: AM says the AIP no longer exists — deleted via the
+        # Storage Service. No retry can ever succeed; the caller
+        # classifies this as permanently-decided (2026-08-11 backfill:
+        # a DELETED AIP burned retry budget as "will retry" forever).
+        out['elapsed_ms'] = int((time.monotonic() - started) * 1000)
+        out['error'] = 'AM status is DELETED — the AIP was deleted from Archivematica; skipping permanently'
+        return out
     if am_status and am_status != 'UPLOADED':
         out['elapsed_ms'] = int((time.monotonic() - started) * 1000)
         out['error'] = f'AM status is {am_status}, not UPLOADED — will retry'

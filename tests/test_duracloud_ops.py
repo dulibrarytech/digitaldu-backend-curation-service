@@ -127,6 +127,55 @@ class ManifestTests(unittest.TestCase):
             )
 
 
+class LegacyManifestTests(unittest.TestCase):
+    """
+    Older-generation manifests (2026-08-13 backfill incident, 35
+    failures: TypeError int(None)) differ from newer ones in three
+    ways: NO index attribute on <chunk>, chunkIds with a spurious
+    leading slash, and 1 GiB (not 1 GB) chunk sizes. The parser must
+    derive indices from the .dura-chunk-NNNN suffix and strip the
+    slash (which would 404 every chunk GET).
+    """
+
+    LEGACY = """<?xml version='1.0' encoding='UTF-8'?>
+<dur:chunksManifest xmlns:dur="duracloud.org">
+  <header schemaVersion="0.2">
+    <sourceContent contentId="/aip-store/x/y.7z">
+      <mimetype>application/octet-stream</mimetype>
+      <byteSize>1098435899</byteSize>
+      <md5>cf1e513e97ecfcb3aacd434250f4018c</md5>
+    </sourceContent>
+  </header>
+  <chunks>
+    <chunk chunkId="/aip-store/x/y.7z.dura-chunk-0001">
+      <byteSize>24694075</byteSize>
+      <md5>8458adb1625197abec3e2a0535710778</md5>
+    </chunk>
+    <chunk chunkId="/aip-store/x/y.7z.dura-chunk-0000">
+      <byteSize>1073741824</byteSize>
+      <md5>eed32840e8568199b6639eff57ba98dd</md5>
+    </chunk>
+  </chunks>
+</dur:chunksManifest>"""
+
+    def test_derives_indices_and_strips_leading_slash(self):
+        # Document order is deliberately REVERSED above — order must
+        # come from the suffix-derived indices, not the document.
+        parsed = dc.parse_manifest(self.LEGACY)
+        self.assertEqual(parsed['total_bytes'], 1_098_435_899)
+        self.assertEqual(
+            [c['chunk_id'] for c in parsed['chunks']],
+            ['aip-store/x/y.7z.dura-chunk-0000', 'aip-store/x/y.7z.dura-chunk-0001'],
+        )
+        self.assertEqual([c['index'] for c in parsed['chunks']], [0, 1])
+        self.assertEqual(parsed['chunks'][0]['bytes'], 1_073_741_824)
+
+    def test_chunk_with_no_index_and_no_suffix_is_a_parse_error(self):
+        broken = self.LEGACY.replace('.dura-chunk-0000', '.dura-chunk-zz')
+        with self.assertRaises(ValueError):
+            dc.parse_manifest(broken)
+
+
 class ChunkStreamReaderTests(unittest.TestCase):
     def _reader(self, chunk_payloads, tamper=None):
         payloads = {f'c-{i}': p for i, p in enumerate(chunk_payloads)}

@@ -102,6 +102,25 @@ class LargeAipRoutingTests(unittest.TestCase):
         head.assert_called_once()
         self.assertTrue(result['ok'])
 
+    def test_deleted_am_status_is_terminal_not_retry(self):
+        class DeletedMeta:
+            status_code = 200
+
+            @staticmethod
+            def json():
+                return {
+                    'status': 'DELETED',
+                    'size': 123,
+                    'current_path': f'/store/x_{UUID}.7z',
+                }
+
+        with patch.object(aip_ops.requests, 'get', return_value=DeletedMeta()):
+            result = aip_ops.copy_aip_to_wasabi(UUID, 'pid-1')
+        self.assertFalse(result['ok'])
+        self.assertIn('DELETED', result['error'])
+        self.assertIn('skipping permanently', result['error'])
+        self.assertNotIn('will retry', result['error'])
+
     def test_config_default_is_one_gb(self):
         self.assertEqual(config.AIP_DURACLOUD_THRESHOLD_BYTES, 1_000_000_000)
 

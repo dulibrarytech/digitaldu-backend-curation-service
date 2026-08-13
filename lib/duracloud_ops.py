@@ -52,6 +52,7 @@ of which source served the bytes.
 
 import hashlib
 import logging
+import re
 import tempfile
 import time
 import xml.etree.ElementTree as ET
@@ -109,6 +110,28 @@ def content_id_for(aip_uuid, basename):
     return f'aip-store/{pairs}/{basename}'
 
 
+def _chunk_index(chunk_id, raw_index):
+    """
+    Reassembly index for one manifest chunk. TWO manifest generations
+    exist in aip-store (2026-08-13 backfill incident, 35 failures):
+    newer ones carry an `index` attribute on each <chunk>; older ones
+    (different replication-tool vintage — also leading-slash chunkIds
+    and 1 GiB rather than 1 GB chunks) have NO index attribute, so it
+    is derived from the chunkId's `.dura-chunk-NNNN` suffix — the
+    DuraCloud chunking naming contract. Raises ValueError when neither
+    is available (surfaces as 'manifest unparseable', retryable).
+    """
+    if raw_index is not None:
+        return int(raw_index)
+    m = re.search(r'\.dura-chunk-(\d+)$', chunk_id or '')
+    if m:
+        return int(m.group(1))
+    raise ValueError(
+        f'chunk has neither an index attribute nor a numeric '
+        f'.dura-chunk suffix: {chunk_id!r}'
+    )
+
+
 def parse_manifest(xml_text):
     """
     Parse a dur:chunksManifest into:
@@ -139,9 +162,13 @@ def parse_manifest(xml_text):
     md5 = (source.findtext('md5') or '').strip().lower()
     chunks = []
     for chunk in root.findall('.//chunk'):
+        # Older-generation chunkIds carry a spurious leading slash
+        # that is NOT part of the stored item id — strip it or every
+        # chunk GET 404s.
+        chunk_id = (chunk.get('chunkId') or '').lstrip('/')
         chunks.append({
-            'index': int(chunk.get('index')),
-            'chunk_id': chunk.get('chunkId'),
+            'index': _chunk_index(chunk_id, chunk.get('index')),
+            'chunk_id': chunk_id,
             'bytes': _int_text(chunk, 'byteSize'),
             'md5': (chunk.findtext('md5') or '').strip().lower(),
         })
