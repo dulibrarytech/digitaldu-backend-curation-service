@@ -58,9 +58,9 @@ _MARKER_STALE_S = 30 * 60
 
 def _ttl_seconds():
     try:
-        return int(os.getenv('WASABI_USAGE_TTL_SECONDS', '21600'))  # 6h
+        return int(os.getenv('WASABI_USAGE_TTL_SECONDS', '86400'))  # 24h
     except ValueError:
-        return 21600
+        return 86400
 
 
 def _targets():
