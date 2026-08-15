@@ -66,6 +66,7 @@ from auth import require_api_key_qa
 from lib import wasabi
 from lib import aip_ops
 from lib import duracloud_ops
+from lib import storage_usage
 
 logger = logging.getLogger(__name__)
 
@@ -154,6 +155,28 @@ def copy_from_duracloud():
         }), 200
 
     return jsonify(result), 200
+
+
+@aip_bp.route('/bucket-usage', methods=['GET'])
+@require_api_key_qa
+def bucket_usage():
+    """
+    Cached storage-utilization readout for both Wasabi buckets
+    (batch backups + AIP store). Serves the cache instantly; when the
+    cache is missing or older than WASABI_USAGE_TTL_SECONDS (6h
+    default) a background recompute starts and `computing: true`
+    tells the caller to poll. Completed objects only — multipart
+    debris is invisible to listings (see lib/storage_usage.py).
+    """
+    return jsonify({'ok': True, **storage_usage.get_usage()}), 200
+
+
+@aip_bp.route('/bucket-usage/refresh', methods=['POST'])
+@require_api_key_qa
+def bucket_usage_refresh():
+    """Force a background recompute regardless of cache freshness."""
+    storage_usage.trigger_recompute(force=True)
+    return jsonify({'ok': True, **storage_usage.get_usage()}), 200
 
 
 @aip_bp.route('/copy-progress/<aip_uuid>', methods=['GET'])
