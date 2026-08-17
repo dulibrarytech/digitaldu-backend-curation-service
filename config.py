@@ -18,8 +18,6 @@ Central configuration for the curation API.
 All env vars are loaded once at module import and exposed as module-level
 attributes. Route handlers additionally re-check the env vars they need,
 so a deployment gap surfaces per endpoint as well as at startup.
-
-Design history and rationale: repo/notes/CURATION_API_CODE_NOTES.md
 """
 
 import os
@@ -47,10 +45,10 @@ SFTP_PWD = os.getenv('SFTP_PWD')
 SFTP_REMOTE_PATH = os.getenv('SFTP_REMOTE_PATH')
 WASABI_ENDPOINT = os.getenv('WASABI_ENDPOINT')
 WASABI_BUCKET = os.getenv('WASABI_BUCKET')
-# DU's deployment uses TWO Wasabi buckets:
+# Deployment uses TWO Wasabi buckets:
 #   WASABI_BUCKET     → batch archive (move_to_ingested writes here)
 #   WASABI_AIP_BUCKET → AM-produced AIP packages (Stage 6 writes here),
-#                       conventionally s3://library-repository/aip-store/
+#                       conventionally s3://bucket/aip-store/
 # WASABI_AIP_BUCKET is REQUIRED by /api/v2/aip/*; unset, those routes
 # refuse with ok=false rather than writing AIPs to the batch bucket.
 WASABI_AIP_BUCKET = os.getenv('WASABI_AIP_BUCKET')
@@ -91,8 +89,7 @@ except ValueError:
 
 # --- DuraCloud (AIP-copy failover source) -----------------------------------
 # AM replicates every AIP to DuraCloud's aip-store space; when AM's own
-# /download/ endpoint can't serve a large AIP (observed 2026-07-31:
-# silent hangs, then 502s at 66-75 GB), lib/duracloud_ops.py copies the
+# /download/ endpoint can't serve a large AIP, lib/duracloud_ops.py copies the
 # AIP to Wasabi FROM DuraCloud instead. Conventionally the same three
 # values as repo-backend-v2's DURACLOUD_* env. Optional — when unset,
 # only the /aip/copy-from-duracloud route refuses; the AM path is
@@ -102,7 +99,7 @@ DURACLOUD_USER = os.getenv('DURACLOUD_USER')
 DURACLOUD_PWD = os.getenv('DURACLOUD_PWD')
 
 # AIPs at or above this size are copied FROM DURACLOUD BY DEFAULT
-# (Artefactual's recommendation, 2026-08-03: download large AIPs
+# (Artefactual's recommendation: download large AIPs
 # directly from DuraCloud — the Storage Service /download/ path is not
 # suited to them; it hung, then 502'd, at 66-75 GB). Default 1 GB —
 # the same threshold at which DuraCloud chunks content, so "large"
