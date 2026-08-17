@@ -15,12 +15,6 @@
 """
 Derivative conversion + serving routes.
 
-Wire-compatible with the libspec02 Node convert service so
-repo-backend-v2's convert worker and its verification pass need only a
-CONVERT_SERVICE URL change (the client derives the verify URL by
-rewriting .../convert/tiff -> .../image — these paths preserve that).
-See repo/DERIVATIVE_PIPELINE_PLAN.md.
-
     POST /api/v1/convert/tiff
         Body {sip_uuid, full_path, object_name, mime_type}.
         SYNCHRONOUS — the response reports the real outcome (200 with

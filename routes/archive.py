@@ -47,8 +47,6 @@ here, so no request through this surface can mutate the archive.
         transit repo-backend-v2 or this service.
 
 Auth: shared X-API-Key (same scheme as /api/v2/qa/).
-
-Design history and rationale: repo/notes/CURATION_API_CODE_NOTES.md
 """
 
 import logging

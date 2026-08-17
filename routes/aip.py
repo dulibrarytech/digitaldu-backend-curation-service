@@ -50,8 +50,6 @@ Endpoints:
         scripts/backfill_aip_sizes.js.
 
 Auth: shared X-API-Key (same scheme as /api/v2/qa/).
-
-Design history and rationale: repo/notes/CURATION_API_CODE_NOTES.md
 """
 
 import logging

@@ -21,8 +21,6 @@ runner. Its helpers (`_validate_*`, `_build_cli_arguments`,
 
 CONTRACT: the /api/v1/astools/ prefix and the {result, errors} envelope
 are consumed as-is by the ingest service.
-
-Design history and rationale: repo/notes/CURATION_API_CODE_NOTES.md
 """
 
 import json

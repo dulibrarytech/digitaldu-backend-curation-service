@@ -20,8 +20,6 @@ Ready-stage QA checks and the staging moves the ingest service drives.
 CONTRACT: the /api/v2/qa/ prefix and every response shape below are
 consumed as-is by the ingest service — changing either is a breaking
 change for that caller.
-
-Design history and rationale: repo/notes/CURATION_API_CODE_NOTES.md
 """
 
 import json
@@ -264,9 +262,9 @@ def move_to_sftp():
 @qa_bp.route('/cancel-upload', methods=['GET'])
 @require_api_key_qa
 def cancel_upload():
-    """Ask the in-flight background put for `uuid` to stop (2026-07-30:
+    """Ask the in-flight background put for `uuid` to stop:
     'Halt entire batch' cancelled queue rows but the daemon-thread puts
-    kept uploading). Best-effort + idempotent — see
+    kept uploading. Best-effort + idempotent — see
     ops.request_upload_cancel."""
     uuid = request.args.get('uuid')
     if uuid is None:
