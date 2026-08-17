@@ -39,7 +39,7 @@ debris from accumulating, two ways:
       S3-compatible endpoint regardless of lifecycle support, so it is
       the fallback when --set-lifecycle is rejected. Cron shape:
 
-        17 3 * * * cd /library/lib-sftp/digitaldu-backend-curation-service \
+        17 3 * * * cd /path/digitaldu-backend-curation-service \
             && .venv/bin/python scripts/abort_stale_multipart_uploads.py \
                --target both --apply >> /var/log/curation-api/multipart-hygiene.log 2>&1
 

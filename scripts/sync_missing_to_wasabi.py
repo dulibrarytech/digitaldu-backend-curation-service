@@ -45,10 +45,10 @@ Usage (on the curation host, service env loaded):
     set -a; source /etc/curation-api/env; set +a
     # See the plan first:
     .venv/bin/python scripts/sync_missing_to_wasabi.py \
-        --from-summary /root/reconcile-2026-07-26/reconcile-summary-<ts>.csv
+        --from-summary /root/reconcile/reconcile-summary-<ts>.csv
     # Then do it:
     .venv/bin/python scripts/sync_missing_to_wasabi.py \
-        --from-summary /root/reconcile-2026-07-26/reconcile-summary-<ts>.csv \
+        --from-summary /root/reconcile/reconcile-summary-<ts>.csv \
         --execute
 
 Exit codes: 0 = nothing left to do / all uploads verified;
