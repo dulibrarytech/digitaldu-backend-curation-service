@@ -290,9 +290,9 @@ def check_uri_txt(folder):
     The function will automatically prepend WORKSPACE environment variable.
 
     Example:
-        WORKSPACE = '/jetbrains/PycharmProjects/storage/001-ready/'
+        WORKSPACE = '/storage/001-ready/'
         folder = 'batch1'  ← Just the folder name, NOT the full path
-        Result: Checks /jetbrains/PycharmProjects/storage/001-ready/batch1/
+        Result: Checks /storage/001-ready/batch1/
 
     @param folder: Folder name relative to WORKSPACE environment variable
     @return: Dictionary with 'result' message and 'errors' list

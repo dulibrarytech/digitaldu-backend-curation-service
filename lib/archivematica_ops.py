@@ -18,8 +18,6 @@ Archivematica staging operations.
 Ready-stage QA checks, the local staging moves (001-ready -> 002-ingest
 -> Wasabi), the paramiko SFTP transfer to the Archivematica staging
 host, and the per-uuid lock that serializes moves for one collection.
-
-Design history and rationale: repo/notes/CURATION_API_CODE_NOTES.md
 """
 
 import fcntl
@@ -1386,7 +1384,7 @@ def move_to_ingested(uuid, folder):
     the sole batch-snapshot custodian (preservation redundancy lives in the
     AIP chain: Wasabi aip-store + DuraCloud + AM storage).
 
-    INVARIANT: the staging copy is removed ONLY after a per-file verified
+    The staging copy is removed ONLY after a per-file verified
     upload (head_object size check in wasabi.upload_directory). On any S3
     failure the source is left in place and the caller records a FAILED
     archive_to_wasabi job; re-running the archive is the remedy.
@@ -1435,10 +1433,7 @@ def reset_permissions(folder):
 
     Recursively sets the group to GID (the shared staff group, e.g.
     `domain users`) and grants group rwX. The owner is deliberately left
-    untouched: batches are created by different individual staff accounts,
-    so the pre-2026-08 `chown -R UID:GID` here flattened every batch to
-    one fixed owner (and with the template placeholder 1001:1001, to an
-    id that maps to no account at all). UID is no longer read.
+    untouched: batches are created by different individual staff accounts.
 
     Privilege note: chgrp on files the service user does not own needs
     CAP_CHOWN; on its own files it needs membership in GID (e.g.

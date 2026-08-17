@@ -43,7 +43,6 @@ Naming:
   JOIN depends on. The bucket-level prefix, if any, is applied by
   lib.wasabi from the bucket env value.
 
-Design history and rationale: repo/notes/CURATION_API_CODE_NOTES.md
 """
 
 import json
@@ -229,7 +228,7 @@ def copy_aip_to_wasabi(aip_uuid, repo_uuid):
         out['elapsed_ms'] = int((time.monotonic() - started) * 1000)
         out['error'] = (
             'WASABI_AIP_BUCKET is not configured. Set it in the curation '
-            'service .env (e.g. s3://library-repository/aip-store/) and '
+            'service .env (e.g. s3://bucket/aip-store/) and '
             'restart before running Stage 6 / the backfill.'
         )
         logger.error(
@@ -299,8 +298,7 @@ def copy_aip_to_wasabi(aip_uuid, repo_uuid):
     if am_status == 'DELETED':
         # Terminal: AM says the AIP no longer exists — deleted via the
         # Storage Service. No retry can ever succeed; the caller
-        # classifies this as permanently-decided (2026-08-11 backfill:
-        # a DELETED AIP burned retry budget as "will retry" forever).
+        # classifies this as permanently-decided
         out['elapsed_ms'] = int((time.monotonic() - started) * 1000)
         out['error'] = 'AM status is DELETED — the AIP was deleted from Archivematica; skipping permanently'
         return out
@@ -322,12 +320,9 @@ def copy_aip_to_wasabi(aip_uuid, repo_uuid):
         return out
 
     # --- Large-AIP routing: DuraCloud is the DEFAULT source ------------
-    # Artefactual's recommendation (2026-08-03) after the SS /download/
-    # path hung and then 502'd on 66-75 GB AIPs: retrieve large AIPs
-    # directly from DuraCloud. Routing here (rather than in the caller)
-    # means EVERY consumer of this function — Stage 6, the backfill
+    # Routing here means EVERY consumer of this function — Stage 6, the backfill
     # tool, dashboard retries — inherits the policy. The DuraCloud copy
-    # is also the stronger path: chunk + whole-file MD5 verification
+    # is the stronger path: chunk + whole-file MD5 verification
     # against the .dura-manifest vs the AM path's size-only check.
     # A not-yet-replicated AIP surfaces as a retryable "not found in
     # DuraCloud" error — the caller's retry budget covers replication
@@ -420,7 +415,7 @@ def copy_aip_to_wasabi(aip_uuid, repo_uuid):
         with requests.get(
             _am_download_url(aip_uuid),
             # identity: raw reads must see entity bytes, not a
-            # negotiated gzip stream (see duracloud_ops 2026-08-02).
+            # negotiated gzip stream
             headers={**_am_storage_auth_header(),
                      'Accept-Encoding': 'identity'},
             stream=True,

@@ -15,12 +15,7 @@
 """
 TIFF -> JPG derivative generation against the DuraCloud dip-store.
 
-Replaces the libspec02 Node convert service (see
-repo/DERIVATIVE_PIPELINE_PLAN.md). Every guard here exists because its
-absence shipped broken derivatives on 2026-08-04:
-
-  - synchronous, truthful results (the Node service ACKed 202 before
-    converting, so a full disk reported success for a day)
+  - synchronous, truthful results
   - free-space preflight BEFORE accepting work (InsufficientStorage ->
     HTTP 507 at the route layer)
   - atomic writes: temp file + rename, size-verified, temp removed on
@@ -32,7 +27,7 @@ reason) but is deliberately separate: duracloud_ops speaks the
 aip-store space, derivatives come from dip-store, whose content ids
 carry a leading 'dip-store/' segment (URL =
 /durastore/dip-store/dip-store/<path> — verified against the live
-store 2026-08-04).
+store).
 """
 
 import io
@@ -77,9 +72,7 @@ class UnreadableSource(ConvertError):
     """
     The fetched bytes cannot be decoded as an image. Almost always a
     corrupt/truncated copy at rest in the dip-store, not a service
-    fault: B463.01.0007.0007.0037.00001.tif (2026-08-12) was stored as
-    a 103MB prefix of a 146MB TIFF and failed every retry as an
-    anonymous 500 until the bytes were pulled and diffed by hand. 422
+    fault: 422
     so the repov2 queue records a per-source verdict, not a server
     error.
     """

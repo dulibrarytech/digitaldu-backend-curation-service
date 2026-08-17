@@ -19,8 +19,6 @@ Directory and stream uploads, presigned GETs, and the read-only listing
 helpers the archive-browser routes use. Auth comes from
 AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY or WASABI_PROFILE, against
 WASABI_ENDPOINT / WASABI_BUCKET.
-
-Design history and rationale: repo/notes/CURATION_API_CODE_NOTES.md
 """
 
 import logging

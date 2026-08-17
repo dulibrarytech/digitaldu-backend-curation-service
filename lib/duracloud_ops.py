@@ -17,10 +17,9 @@ AIP-copy failover source: DuraCloud aip-store → Wasabi.
 
 Archivematica replicates every AIP to DuraCloud's `aip-store` space.
 When AM Storage Service's own /download/ endpoint cannot serve a large
-AIP (observed 2026-07-31: silent hangs, then 502s at 66-75 GB), this
-module copies the SAME bytes to Wasabi from DuraCloud instead.
+AIP, this module copies the SAME bytes to Wasabi from DuraCloud instead.
 
-Layout facts (verified live against durastore, 2026-08-01):
+Layout facts:
 
   - contentId = `aip-store/<uuid-pairs-of-AIP-uuid>/<basename>` where
     <basename> is exactly the Wasabi key the AM path derives from AM's
@@ -154,7 +153,7 @@ def parse_manifest(xml_text):
 
     # Only the ROOT element lives in the dur: namespace in real
     # manifests — every child (header/sourceContent/byteSize/chunk/…)
-    # is unqualified. Verified against a live dura-manifest 2026-08-01.
+    # is unqualified.
     source = root.find('.//sourceContent')
     if source is None:
         raise ValueError('manifest has no sourceContent')
@@ -191,8 +190,7 @@ class ChunkStreamReader:
     File-like reader that serves DuraCloud chunks as one continuous,
     VERIFIED byte stream.
 
-    Verify-before-forward (2026-08-02, production incident): each chunk
-    is first downloaded in full to an anonymous temp spool file, its
+    Each chunk is first downloaded in full to an anonymous temp spool file, its
     byte count and manifest MD5 are verified, and only then are its
     bytes served onward to boto3's upload_fileobj. A chunk that arrives
     corrupt (observed live: correct size, wrong MD5 — an upstream
@@ -203,8 +201,7 @@ class ChunkStreamReader:
 
     Silent truncation is handled INSIDE each download: urllib3 1.x does
     not enforce Content-Length on raw reads, so a connection cut mid-
-    chunk looks like a clean EOF (observed live: 999,876,870 of
-    1,000,000,000 bytes). A short stream resumes via HTTP Range from
+    chunk looks like a clean EOF. A short stream resumes via HTTP Range from
     the exact offset (DuraCloud serves 206), up to `max_resumes` times
     per download attempt.
 
@@ -239,8 +236,7 @@ class ChunkStreamReader:
         verification.
 
         Filling the full `size` ACROSS chunk boundaries is load-bearing
-        (2026-08-02, EntityTooSmall at 99%): s3transfer builds each S3
-        part from a SINGLE read() call and treats a short return as a
+        s3transfer builds each S3 part from a SINGLE read() call and treats a short return as a
         complete part — and S3 requires every part except the last to
         be >= 5 MiB, validated only at CompleteMultipartUpload. A
         reader that returns short at each 1 GB chunk boundary hands
@@ -409,10 +405,8 @@ def _open_dc_stream(content_id, offset=0):
     # Accept-Encoding: identity is LOAD-BEARING. requests defaults to
     # advertising gzip, and DuraCloud's Apache obliges — our raw reads
     # then consume the COMPRESSED stream: ~0.012% short of the manifest
-    # size for incompressible .7z chunks (the "truncation" incident),
-    # and a Range resume splices an identity tail onto a gzip prefix
-    # that can sum to EXACTLY the manifest size with a wrong MD5 (the
-    # corruption incidents, 2026-08-02). Identity keeps wire bytes ==
+    # size for incompressible .7z chunks, and a Range resume splices an identity tail onto a gzip prefix
+    # that can sum to EXACTLY the manifest size with a wrong MD5. Identity keeps wire bytes ==
     # entity bytes, which also makes Range offsets byte-exact.
     headers = {'Accept-Encoding': 'identity'}
     if offset > 0:

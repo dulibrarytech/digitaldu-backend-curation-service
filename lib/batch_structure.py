@@ -60,8 +60,6 @@ Flag codes (severity in parentheses):
 
 The server reports codes + raw items only. Staff-facing wording lives in
 the dashboard views (repo-backend-v2), which own tone and language.
-
-Design history and rationale: repo/notes/CURATION_API_CODE_NOTES.md
 """
 
 import logging
