@@ -387,9 +387,7 @@ def _resolve_bucket(bucket_config):
 # S3 protocol: a multipart upload may contain at most 10,000 parts. At
 # boto3's default 8 MiB multipart_chunksize that caps any single upload
 # at 80 GiB (~85.9 GB) — part 10,001 is rejected with InvalidArgument
-# ("Part number must be an integer between 1 and 10000"), hit in
-# production 2026-08-05 by AIPs bigger than the 66-75 GB ones that
-# squeaked under (7,888 / 8,991 parts). boto3 auto-scales the part size
+# ("Part number must be an integer between 1 and 10000"). boto3 auto-scales the part size
 # for FILE uploads, where it knows the total size — but our verified
 # chunk stream is non-seekable, so it cannot adapt on its own. We DO
 # know the exact size (AM metadata / DuraCloud manifest), so scale the

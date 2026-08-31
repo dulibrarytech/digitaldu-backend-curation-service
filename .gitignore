@@ -14,3 +14,4 @@ htmlcov/
 *.egg-info/
 # Ignore files containing '.orig' in the name
 *.orig*
+.idea/
