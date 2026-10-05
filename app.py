@@ -17,12 +17,13 @@ DigitalDU Curation API — entry point.
 """
 
 import logging
+import threading
 
 from flask import Flask
 from flask_cors import CORS
 
 import config
-from lib import wasabi
+from lib import dcp, wasabi
 from routes.qa import qa_bp
 from routes.astools import astools_bp
 from routes.aip import aip_bp
@@ -43,6 +44,11 @@ def create_app():
     # the SFTP and local-fs endpoints work without Wasabi. Look for
     # `wasabi probe OK` in journald to confirm cred + bucket auth on boot.
     _probe_wasabi_at_startup()
+    # DuraCloud Preserve probe: logged only, and run on a daemon thread so
+    # an unreachable DCP can't delay any gunicorn worker's boot.
+    threading.Thread(
+        target=_probe_dcp_at_startup, name='dcp-startup-probe', daemon=True,
+    ).start()
 
     app = Flask(__name__)
     CORS(app, resources={r'/api/*': {'origins': '*'}})
@@ -73,6 +79,16 @@ def create_app():
         result = wasabi.health_check()
         return result, 200
 
+    @app.route('/health/dcp')
+    def dcp_health():
+        """
+        On-demand DuraCloud Preserve probe: lists one key under each
+        configured DCP location with the DCP credential. Same contract as
+        /health/wasabi: always 200, and the JSON body's `ok` field is the
+        success signal.
+        """
+        return dcp.health_check(), 200
+
     return app
 
 
@@ -100,6 +116,36 @@ def _probe_wasabi_at_startup():
         # Belt-and-braces; health_check itself is supposed to catch
         # everything but we don't want a regression there to block boot.
         logger.warning('wasabi probe threw unexpectedly: %s', e)
+
+
+def _probe_dcp_at_startup():
+    """
+    Log the DuraCloud Preserve probe once at startup. Skipped quietly when
+    DCP isn't configured. Look for `dcp probe OK` in journald to confirm
+    the DCP credential, region and locations on boot.
+    """
+    try:
+        if not dcp.is_configured():
+            logger.info('dcp probe skipped: not configured')
+            return
+        result = dcp.health_check()
+        summary = ', '.join(
+            '%s=%s' % (loc['name'], 'ok' if loc['ok'] else loc['error'])
+            for loc in result['locations']
+        ) or result.get('error')
+        if result['ok']:
+            logger.info(
+                'dcp probe OK %s elapsed_ms=%d',
+                summary, result.get('elapsed_ms', 0),
+            )
+        else:
+            logger.warning(
+                'dcp probe FAILED %s elapsed_ms=%d',
+                summary, result.get('elapsed_ms', 0),
+            )
+    except Exception as e:  # noqa: BLE001
+        # Same belt-and-braces as the Wasabi probe: never break boot.
+        logger.warning('dcp probe threw unexpectedly: %s', e)
 
 
 app = create_app()

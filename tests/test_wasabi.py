@@ -318,9 +318,70 @@ class MakeClientCredentialResolutionTest(unittest.TestCase):
         # Default to a sensible client return so chained .client(...)
         # in _make_client doesn't AttributeError.
         self.boto3_mock.Session.return_value.client.return_value = MagicMock()
+        # Start with no WASABI_* key pair, whatever the host env holds, so
+        # the AWS_* tests below stay pinned; the WASABI_* tests set them.
+        self.wasabi_keys_patcher = patch.multiple(
+            config,
+            WASABI_ACCESS_KEY_ID=None,
+            WASABI_SECRET_ACCESS_KEY=None,
+            WASABI_REGION=None,
+        )
+        self.wasabi_keys_patcher.start()
 
     def tearDown(self):
+        self.wasabi_keys_patcher.stop()
         self.session_patcher.stop()
+
+    def test_prefers_wasabi_named_keys_over_generic_aws_names(self):
+        with patch.multiple(
+            config,
+            WASABI_ACCESS_KEY_ID='wk',
+            WASABI_SECRET_ACCESS_KEY='ws',
+            WASABI_REGION='us-west-1',
+            AWS_ACCESS_KEY_ID='ak',
+            AWS_SECRET_ACCESS_KEY='sk',
+            AWS_DEFAULT_REGION='us-east-1',
+        ):
+            wasabi._make_client()
+        call_kwargs = self.boto3_mock.Session.call_args.kwargs
+        self.assertEqual(call_kwargs.get('aws_access_key_id'), 'wk')
+        self.assertEqual(call_kwargs.get('aws_secret_access_key'), 'ws')
+        self.assertEqual(call_kwargs.get('region_name'), 'us-west-1')
+        self.assertNotIn('profile_name', call_kwargs)
+
+    def test_wasabi_keys_take_aws_default_region_when_wasabi_region_unset(self):
+        with patch.multiple(
+            config,
+            WASABI_ACCESS_KEY_ID='wk',
+            WASABI_SECRET_ACCESS_KEY='ws',
+            AWS_DEFAULT_REGION='us-west-1',
+        ):
+            wasabi._make_client()
+        call_kwargs = self.boto3_mock.Session.call_args.kwargs
+        self.assertEqual(call_kwargs.get('aws_access_key_id'), 'wk')
+        self.assertEqual(call_kwargs.get('region_name'), 'us-west-1')
+
+    def test_half_set_wasabi_pair_falls_back_to_the_whole_aws_pair(self):
+        # Never an id from one family and a secret from the other.
+        with patch.multiple(
+            config,
+            WASABI_ACCESS_KEY_ID='wk',
+            WASABI_SECRET_ACCESS_KEY='',
+            AWS_ACCESS_KEY_ID='ak',
+            AWS_SECRET_ACCESS_KEY='sk',
+        ):
+            wasabi._make_client()
+        call_kwargs = self.boto3_mock.Session.call_args.kwargs
+        self.assertEqual(call_kwargs.get('aws_access_key_id'), 'ak')
+        self.assertEqual(call_kwargs.get('aws_secret_access_key'), 'sk')
+
+    def test_missing_credentials_error_names_the_wasabi_settings(self):
+        with patch.object(config, 'AWS_ACCESS_KEY_ID', ''), \
+             patch.object(config, 'AWS_SECRET_ACCESS_KEY', ''), \
+             patch.object(config, 'WASABI_PROFILE', ''):
+            with self.assertRaises(RuntimeError) as ctx:
+                wasabi._make_client()
+        self.assertIn('WASABI_ACCESS_KEY_ID', str(ctx.exception))
 
     def test_prefers_env_credentials_over_profile(self):
         # Both env keys AND a profile are set — env keys should win.

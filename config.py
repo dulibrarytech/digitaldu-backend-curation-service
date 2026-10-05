@@ -64,6 +64,15 @@ AWS_ACCESS_KEY_ID = os.getenv('AWS_ACCESS_KEY_ID')
 AWS_SECRET_ACCESS_KEY = os.getenv('AWS_SECRET_ACCESS_KEY')
 AWS_DEFAULT_REGION = os.getenv('AWS_DEFAULT_REGION')
 
+# --- Wasabi credentials (role-named) -----------------------------------------
+# Preferred over the generic AWS_* names above, which lib/wasabi.py still
+# reads as a fallback for one release so a host can switch without a
+# coordinated cutover. The generic names become ambiguous once DuraCloud
+# Preserve (real AWS) credentials live in the same process.
+WASABI_ACCESS_KEY_ID = os.getenv('WASABI_ACCESS_KEY_ID')
+WASABI_SECRET_ACCESS_KEY = os.getenv('WASABI_SECRET_ACCESS_KEY')
+WASABI_REGION = os.getenv('WASABI_REGION')
+
 # --- Archivematica Storage Service (AIP retrieval) ---------------------------
 # Used by lib/aip_ops.py to fetch AM-produced AIPs and pipe them to Wasabi.
 # Auth scheme is the AM Storage Service's ApiKey header:
@@ -97,6 +106,24 @@ except ValueError:
 DURACLOUD_API = os.getenv('DURACLOUD_API')
 DURACLOUD_USER = os.getenv('DURACLOUD_USER')
 DURACLOUD_PWD = os.getenv('DURACLOUD_PWD')
+
+# --- DuraCloud Preserve (AWS S3) --------------------------------------------
+# Lyrasis replaced the DuraCloud REST API with plain AWS S3; lib/dcp.py
+# builds the client. Explicit keys and region only — never boto3's
+# default credential chain. Optional: unset = /health/dcp reports "not
+# configured", and nothing else reads DCP yet.
+DCP_ACCESS_KEY_ID = os.getenv('DCP_ACCESS_KEY_ID')
+DCP_SECRET_ACCESS_KEY = os.getenv('DCP_SECRET_ACCESS_KEY')
+# us-east-1 for DU's stack. Set it explicitly: DCP grants
+# GetBucketLocation only temporarily, so the region can't be discovered.
+DCP_REGION = os.getenv('DCP_REGION')
+# Optional endpoint override, e.g. a local MinIO for tests. Blank = AWS.
+DCP_ENDPOINT_URL = os.getenv('DCP_ENDPOINT_URL')
+# Bucket + key prefix in the WASABI_AIP_BUCKET form, e.g.
+# s3://dcp-archivesdu-dip-store/dip-store/ and
+# s3://dcp-archivesdu-aip-store/aip-store/.
+DCP_DIP_LOCATION = os.getenv('DCP_DIP_LOCATION')
+DCP_AIP_LOCATION = os.getenv('DCP_AIP_LOCATION')
 
 # AIPs at or above this size are copied FROM DURACLOUD BY DEFAULT
 # (Artefactual's recommendation: download large AIPs

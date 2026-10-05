@@ -17,7 +17,8 @@ Wasabi S3 operations (boto3).
 
 Directory and stream uploads, presigned GETs, and the read-only listing
 helpers the archive-browser routes use. Auth comes from
-AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY or WASABI_PROFILE, against
+WASABI_ACCESS_KEY_ID + WASABI_SECRET_ACCESS_KEY (or the older generic
+AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY) or WASABI_PROFILE, against
 WASABI_ENDPOINT / WASABI_BUCKET.
 """
 
@@ -84,28 +85,51 @@ def _make_client():
 
     Three credential paths, in priority order:
 
-      1. AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY (plus optional
-         AWS_DEFAULT_REGION).
+      1. An access key + secret, from WASABI_ACCESS_KEY_ID +
+         WASABI_SECRET_ACCESS_KEY or else the older AWS_ACCESS_KEY_ID +
+         AWS_SECRET_ACCESS_KEY (see _wasabi_keys).
       2. WASABI_PROFILE, a named profile in `~/.aws/config`. Used only
-         when the keys above are unset.
+         when no key pair is set.
       3. Neither — RuntimeError. There is deliberately no fallback to
          instance metadata or ambient host credentials.
     """
     if not config.WASABI_ENDPOINT:
         raise RuntimeError('WASABI_ENDPOINT is not configured')
 
-    if config.AWS_ACCESS_KEY_ID and config.AWS_SECRET_ACCESS_KEY:
-        return _client_from_keys()
+    keys = _wasabi_keys()
+    if keys:
+        return _client_from_keys(*keys)
     if config.WASABI_PROFILE:
         return _client_from_profile()
     raise RuntimeError(
-        'No Wasabi credentials configured. Set AWS_ACCESS_KEY_ID + '
-        'AWS_SECRET_ACCESS_KEY (preferred) or WASABI_PROFILE in '
-        'the service env.'
+        'No Wasabi credentials configured. Set WASABI_ACCESS_KEY_ID + '
+        'WASABI_SECRET_ACCESS_KEY (preferred), AWS_ACCESS_KEY_ID + '
+        'AWS_SECRET_ACCESS_KEY, or WASABI_PROFILE in the service env.'
     )
 
 
-def _client_from_keys():
+def _wasabi_keys():
+    """
+    Return (access_key_id, secret_access_key, region) for Wasabi, or None.
+
+    The role-named WASABI_* pair wins over the generic AWS_* pair, which is
+    read only as a one-release fallback. A pair is always taken from ONE
+    family, never an id from one and a secret from the other. The region
+    is WASABI_REGION, else AWS_DEFAULT_REGION, else None.
+    """
+    region = config.WASABI_REGION or config.AWS_DEFAULT_REGION or None
+    if config.WASABI_ACCESS_KEY_ID and config.WASABI_SECRET_ACCESS_KEY:
+        return (
+            config.WASABI_ACCESS_KEY_ID,
+            config.WASABI_SECRET_ACCESS_KEY,
+            region,
+        )
+    if config.AWS_ACCESS_KEY_ID and config.AWS_SECRET_ACCESS_KEY:
+        return config.AWS_ACCESS_KEY_ID, config.AWS_SECRET_ACCESS_KEY, region
+    return None
+
+
+def _client_from_keys(access_key_id, secret_access_key, region=None):
     """
     Build an S3 client from explicit access-key + secret.
 
@@ -116,11 +140,11 @@ def _client_from_keys():
     the built client no longer needs them.
     """
     session_kwargs = {
-        'aws_access_key_id': config.AWS_ACCESS_KEY_ID,
-        'aws_secret_access_key': config.AWS_SECRET_ACCESS_KEY,
+        'aws_access_key_id': access_key_id,
+        'aws_secret_access_key': secret_access_key,
     }
-    if config.AWS_DEFAULT_REGION:
-        session_kwargs['region_name'] = config.AWS_DEFAULT_REGION
+    if region:
+        session_kwargs['region_name'] = region
 
     saved = {k: os.environ.pop(k) for k in _PROFILE_ENV_VARS if k in os.environ}
     try:
