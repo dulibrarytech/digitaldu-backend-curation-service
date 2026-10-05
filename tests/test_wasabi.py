@@ -608,6 +608,35 @@ class BucketRoutingTest(unittest.TestCase):
             shutil.rmtree(tmp)
 
 
+class HeadObjectStatusTest(unittest.TestCase):
+    """
+    head_object's answer for a 404 and a 403. The AIP copies use it as
+    their idempotency probe, so a 403 must never read as "present".
+    """
+
+    def _head_raising(self, code):
+        client = MagicMock()
+        client.head_object.side_effect = ClientError(
+            {'Error': {'Code': code, 'Message': 'x'}}, 'HeadObject',
+        )
+        with patch.object(wasabi, '_make_client', return_value=client):
+            return wasabi.head_object(
+                'thing.7z', bucket_config='s3://aip-bucket/aip-store/',
+            )
+
+    def test_404_is_absent(self):
+        head = self._head_raising('404')
+        self.assertIs(head['exists'], False)
+        self.assertNotIn('forbidden', head)
+
+    def test_403_is_unknown_not_present(self):
+        head = self._head_raising('403')
+        self.assertIsNone(head['exists'])
+        self.assertTrue(head['forbidden'])
+        self.assertIsNone(head['content_length'])
+        self.assertEqual(head['key'], 'aip-store/thing.7z')
+
+
 class HealthCheckTest(unittest.TestCase):
 
     def test_ok_when_head_bucket_succeeds(self):

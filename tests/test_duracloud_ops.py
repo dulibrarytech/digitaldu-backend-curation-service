@@ -441,6 +441,65 @@ class CopyFlowTests(unittest.TestCase):
         self.assertTrue(result['idempotent'])
         self.assertEqual(result['source'], 'duracloud')
 
+    def test_forbidden_head_copies_instead_of_skipping(self):
+        payload = b'single-object-bytes'
+        uploaded = {}
+
+        def fake_get(url, **kwargs):
+            if url.endswith('.dura-manifest'):
+                class M:
+                    status_code = 404
+                    text = ''
+                return M()
+            return self._am_meta(len(payload))
+
+        def fake_upload(reader, key, expected_bytes=None, bucket_config=None,
+                        progress_hook=None):
+            uploaded['body'] = reader.read(-1)
+            return {'bucket': 'aip-bucket', 'bytes': len(uploaded['body'])}
+
+        with patch.object(dc.requests, 'get', side_effect=fake_get), \
+                patch.object(dc, '_open_dc_stream',
+                             side_effect=lambda cid, offset=0: FakeStreamResponse(payload[offset:])), \
+                patch.object(wasabi, 'head_object', return_value={
+                    'exists': None, 'forbidden': True, 'bucket': 'aip-bucket',
+                    'content_length': None,
+                }), \
+                patch.object(wasabi, 'delete_object') as delete, \
+                patch.object(wasabi, 'upload_fileobj', side_effect=fake_upload):
+            result = dc.copy_aip_from_duracloud(AIP_UUID, 'pid-1')
+
+        self.assertTrue(result['ok'], result.get('error'))
+        self.assertFalse(result.get('idempotent'))
+        self.assertEqual(uploaded['body'], payload)
+        delete.assert_not_called()
+
+    def test_existing_copy_of_unknown_size_is_replaced(self):
+        payload = b'single-object-bytes'
+
+        def fake_get(url, **kwargs):
+            if url.endswith('.dura-manifest'):
+                class M:
+                    status_code = 404
+                    text = ''
+                return M()
+            return self._am_meta(len(payload))
+
+        with patch.object(dc.requests, 'get', side_effect=fake_get), \
+                patch.object(dc, '_open_dc_stream',
+                             side_effect=lambda cid, offset=0: FakeStreamResponse(payload[offset:])), \
+                patch.object(wasabi, 'head_object', return_value={
+                    'exists': True, 'bucket': 'aip-bucket', 'content_length': None,
+                }), \
+                patch.object(wasabi, 'delete_object') as delete, \
+                patch.object(wasabi, 'upload_fileobj',
+                             side_effect=lambda reader, *a, **kw: {'bytes': len(reader.read(-1))}):
+            result = dc.copy_aip_from_duracloud(AIP_UUID, 'pid-1')
+
+        self.assertTrue(result['ok'], result.get('error'))
+        self.assertFalse(result.get('idempotent'))
+        delete.assert_called_once()
+
     def test_chunked_copy_verifies_and_uploads(self):
         chunks = [b'first-', b'second-', b'third']
         manifest_xml = _manifest_xml(chunks)

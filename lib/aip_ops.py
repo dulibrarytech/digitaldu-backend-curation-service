@@ -359,19 +359,23 @@ def copy_aip_to_wasabi(aip_uuid, repo_uuid):
         return out
 
     bucket_name = head.get('bucket')
+    if head.get('forbidden'):
+        logger.warning(
+            'copy_aip_to_wasabi HEAD_FORBIDDEN key=%s — cannot confirm an '
+            'existing copy; copying anyway',
+            key,
+        )
     if head.get('exists'):
         existing_size = head.get('content_length')
-        if (
-            expected_bytes is None
-            or existing_size is None
-            or int(existing_size) == int(expected_bytes)
+        # Skip only on a size we can see. An object of unknown size is
+        # treated like a mismatch: delete and copy again.
+        if existing_size is not None and (
+            expected_bytes is None or int(existing_size) == int(expected_bytes)
         ):
             out['ok'] = True
             out['bucket'] = bucket_name
             out['key'] = key
-            out['bytes'] = (
-                int(existing_size) if existing_size is not None else expected_bytes
-            )
+            out['bytes'] = int(existing_size)
             out['elapsed_ms'] = int((time.monotonic() - started) * 1000)
             out['idempotent'] = True
             logger.info(

@@ -556,18 +556,23 @@ def copy_aip_from_duracloud(aip_uuid, repo_uuid):
     except Exception as e:
         return done(f'wasabi head_object failed: {e}')
     bucket_name = head.get('bucket')
+    if head.get('forbidden'):
+        logger.warning(
+            'copy_aip_from_duracloud HEAD_FORBIDDEN key=%s — cannot confirm '
+            'an existing copy; copying anyway',
+            key,
+        )
     if head.get('exists'):
         existing_size = head.get('content_length')
-        if (
-            expected_bytes is None
-            or existing_size is None
-            or int(existing_size) == int(expected_bytes)
+        # Skip only on a size we can see (same rule as the AM path).
+        if existing_size is not None and (
+            expected_bytes is None or int(existing_size) == int(expected_bytes)
         ):
             out.update({
                 'ok': True,
                 'bucket': bucket_name,
                 'key': key,
-                'bytes': int(existing_size) if existing_size is not None else expected_bytes,
+                'bytes': int(existing_size),
                 'idempotent': True,
             })
             logger.info(

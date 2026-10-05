@@ -506,17 +506,20 @@ def upload_fileobj(file_obj, key, expected_bytes=None, bucket_config=None,
 def head_object(key, bucket_config=None):
     """
     HEAD a Wasabi object. Returns:
-        {'exists': bool, 'bucket': str, 'key': str,
-         'content_length': int | None}
+        {'exists': bool | None, 'bucket': str, 'key': str,
+         'content_length': int | None, 'forbidden': True (403 only)}
 
     Used by aip_ops as the idempotency probe before a copy — a key
     that already exists at the expected size means we can skip the
     upload entirely.
 
     Distinguishes "not there" (returns exists=False, no raise) from
-    transport / auth errors (raises). 403 Forbidden is treated as
-    "exists but not accessible" → exists=True with content_length=None
-    so the caller can choose to skip or warn rather than re-upload.
+    transport / auth errors (raises). 403 Forbidden proves nothing
+    either way: a policy without bucket-wide s3:ListBucket answers a
+    MISSING key with 403, and so does a request the policy rejects
+    outright (source IP, clock skew). It returns exists=None ("can't
+    tell") with forbidden=True, so a caller that checks `exists` copies
+    instead of skipping; if access really is denied, the upload fails.
 
     `bucket_config` mirrors upload_fileobj — AIP callers pass
     config.WASABI_AIP_BUCKET; otherwise we fall back to
@@ -544,13 +547,13 @@ def head_object(key, bucket_config=None):
                 'key': full_key,
                 'content_length': None,
             }
-        # 403 — bucket policy issue or temporary auth glitch. We
-        # surface the assertion that something IS there (defensive
-        # default) but with no size info; the caller can decide
-        # whether that's enough to skip the upload.
+        # 403 — can't tell whether the key exists (see docstring). Never
+        # report it as present: a copy that trusted that would record
+        # success without uploading anything.
         if code == '403':
             return {
-                'exists': True,
+                'exists': None,
+                'forbidden': True,
                 'bucket': bucket,
                 'key': full_key,
                 'content_length': None,
