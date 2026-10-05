@@ -19,7 +19,6 @@ import os
 import unittest
 from unittest.mock import MagicMock, patch
 
-from botocore.exceptions import ClientError
 from botocore.response import StreamingBody
 from botocore.stub import Stubber
 
@@ -148,29 +147,6 @@ class StubbedClientTest(unittest.TestCase):
         self.stub = Stubber(self.client)
         self.stub.activate()
         self.addCleanup(self.stub.deactivate)
-
-
-class HeadTest(StubbedClientTest):
-    def test_existing_key(self):
-        self.stub.add_response(
-            'head_object',
-            {'ContentLength': 42, 'ETag': '"abc123"', 'ContentType': 'image/jpeg'},
-            {'Bucket': 'b', 'Key': 'dip-store/x.jpg'},
-        )
-        out = dcp.head('b', 'dip-store/x.jpg', client=self.client)
-        self.assertTrue(out['exists'])
-        self.assertEqual(out['content_length'], 42)
-        self.assertEqual(out['etag'], 'abc123')
-        self.assertEqual(out['content_type'], 'image/jpeg')
-
-    def test_404_means_missing(self):
-        self.stub.add_client_error('head_object', '404', http_status_code=404)
-        self.assertEqual(dcp.head('b', 'nope', client=self.client), {'exists': False})
-
-    def test_403_raises_instead_of_reporting_missing(self):
-        self.stub.add_client_error('head_object', '403', http_status_code=403)
-        with self.assertRaises(ClientError):
-            dcp.head('b', 'secret', client=self.client)
 
 
 class IterObjectsTest(StubbedClientTest):

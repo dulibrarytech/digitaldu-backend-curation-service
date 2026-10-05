@@ -126,36 +126,6 @@ def make_client(probe=False):
         os.environ.update(saved)
 
 
-def _status(error):
-    """HTTP status of a botocore ClientError, or None."""
-    return error.response.get('ResponseMetadata', {}).get('HTTPStatusCode')
-
-
-def head(bucket, key, client=None):
-    """
-    HeadObject for one key.
-
-    Returns {'exists': False} for a 404. Otherwise returns exists=True
-    plus content_length, etag (unquoted), content_type and
-    last_modified. Any other error raises (ClientError / BotoCoreError):
-    a 403 is a policy problem, never "missing".
-    """
-    client = client or make_client()
-    try:
-        resp = client.head_object(Bucket=bucket, Key=key)
-    except ClientError as e:
-        if _status(e) == 404:
-            return {'exists': False}
-        raise
-    return {
-        'exists': True,
-        'content_length': resp.get('ContentLength'),
-        'etag': (resp.get('ETag') or '').strip('"'),
-        'content_type': resp.get('ContentType'),
-        'last_modified': resp.get('LastModified'),
-    }
-
-
 def iter_objects(bucket, prefix, client=None):
     """
     Yield every object under `prefix`, following continuation tokens.
