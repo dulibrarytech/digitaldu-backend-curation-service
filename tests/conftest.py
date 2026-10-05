@@ -31,3 +31,12 @@ os.environ.setdefault('API_KEY', 'test-key')
 os.environ.setdefault('WASABI_ENDPOINT', 'https://s3.test.example')
 os.environ.setdefault('WASABI_BUCKET', 's3://test-bucket/')
 os.environ.setdefault('WASABI_PROFILE', 'test-profile')
+
+# DuraCloud Preserve must never be configured from the host environment
+# or a developer .env during a test run: importing `app` starts the
+# startup probe thread, which would send a real, signed listing with
+# whatever DCP_* holds. These are set (not setdefault) so they win over
+# both; load_dotenv never overrides a name that is already present. Tests
+# that need a configured DCP patch `config` directly.
+for _name in ('DCP_ACCESS_KEY_ID', 'DCP_SECRET_ACCESS_KEY', 'DCP_REGION'):
+    os.environ[_name] = ''

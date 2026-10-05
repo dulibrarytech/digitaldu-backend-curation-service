@@ -441,11 +441,12 @@ class CopyFlowTests(unittest.TestCase):
         self.assertTrue(result['idempotent'])
         self.assertEqual(result['source'], 'duracloud')
 
-    def test_forbidden_head_copies_instead_of_skipping(self):
+    def test_forbidden_head_fails_fast_without_copying(self):
         payload = b'single-object-bytes'
-        uploaded = {}
+        urls = []
 
         def fake_get(url, **kwargs):
+            urls.append(url)
             if url.endswith('.dura-manifest'):
                 class M:
                     status_code = 404
@@ -453,28 +454,27 @@ class CopyFlowTests(unittest.TestCase):
                 return M()
             return self._am_meta(len(payload))
 
-        def fake_upload(reader, key, expected_bytes=None, bucket_config=None,
-                        progress_hook=None):
-            uploaded['body'] = reader.read(-1)
-            return {'bucket': 'aip-bucket', 'bytes': len(uploaded['body'])}
-
         with patch.object(dc.requests, 'get', side_effect=fake_get), \
-                patch.object(dc, '_open_dc_stream',
-                             side_effect=lambda cid, offset=0: FakeStreamResponse(payload[offset:])), \
+                patch.object(dc, '_open_dc_stream') as open_stream, \
                 patch.object(wasabi, 'head_object', return_value={
                     'exists': None, 'forbidden': True, 'bucket': 'aip-bucket',
                     'content_length': None,
                 }), \
                 patch.object(wasabi, 'delete_object') as delete, \
-                patch.object(wasabi, 'upload_fileobj', side_effect=fake_upload):
+                patch.object(wasabi, 'upload_fileobj') as upload:
             result = dc.copy_aip_from_duracloud(AIP_UUID, 'pid-1')
 
-        self.assertTrue(result['ok'], result.get('error'))
+        self.assertFalse(result['ok'])
+        self.assertIn('403', result['error'])
+        self.assertIn('nothing was copied', result['error'])
         self.assertFalse(result.get('idempotent'))
-        self.assertEqual(uploaded['body'], payload)
+        # Nothing was read from DuraCloud, uploaded, or deleted.
+        self.assertFalse(any(u.endswith('.dura-manifest') for u in urls))
+        open_stream.assert_not_called()
+        upload.assert_not_called()
         delete.assert_not_called()
 
-    def test_existing_copy_of_unknown_size_is_replaced(self):
+    def test_existing_copy_of_unknown_size_is_copied_over_not_deleted(self):
         payload = b'single-object-bytes'
 
         def fake_get(url, **kwargs):
@@ -498,7 +498,7 @@ class CopyFlowTests(unittest.TestCase):
 
         self.assertTrue(result['ok'], result.get('error'))
         self.assertFalse(result.get('idempotent'))
-        delete.assert_called_once()
+        delete.assert_not_called()
 
     def test_chunked_copy_verifies_and_uploads(self):
         chunks = [b'first-', b'second-', b'third']

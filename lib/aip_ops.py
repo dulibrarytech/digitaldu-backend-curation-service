@@ -35,7 +35,8 @@ Idempotency:
   it exists at the expected size, return ok=True with the existing
   metadata — the upload is skipped. This makes Stage 6 retries safe:
   a crash mid-upload (or a retry from a prior failed call) re-runs
-  and the second call short-circuits.
+  and the second call short-circuits. A 403 on that HEAD fails the
+  call without copying or deleting anything (see _forbidden_error).
 
 Naming:
   The Wasabi key is <basename-of-am-current-path> with NO directory
@@ -120,6 +121,21 @@ _PROGRESS_UUID_RE = re.compile(
     r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$',
     re.IGNORECASE,
 )
+
+
+def _forbidden_error(key):
+    """
+    The error both AIP copy paths return when the idempotency HEAD
+    answers 403. repov2 treats it as retryable (it names neither a
+    deleted AIP nor a missing one), so the copy runs again once access
+    is fixed.
+    """
+    return (
+        f'wasabi answered 403 (forbidden) for HEAD {key}: cannot tell '
+        'whether a copy already exists, so nothing was copied. Check the '
+        'Wasabi key, its bucket-wide s3:ListBucket, the source-IP rule and '
+        'the host clock'
+    )
 
 
 def _progress_path(aip_uuid):
@@ -360,15 +376,24 @@ def copy_aip_to_wasabi(aip_uuid, repo_uuid):
 
     bucket_name = head.get('bucket')
     if head.get('forbidden'):
-        logger.warning(
-            'copy_aip_to_wasabi HEAD_FORBIDDEN key=%s — cannot confirm an '
-            'existing copy; copying anyway',
-            key,
+        # A 403 proves nothing about the key, so neither skipping nor
+        # copying is safe: a copy over an unseen good object could
+        # replace it, and the cleanup after a failed copy could delete
+        # it. The service key keeps bucket-wide s3:ListBucket, so a
+        # missing key answers 404 and a 403 means the request was
+        # denied. Fail, and let the retry run once access is fixed.
+        logger.error(
+            'copy_aip_to_wasabi HEAD_FORBIDDEN key=%s — Wasabi answered 403, '
+            'so the copy cannot tell whether %s already holds the AIP; '
+            'nothing copied',
+            key, bucket_name,
         )
+        out['elapsed_ms'] = int((time.monotonic() - started) * 1000)
+        out['error'] = _forbidden_error(key)
+        return out
     if head.get('exists'):
         existing_size = head.get('content_length')
-        # Skip only on a size we can see. An object of unknown size is
-        # treated like a mismatch: delete and copy again.
+        # Skip only on a size we can see.
         if existing_size is not None and (
             expected_bytes is None or int(existing_size) == int(expected_bytes)
         ):
@@ -383,19 +408,31 @@ def copy_aip_to_wasabi(aip_uuid, repo_uuid):
                 key, out['bytes'],
             )
             return out
-        # Size mismatch — the prior upload was partial or corrupted.
-        # Delete and re-upload, logged at WARNING.
-        logger.warning(
-            'copy_aip_to_wasabi SIZE_MISMATCH key=%s existing=%s expected=%s — '
-            'deleting and re-uploading',
-            key, existing_size, expected_bytes,
-        )
-        try:
-            wasabi.delete_object(key, bucket_config=config.WASABI_AIP_BUCKET)
-        except Exception as e:
-            out['elapsed_ms'] = int((time.monotonic() - started) * 1000)
-            out['error'] = f'wasabi delete of stale object failed: {e}'
-            return out
+        if existing_size is None:
+            # S3 always reports a size, so this is unexpected. Copy over
+            # the object without deleting it first: S3 replaces it only
+            # once the new upload completes, so a failed copy loses
+            # nothing.
+            logger.warning(
+                'copy_aip_to_wasabi UNKNOWN_SIZE key=%s — copying over it',
+                key,
+            )
+        else:
+            # Size mismatch — the prior upload was partial or corrupted.
+            # Delete and re-upload, logged at WARNING.
+            logger.warning(
+                'copy_aip_to_wasabi SIZE_MISMATCH key=%s existing=%s '
+                'expected=%s — deleting and re-uploading',
+                key, existing_size, expected_bytes,
+            )
+            try:
+                wasabi.delete_object(
+                    key, bucket_config=config.WASABI_AIP_BUCKET,
+                )
+            except Exception as e:
+                out['elapsed_ms'] = int((time.monotonic() - started) * 1000)
+                out['error'] = f'wasabi delete of stale object failed: {e}'
+                return out
 
     # --- Step 3: Stream-pipe AM → Wasabi --------------------------------
     # Seed the progress file at 0 bytes before the stream opens so the

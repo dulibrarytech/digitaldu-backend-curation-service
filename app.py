@@ -44,11 +44,6 @@ def create_app():
     # the SFTP and local-fs endpoints work without Wasabi. Look for
     # `wasabi probe OK` in journald to confirm cred + bucket auth on boot.
     _probe_wasabi_at_startup()
-    # DuraCloud Preserve probe: logged only, and run on a daemon thread so
-    # an unreachable DCP can't delay any gunicorn worker's boot.
-    threading.Thread(
-        target=_probe_dcp_at_startup, name='dcp-startup-probe', daemon=True,
-    ).start()
 
     app = Flask(__name__)
     CORS(app, resources={r'/api/*': {'origins': '*'}})
@@ -100,6 +95,17 @@ def _probe_wasabi_at_startup():
     never a non-booting service.
     """
     try:
+        # Which settings the key came from (names only), so a key move
+        # that never took effect shows up in the log.
+        logger.info(
+            'wasabi credentials: %s',
+            wasabi.credential_source() or 'none configured',
+        )
+        for pair in wasabi.half_set_key_pairs():
+            logger.warning(
+                'wasabi credentials: %s is set, so that pair is ignored',
+                pair,
+            )
         result = wasabi.health_check()
         if result['ok']:
             logger.info(
@@ -148,7 +154,21 @@ def _probe_dcp_at_startup():
         logger.warning('dcp probe threw unexpectedly: %s', e)
 
 
+def _start_dcp_probe_thread():
+    """
+    Run the DuraCloud Preserve probe on a daemon thread, so an
+    unreachable DCP can't delay a gunicorn worker's boot. Started once
+    per process from the module level below, not from create_app(): the
+    tests build apps freely, and must never start a probe that reads
+    whatever DCP_* the host environment holds.
+    """
+    threading.Thread(
+        target=_probe_dcp_at_startup, name='dcp-startup-probe', daemon=True,
+    ).start()
+
+
 app = create_app()
+_start_dcp_probe_thread()
 
 
 if __name__ == '__main__':

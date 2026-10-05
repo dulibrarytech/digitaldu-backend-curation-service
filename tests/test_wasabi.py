@@ -437,60 +437,23 @@ class MakeClientCredentialResolutionTest(unittest.TestCase):
         self.assertEqual(call_kwargs.get('profile_name'), 'fallback')
         self.assertNotIn('aws_access_key_id', call_kwargs)
 
-    def test_pops_profile_env_vars_through_both_session_and_client(self):
+    def test_keys_branch_passes_an_isolated_botocore_session(self):
         """
-        boto3.Session() AND session.client() both read AWS_PROFILE /
-        AWS_DEFAULT_PROFILE from os.environ during init, via the
-        same get_scoped_config() path. If the named profile isn't
-        in ~/.aws/config either call raises ProfileNotFound.
-
-        _client_from_keys must keep the pop in effect through BOTH
-        calls — popping only during Session() leaves client() to
-        crash on `get_config_variable('ca_bundle')`.
-
-        This regression bit twice on the live curation host: the
-        first pop fixed Session(), then client() failed at the
-        ca_bundle config lookup. Pin both points here.
+        The explicit-keys branch builds its boto3 Session on a botocore
+        session from _session_from_keys, which never reads AWS_PROFILE /
+        AWS_DEFAULT_PROFILE. Pinned here at the call shape; the real
+        behaviour is in SessionFromKeysTest.
         """
-        captured_at_session = {}
-        captured_at_client = {}
-
-        def capture_env_at_session(**kwargs):
-            captured_at_session['AWS_PROFILE'] = os.environ.get('AWS_PROFILE')
-            captured_at_session['AWS_DEFAULT_PROFILE'] = os.environ.get('AWS_DEFAULT_PROFILE')
-
-            def capture_env_at_client(*c_args, **c_kwargs):
-                captured_at_client['AWS_PROFILE'] = os.environ.get('AWS_PROFILE')
-                captured_at_client['AWS_DEFAULT_PROFILE'] = os.environ.get('AWS_DEFAULT_PROFILE')
-                return MagicMock()
-
-            sess = MagicMock()
-            sess.client.side_effect = capture_env_at_client
-            return sess
-
-        self.boto3_mock.Session.side_effect = capture_env_at_session
-
         with patch.object(config, 'AWS_ACCESS_KEY_ID', 'ak-env'), \
-             patch.object(config, 'AWS_SECRET_ACCESS_KEY', 'sk-env'), \
-             patch.dict(os.environ, {
-                 'AWS_PROFILE': 'fernando.reyes',
-                 'AWS_DEFAULT_PROFILE': 'fernando.reyes',
-             }, clear=False):
+             patch.object(config, 'AWS_SECRET_ACCESS_KEY', 'sk-env'):
             wasabi._make_client()
-            # Both Session() and client() must see the env vars popped.
-            self.assertIsNone(captured_at_session['AWS_PROFILE'])
-            self.assertIsNone(captured_at_session['AWS_DEFAULT_PROFILE'])
-            self.assertIsNone(captured_at_client['AWS_PROFILE'])
-            self.assertIsNone(captured_at_client['AWS_DEFAULT_PROFILE'])
-            # And restored on return.
-            self.assertEqual(os.environ['AWS_PROFILE'], 'fernando.reyes')
-            self.assertEqual(os.environ['AWS_DEFAULT_PROFILE'], 'fernando.reyes')
+        call_kwargs = self.boto3_mock.Session.call_args.kwargs
+        self.assertIn('botocore_session', call_kwargs)
+        self.assertNotIn('profile_name', call_kwargs)
 
     def test_does_not_pop_profile_env_when_using_profile_branch(self):
-        """The profile branch SHOULD see AWS_PROFILE / AWS_DEFAULT_PROFILE.
-        We only pop them on the env-keys branch (where they'd cause a
-        false ProfileNotFound on a Session we're constructing with
-        explicit creds anyway)."""
+        """The profile branch is built on a plain boto3.Session with an
+        explicit profile_name; the environment is left alone there too."""
         captured = {}
 
         def capture_env(**kwargs):
@@ -505,6 +468,113 @@ class MakeClientCredentialResolutionTest(unittest.TestCase):
              patch.dict(os.environ, {'AWS_PROFILE': 'unrelated'}, clear=False):
             wasabi._make_client()
         self.assertEqual(captured['AWS_PROFILE'], 'unrelated')
+
+
+class SessionFromKeysTest(unittest.TestCase):
+    """
+    Real boto3 sessions, no requests. A profile name in the environment
+    used to be popped and restored around the build, which raced across
+    threads (the startup probe thread against a request, or a
+    multi-threaded script). Now it is simply never consulted, and
+    os.environ is never written.
+
+    This regression bit twice on the live curation host: AWS_PROFILE named
+    a profile missing from ~/.aws/config, and both boto3.Session() and
+    session.client() raised ProfileNotFound.
+    """
+
+    def _build(self):
+        session = wasabi._session_from_keys('ak-env', 'sk-env', 'us-west-1')
+        return session.client('s3', endpoint_url='https://s3.test.example')
+
+    def test_a_missing_profile_name_in_the_environment_is_ignored(self):
+        env = {'AWS_PROFILE': 'no-such-profile', 'AWS_DEFAULT_PROFILE': 'no-such-profile'}
+        with patch.dict(os.environ, env, clear=False):
+            client = self._build()
+            # Still there: nothing popped them.
+            self.assertEqual(os.environ['AWS_PROFILE'], 'no-such-profile')
+            self.assertEqual(os.environ['AWS_DEFAULT_PROFILE'], 'no-such-profile')
+        self.assertEqual(client.meta.region_name, 'us-west-1')
+        self.assertEqual(client.meta.endpoint_url, 'https://s3.test.example')
+        self.assertEqual(client._request_signer._credentials.access_key, 'ak-env')
+
+    def test_a_blank_profile_name_is_ignored_too(self):
+        # A blank line in the env file sets the variable to ''; a plain
+        # boto3.Session would raise ProfileNotFound for profile ''.
+        with patch.dict(os.environ, {'AWS_DEFAULT_PROFILE': ''}, clear=False):
+            self._build()
+
+    def test_the_environment_is_not_written_during_the_build(self):
+        seen = {}
+        real_session = wasabi.boto3.Session
+
+        def spy(**kwargs):
+            seen['AWS_PROFILE'] = os.environ.get('AWS_PROFILE')
+            return real_session(**kwargs)
+
+        with patch.dict(os.environ, {'AWS_PROFILE': 'no-such-profile'}, clear=False), \
+             patch.object(wasabi.boto3, 'Session', side_effect=spy):
+            self._build()
+        self.assertEqual(seen['AWS_PROFILE'], 'no-such-profile')
+
+    def test_the_wasabi_session_still_reads_the_aws_config_file(self):
+        # read_aws_config stays on for Wasabi so its behaviour is unchanged;
+        # the DCP client turns it off (tests/test_dcp.py).
+        with tempfile.NamedTemporaryFile('w', suffix='.ini', delete=False) as f:
+            f.write('[default]\ns3 =\n    addressing_style = path\n')
+        self.addCleanup(os.unlink, f.name)
+        with patch.dict(os.environ, {'AWS_CONFIG_FILE': f.name}, clear=False):
+            client = self._build()
+        self.assertEqual(client.meta.config.s3, {'addressing_style': 'path'})
+
+
+class CredentialSourceTest(unittest.TestCase):
+    """The startup log names where the Wasabi key came from, never its value."""
+
+    def test_wasabi_names_win(self):
+        with patch.multiple(config, WASABI_ACCESS_KEY_ID='wk', WASABI_SECRET_ACCESS_KEY='ws',
+                            AWS_ACCESS_KEY_ID='ak', AWS_SECRET_ACCESS_KEY='sk'):
+            self.assertEqual(wasabi.credential_source(), 'WASABI_*')
+
+    def test_aws_names_are_the_fallback(self):
+        with patch.multiple(config, WASABI_ACCESS_KEY_ID=None, WASABI_SECRET_ACCESS_KEY=None,
+                            AWS_ACCESS_KEY_ID='ak', AWS_SECRET_ACCESS_KEY='sk'):
+            self.assertEqual(wasabi.credential_source(), 'AWS_* (fallback)')
+
+    def test_then_the_profile_then_nothing(self):
+        with patch.multiple(config, WASABI_ACCESS_KEY_ID=None, WASABI_SECRET_ACCESS_KEY=None,
+                            AWS_ACCESS_KEY_ID=None, AWS_SECRET_ACCESS_KEY=None,
+                            WASABI_PROFILE='wasabi-prod'):
+            self.assertEqual(wasabi.credential_source(), 'WASABI_PROFILE')
+        with patch.multiple(config, WASABI_ACCESS_KEY_ID=None, WASABI_SECRET_ACCESS_KEY=None,
+                            AWS_ACCESS_KEY_ID=None, AWS_SECRET_ACCESS_KEY=None,
+                            WASABI_PROFILE=None):
+            self.assertIsNone(wasabi.credential_source())
+
+    def test_half_set_pairs_are_named(self):
+        with patch.multiple(config, WASABI_ACCESS_KEY_ID='wk', WASABI_SECRET_ACCESS_KEY='',
+                            AWS_ACCESS_KEY_ID='', AWS_SECRET_ACCESS_KEY='sk'):
+            self.assertEqual(wasabi.half_set_key_pairs(), [
+                'WASABI_ACCESS_KEY_ID without WASABI_SECRET_ACCESS_KEY',
+                'AWS_SECRET_ACCESS_KEY without AWS_ACCESS_KEY_ID',
+            ])
+
+    def test_whole_or_absent_pairs_are_not_flagged(self):
+        with patch.multiple(config, WASABI_ACCESS_KEY_ID='wk', WASABI_SECRET_ACCESS_KEY='ws',
+                            AWS_ACCESS_KEY_ID=None, AWS_SECRET_ACCESS_KEY=None):
+            self.assertEqual(wasabi.half_set_key_pairs(), [])
+
+    def test_startup_log_names_the_source_and_warns_on_a_half_set_pair(self):
+        from app import _probe_wasabi_at_startup
+        with patch.multiple(config, WASABI_ACCESS_KEY_ID='wk', WASABI_SECRET_ACCESS_KEY='',
+                            AWS_ACCESS_KEY_ID='ak', AWS_SECRET_ACCESS_KEY='sk'), \
+             patch.object(wasabi, 'health_check', return_value={'ok': True, 'bucket': 'b'}), \
+             self.assertLogs('app', level='INFO') as logs:
+            _probe_wasabi_at_startup()
+        text = '\n'.join(logs.output)
+        self.assertIn('wasabi credentials: AWS_* (fallback)', text)
+        self.assertIn('WASABI_ACCESS_KEY_ID without WASABI_SECRET_ACCESS_KEY is set', text)
+        self.assertNotIn('wk', text.replace('wasabi', ''))
 
 
 class BucketRoutingTest(unittest.TestCase):

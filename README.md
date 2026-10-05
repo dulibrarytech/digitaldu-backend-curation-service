@@ -32,7 +32,7 @@ All other content is released under [CC-BY-4.0](https://creativecommons.org/lice
 * **System libraries** (RHEL 8.10):
   * `libmagic` (for `python-magic`): `dnf install file-libs`
   * `gcc` + `python3.12-devel` if a wheel falls through to a source build (rare on x86_64 — boto3 / paramiko / cryptography all ship binary wheels)
-* **Wasabi credentials** — either `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY` in the service env (preferred; no dependency on `~/.aws/*` files), or an AWS CLI profile at `~/.aws/config` for the service user matching `WASABI_PROFILE`. See [Wasabi credentials](#wasabi-credentials) for the resolution order.
+* **Wasabi credentials** — either `WASABI_ACCESS_KEY_ID` + `WASABI_SECRET_ACCESS_KEY` in the service env (preferred; no dependency on `~/.aws/*` files; the older `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY` names still work as a fallback for one release), or an AWS CLI profile at `~/.aws/config` for the service user matching `WASABI_PROFILE`. See [Wasabi credentials](#wasabi-credentials) for the resolution order.
 * **Network egress** to the Archivematica SFTP host and the Wasabi endpoint. Optional (full functionality): ArchivesSpace for the digital-object CLI. Endpoint and health routes work without it.
 
 **Install and configure**
@@ -89,7 +89,8 @@ Fill in:
 - `SFTP_HOST`, `SFTP_ID`, `SFTP_PWD`, `SFTP_REMOTE_PATH` — Archivematica SFTP daemon address + credentials.
 - `WASABI_ENDPOINT`, `WASABI_BUCKET` — Wasabi endpoint + the **batch archive** bucket (completed ingests' source packages). `WASABI_BUCKET` accepts the legacy `s3://bucket-name/` form (an optional path becomes a base key prefix) OR the bare `name` form.
 - `WASABI_AIP_BUCKET` — the **AIP store** bucket/prefix (e.g. `s3://bucket-name/aip-store/`) used by the `/api/v2/aip/*` routes. Required for those routes; they refuse cleanly if unset rather than falling back to the batch bucket.
-- `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` (+ optional `AWS_DEFAULT_REGION`) — Wasabi credentials, preferred form. Alternatively `WASABI_PROFILE` naming a profile in `~/.aws/config` for the service user (used only when the explicit keys are unset).
+- `WASABI_ACCESS_KEY_ID`, `WASABI_SECRET_ACCESS_KEY` (+ optional `WASABI_REGION`) — Wasabi credentials, preferred form. The older `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY` (+ `AWS_DEFAULT_REGION`) names are read as a fallback for one release; move the key to the `WASABI_*` names before the `DCP_*` (real AWS) credentials are added, so the generic names can't be confused. Alternatively `WASABI_PROFILE` naming a profile in `~/.aws/config` for the service user (used only when no key pair is set). The startup log reports which names the key came from (`wasabi credentials: WASABI_*`).
+- `DCP_ACCESS_KEY_ID`, `DCP_SECRET_ACCESS_KEY`, `DCP_REGION`, `DCP_DIP_LOCATION`, `DCP_AIP_LOCATION` — DuraCloud Preserve (plain AWS S3, `lib/dcp.py`). Optional until the DuraCloud Preserve cutover: unset, `GET /health/dcp` reports "not configured" and nothing reads DCP. `DCP_ENDPOINT_URL` overrides the endpoint for a local MinIO.
 - `WORKSPACE`, `ASPACE_USERNAME`, `ASPACE_PASSWORD`, `SCRIPT_PATH`, `LOG_PATH` — ArchivesSpace-side config.
 - `DEFAULT_URL` — ArchivesSpace API base URL, read straight from the environment by `lib/make_digital_object.py`. Required: without it that script exits 1 during validation and `/api/v1/astools/make-digital-objects` returns a 500 on every call. Optional companions: `TESTING_URL` (used when a request sets `test=true`; falls back to `DEFAULT_URL`, so test runs otherwise hit production) and `ASPACE_REPOSITORY_ID` (default `2`).
 
@@ -100,8 +101,8 @@ Fill in:
 
 Credential resolution order (`lib/wasabi._make_client`):
 
-1. **Explicit env vars** — `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY` (+ optional `AWS_DEFAULT_REGION`) from the service env. Preferred: no dependency on `~/.aws/*` existing for whichever user the process runs as.
-2. **Named profile** — `WASABI_PROFILE` from `~/.aws/config` / `~/.aws/credentials`, used only when the env keys are unset:
+1. **Explicit env vars** — `WASABI_ACCESS_KEY_ID` + `WASABI_SECRET_ACCESS_KEY` (+ optional `WASABI_REGION`), or else the older `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY` (+ optional `AWS_DEFAULT_REGION`), from the service env. A pair is always taken from one family, never mixed; a half-set pair is skipped, and the startup log warns about it. Preferred: no dependency on `~/.aws/*` existing for whichever user the process runs as. `AWS_PROFILE` / `AWS_DEFAULT_PROFILE` are never read on this path.
+2. **Named profile** — `WASABI_PROFILE` from `~/.aws/config` / `~/.aws/credentials`, used only when no key pair is set:
 
    ```ini
    # ~/.aws/config
@@ -260,6 +261,7 @@ At the end of a successful ingest, the batch's `002-ingest` staging copy is back
 | `GET /` | Returns `APP_VERSION` |
 | `GET /health` | `{"status": "ok", "version": ...}` |
 | `GET /health/wasabi` | On-demand Wasabi `head_bucket` probe |
+| `GET /health/dcp` | On-demand DuraCloud Preserve probe: lists one key under each configured `DCP_*` location (one attempt each). Always 200; `ok` is the signal, and an empty listing is reported as not ok |
 
 <a name="batch-structure-qa"></a>
 ### Batch structure QA

@@ -28,6 +28,7 @@ import posixpath
 import time
 
 import boto3
+import botocore.session
 from boto3.s3.transfer import TransferConfig
 from botocore.config import Config
 from botocore.exceptions import (
@@ -43,7 +44,8 @@ logger = logging.getLogger(__name__)
 
 # Retry config applied to every S3 API call. Adaptive mode adds
 # client-side backoff on top of the standard exponential retry; 5
-# attempts caps a transient flake's recovery at roughly 30s.
+# retries (six attempts in all) caps a transient flake's recovery at
+# roughly 30s.
 _RETRY_CONFIG = Config(
     retries={'max_attempts': 5, 'mode': 'adaptive'},
     # Above boto3's 60s default — large multipart uploads can be slow
@@ -73,10 +75,39 @@ def _parse_bucket(raw):
     return bucket, prefix.strip('/') + '/'
 
 
-# These env vars must be popped while a Session is built from explicit
-# keys: set, they make boto3 load a named profile from ~/.aws/config even
-# when keys are passed, and raise ProfileNotFound if it is absent.
-_PROFILE_ENV_VARS = ('AWS_PROFILE', 'AWS_DEFAULT_PROFILE')
+def _session_from_keys(access_key_id, secret_access_key, region=None,
+                       read_aws_config=True):
+    """
+    A boto3 Session for an explicit key pair.
+
+    The session never takes a profile name from AWS_PROFILE or
+    AWS_DEFAULT_PROFILE. Set, those make boto3 load a named profile from
+    ~/.aws/config even when keys are passed, and raise ProfileNotFound
+    when the profile is absent (or the value is blank). Overriding the
+    `profile` session variable switches that lookup off without
+    touching os.environ, so any number of threads can build clients at
+    once. The old approach, popping the variables and restoring them,
+    raced: one thread restored them in the middle of another's build.
+
+    read_aws_config=False also ignores ~/.aws/config and
+    ~/.aws/credentials altogether, so nothing in a [default] profile
+    (addressing style, signature version) reaches the client. The DCP
+    client uses that; the Wasabi client keeps reading the files, as it
+    always has.
+    """
+    session_vars = {'profile': (None, None, None, None)}
+    if not read_aws_config:
+        session_vars['config_file'] = (None, None, os.devnull, None)
+        session_vars['credentials_file'] = (None, None, os.devnull, None)
+    core = botocore.session.Session(session_vars=session_vars)
+    session_kwargs = {
+        'botocore_session': core,
+        'aws_access_key_id': access_key_id,
+        'aws_secret_access_key': secret_access_key,
+    }
+    if region:
+        session_kwargs['region_name'] = region
+    return boto3.Session(**session_kwargs)
 
 
 def _make_client():
@@ -129,33 +160,59 @@ def _wasabi_keys():
     return None
 
 
+def credential_source():
+    """
+    Where the Wasabi key comes from, by setting name: 'WASABI_*',
+    'AWS_* (fallback)', 'WASABI_PROFILE', or None when nothing is set.
+    Same order as _make_client. Names only, never values; the startup
+    log prints it so a key move that didn't take effect is visible.
+    """
+    if config.WASABI_ACCESS_KEY_ID and config.WASABI_SECRET_ACCESS_KEY:
+        return 'WASABI_*'
+    if config.AWS_ACCESS_KEY_ID and config.AWS_SECRET_ACCESS_KEY:
+        return 'AWS_* (fallback)'
+    if config.WASABI_PROFILE:
+        return 'WASABI_PROFILE'
+    return None
+
+
+def half_set_key_pairs():
+    """
+    Key-pair settings where exactly one of the two names is set, as
+    'WASABI_ACCESS_KEY_ID without WASABI_SECRET_ACCESS_KEY'. _wasabi_keys
+    skips a half-set pair silently, which is right for the client but
+    hides a typo in a key move; the startup log warns about it.
+    """
+    pairs = (
+        ('WASABI_ACCESS_KEY_ID', config.WASABI_ACCESS_KEY_ID,
+         'WASABI_SECRET_ACCESS_KEY', config.WASABI_SECRET_ACCESS_KEY),
+        ('AWS_ACCESS_KEY_ID', config.AWS_ACCESS_KEY_ID,
+         'AWS_SECRET_ACCESS_KEY', config.AWS_SECRET_ACCESS_KEY),
+    )
+    out = []
+    for id_name, id_value, secret_name, secret_value in pairs:
+        if bool(id_value) == bool(secret_value):
+            continue
+        if id_value:
+            out.append(f'{id_name} without {secret_name}')
+        else:
+            out.append(f'{secret_name} without {id_name}')
+    return out
+
+
 def _client_from_keys(access_key_id, secret_access_key, region=None):
     """
-    Build an S3 client from explicit access-key + secret.
-
-    _PROFILE_ENV_VARS stay popped across BOTH `boto3.Session()` AND
-    `session.client()` — client construction re-enters the same
-    profile-loading machinery, so popping around Session alone still
-    raises ProfileNotFound. The env vars are restored on return, and
-    the built client no longer needs them.
+    Build an S3 client from explicit access-key + secret. The session
+    comes from _session_from_keys, so a profile name in the environment
+    is never consulted (it used to raise ProfileNotFound on the live
+    host, twice).
     """
-    session_kwargs = {
-        'aws_access_key_id': access_key_id,
-        'aws_secret_access_key': secret_access_key,
-    }
-    if region:
-        session_kwargs['region_name'] = region
-
-    saved = {k: os.environ.pop(k) for k in _PROFILE_ENV_VARS if k in os.environ}
-    try:
-        session = boto3.Session(**session_kwargs)
-        return session.client(
-            's3',
-            endpoint_url=config.WASABI_ENDPOINT,
-            config=_RETRY_CONFIG,
-        )
-    finally:
-        os.environ.update(saved)
+    session = _session_from_keys(access_key_id, secret_access_key, region)
+    return session.client(
+        's3',
+        endpoint_url=config.WASABI_ENDPOINT,
+        config=_RETRY_CONFIG,
+    )
 
 
 def _client_from_profile():
@@ -518,8 +575,10 @@ def head_object(key, bucket_config=None):
     either way: a policy without bucket-wide s3:ListBucket answers a
     MISSING key with 403, and so does a request the policy rejects
     outright (source IP, clock skew). It returns exists=None ("can't
-    tell") with forbidden=True, so a caller that checks `exists` copies
-    instead of skipping; if access really is denied, the upload fails.
+    tell") with forbidden=True. The AIP copies fail fast on it, copying
+    and deleting nothing: the service key keeps bucket-wide ListBucket,
+    so a missing key answers 404 and a 403 can only mean the request
+    was denied.
 
     `bucket_config` mirrors upload_fileobj — AIP callers pass
     config.WASABI_AIP_BUCKET; otherwise we fall back to

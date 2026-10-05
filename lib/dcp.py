@@ -17,14 +17,16 @@ DuraCloud Preserve (DCP) S3 client.
 
 DuraCloud Preserve is plain AWS S3; there is no DuraCloud API anymore.
 This module builds the boto3 client for it and wraps the calls the
-curation service needs: probe a location, look at one key, list a
-prefix, and open a (ranged) read of one object.
+curation service needs: probe a location, list a prefix, and open a
+(ranged) read of one object.
 
 It is separate from lib/wasabi.py on purpose: a different provider, with
-different credentials and region rules. Both modules pass explicit keys
-and a region and never fall back to boto3's default credential chain, so
-AWS and Wasabi credentials can share this process without either being
-picked up for the other.
+different credentials and region rules. The DCP client is built from the
+explicit DCP_* settings only. It never uses boto3's default credential
+chain, never takes a profile name from the environment, and ignores
+~/.aws/config and ~/.aws/credentials entirely, so the Wasabi key (in
+AWS_* or a profile) can share this process without reaching DCP, and
+vice versa.
 
 Locations use the WASABI_AIP_BUCKET form, `s3://<bucket>/<prefix>/`:
 
@@ -32,30 +34,31 @@ Locations use the WASABI_AIP_BUCKET form, `s3://<bucket>/<prefix>/`:
     DCP_AIP_LOCATION=s3://dcp-archivesdu-aip-store/aip-store/
 """
 
-import os
 import time
 
-import boto3
 from botocore.config import Config
-from botocore.exceptions import BotoCoreError, ClientError
+from botocore.exceptions import ClientError
 
 import config
 from lib import wasabi
 
-# Data reads: retry transient failures. read_timeout bounds each socket
-# read, not the whole transfer, so long streams are fine. Endpoint URLs
-# from the environment or ~/.aws/config are ignored: a stray
-# AWS_ENDPOINT_URL_S3 meant for another provider must not redirect DCP.
+# Data reads: retry transient failures (six attempts in all, the same as
+# lib/wasabi.py). read_timeout bounds each socket read, not the whole
+# transfer, so long streams are fine. Endpoint URLs from the environment
+# or ~/.aws/config are ignored: a stray AWS_ENDPOINT_URL_S3 meant for
+# another provider must not redirect DCP.
 _DATA_CONFIG = Config(
-    retries={'max_attempts': 5, 'mode': 'adaptive'},
+    retries={'total_max_attempts': 6, 'mode': 'adaptive'},
     connect_timeout=30,
     read_timeout=180,
     ignore_configured_endpoint_urls=True,
 )
 
-# Health probes answer fast or report failure: one attempt, short timeouts.
+# Health probes answer fast or report failure: exactly one attempt per
+# location (botocore's `max_attempts` counts retries, so it is not used
+# here), with short timeouts.
 _PROBE_CONFIG = Config(
-    retries={'max_attempts': 1},
+    retries={'total_max_attempts': 1},
     connect_timeout=10,
     read_timeout=15,
     ignore_configured_endpoint_urls=True,
@@ -98,10 +101,12 @@ def make_client(probe=False):
     Build a boto3 S3 client for DCP from the explicit DCP_* settings.
 
     probe=True uses the single-attempt, short-timeout config for health
-    checks. AWS_PROFILE / AWS_DEFAULT_PROFILE are popped while the
-    session and client are built, the same guard as
-    wasabi._client_from_keys: set, they make boto3 load a named profile
-    even when keys are passed.
+    checks. The session comes from wasabi._session_from_keys with the
+    AWS config files switched off, so neither a profile name in the
+    environment nor a [default] profile on disk can change how this
+    client signs or addresses requests. Building is safe from any
+    thread; a built client is safe to share between threads, so build
+    one per job rather than one per call.
     """
     if not is_configured():
         raise RuntimeError(
@@ -112,18 +117,13 @@ def make_client(probe=False):
     if config.DCP_ENDPOINT_URL:
         client_kwargs['endpoint_url'] = config.DCP_ENDPOINT_URL
 
-    saved = {
-        k: os.environ.pop(k) for k in wasabi._PROFILE_ENV_VARS if k in os.environ
-    }
-    try:
-        session = boto3.Session(
-            aws_access_key_id=config.DCP_ACCESS_KEY_ID,
-            aws_secret_access_key=config.DCP_SECRET_ACCESS_KEY,
-            region_name=config.DCP_REGION,
-        )
-        return session.client('s3', **client_kwargs)
-    finally:
-        os.environ.update(saved)
+    session = wasabi._session_from_keys(
+        config.DCP_ACCESS_KEY_ID,
+        config.DCP_SECRET_ACCESS_KEY,
+        config.DCP_REGION,
+        read_aws_config=False,
+    )
+    return session.client('s3', **client_kwargs)
 
 
 def iter_objects(bucket, prefix, client=None):
@@ -148,7 +148,7 @@ def iter_objects(bucket, prefix, client=None):
         kwargs['ContinuationToken'] = resp['NextContinuationToken']
 
 
-def open_range(bucket, key, offset=0, client=None):
+def open_range(bucket, key, offset=0, client=None, if_match=None):
     """
     Open a streamed read of one object, from byte `offset` to the end.
 
@@ -157,14 +157,24 @@ def open_range(bucket, key, offset=0, client=None):
     Content-Range starting at `offset`. Anything else raises RangeError,
     because splicing a whole body onto a partial read would corrupt the
     copy.
+
+    `if_match` is the ETag of the response the read started with. Pass
+    it when resuming: S3 then answers 412 (a ClientError,
+    PreconditionFailed) if the object was replaced in between, instead
+    of handing back bytes of a different object that happen to start at
+    `offset`. An offset at or past the end of the object is a
+    ClientError too (InvalidRange, 416), not a RangeError.
     """
     if offset < 0:
         raise ValueError(f'offset must be >= 0 (got {offset})')
     client = client or make_client()
+    kwargs = {'Bucket': bucket, 'Key': key}
+    if if_match:
+        kwargs['IfMatch'] = if_match
     if not offset:
-        return client.get_object(Bucket=bucket, Key=key)
+        return client.get_object(**kwargs)
 
-    resp = client.get_object(Bucket=bucket, Key=key, Range=f'bytes={offset}-')
+    resp = client.get_object(Range=f'bytes={offset}-', **kwargs)
     status = resp.get('ResponseMetadata', {}).get('HTTPStatusCode')
     content_range = resp.get('ContentRange') or ''
     if status != 206 or not content_range.startswith(f'bytes {offset}-'):
@@ -185,12 +195,17 @@ def health_check():
     contract as wasabi.health_check, so /health/dcp can always answer 200:
 
         {'ok': bool, 'configured': bool, 'error': str or None,
-         'locations': [{'name', 'setting', 'bucket', 'prefix', 'ok',
-                        'error'}],
+         'locations': [{'name', 'setting', 'bucket', 'prefix', 'keys',
+                        'ok', 'error'}],
          'elapsed_ms': int}
 
     The probe is a prefix listing, not head_bucket, because it needs only
-    ListBucket on the prefix: the narrowest grant DCP may issue.
+    ListBucket on the prefix: the narrowest grant DCP may issue. A
+    location is ok only when the listing returns a key (`keys` is 1):
+    both DCP locations hold thousands of objects, so an empty answer
+    means the bucket or prefix in the setting is wrong, not that the
+    store is fine. (A local MinIO must hold at least one object per
+    location to probe green.)
     """
     started = time.monotonic()
     out = {
@@ -212,8 +227,10 @@ def health_check():
         return done()
     try:
         client = make_client(probe=True)
-    except (BotoCoreError, RuntimeError) as e:
-        out['error'] = str(e)
+    except Exception as e:  # noqa: BLE001
+        # A malformed DCP_ENDPOINT_URL raises ValueError from botocore;
+        # whatever the cause, the probe reports it rather than raising.
+        out['error'] = f'{type(e).__name__}: {e}'
         return done()
 
     for name, setting in LOCATION_SETTINGS:
@@ -224,23 +241,31 @@ def health_check():
             'setting': setting,
             'bucket': None,
             'prefix': None,
+            'keys': None,
             'ok': False,
             'error': None,
         }
         try:
             loc['bucket'], loc['prefix'] = location(setting)
-            client.list_objects_v2(
+            resp = client.list_objects_v2(
                 Bucket=loc['bucket'], Prefix=loc['prefix'], MaxKeys=1,
             )
-            loc['ok'] = True
+            loc['keys'] = len(resp.get('Contents', []))
+            if loc['keys']:
+                loc['ok'] = True
+            else:
+                loc['error'] = (
+                    'the listing is empty: check the bucket and prefix in '
+                    f'{setting}'
+                )
         except ClientError as e:
             err = e.response.get('Error', {})
             loc['error'] = (
                 f"list_objects_v2 failed ({err.get('Code', 'unknown')}): "
                 f"{err.get('Message', '')}"
             ).rstrip(': ')
-        except (BotoCoreError, RuntimeError) as e:
-            loc['error'] = str(e)
+        except Exception as e:  # noqa: BLE001
+            loc['error'] = f'{type(e).__name__}: {e}'
         out['locations'].append(loc)
 
     if not out['locations']:

@@ -557,11 +557,16 @@ def copy_aip_from_duracloud(aip_uuid, repo_uuid):
         return done(f'wasabi head_object failed: {e}')
     bucket_name = head.get('bucket')
     if head.get('forbidden'):
-        logger.warning(
-            'copy_aip_from_duracloud HEAD_FORBIDDEN key=%s — cannot confirm '
-            'an existing copy; copying anyway',
-            key,
+        # Same rule as the AM path: a 403 proves nothing, and the
+        # verification cleanup below deletes whatever is at the key, so
+        # a copy over an unseen good object could end in its deletion.
+        logger.error(
+            'copy_aip_from_duracloud HEAD_FORBIDDEN key=%s — Wasabi answered '
+            '403, so the copy cannot tell whether %s already holds the AIP; '
+            'nothing copied',
+            key, bucket_name,
         )
+        return done(aip_ops._forbidden_error(key))
     if head.get('exists'):
         existing_size = head.get('content_length')
         # Skip only on a size we can see (same rule as the AM path).
@@ -580,15 +585,26 @@ def copy_aip_from_duracloud(aip_uuid, repo_uuid):
                 key, out['bytes'],
             )
             return done()
-        logger.warning(
-            'copy_aip_from_duracloud SIZE_MISMATCH key=%s existing=%s '
-            'expected=%s — deleting and re-copying',
-            key, existing_size, expected_bytes,
-        )
-        try:
-            wasabi.delete_object(key, bucket_config=config.WASABI_AIP_BUCKET)
-        except Exception as e:
-            return done(f'wasabi delete of stale object failed: {e}')
+        if existing_size is None:
+            # Unexpected (S3 always reports a size). Copy over it without
+            # a delete: S3 replaces the object only when the new upload
+            # completes.
+            logger.warning(
+                'copy_aip_from_duracloud UNKNOWN_SIZE key=%s — copying over it',
+                key,
+            )
+        else:
+            logger.warning(
+                'copy_aip_from_duracloud SIZE_MISMATCH key=%s existing=%s '
+                'expected=%s — deleting and re-copying',
+                key, existing_size, expected_bytes,
+            )
+            try:
+                wasabi.delete_object(
+                    key, bucket_config=config.WASABI_AIP_BUCKET,
+                )
+            except Exception as e:
+                return done(f'wasabi delete of stale object failed: {e}')
 
     # --- Resolve the DuraCloud shape: single object or chunked ----------
     manifest = None

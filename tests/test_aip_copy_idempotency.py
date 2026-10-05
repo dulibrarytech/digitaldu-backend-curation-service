@@ -4,9 +4,11 @@
 Tests for the pre-copy idempotency probe in
 lib/aip_ops.copy_aip_to_wasabi.
 
-A HEAD that Wasabi answers with 403 can't show the AIP is already there:
-a policy without bucket-wide s3:ListBucket returns 403 for a missing key.
-The copy must run instead of reporting success.
+A HEAD that Wasabi answers with 403 proves nothing: a policy without
+bucket-wide s3:ListBucket returns 403 for a missing key, and a denied
+request returns it for a present one. The copy must neither report
+success nor run: it fails fast, copying and deleting nothing, and the
+caller retries once access is fixed.
 
 The AM + Wasabi layers are faked at the module boundary; no network.
 
@@ -66,12 +68,15 @@ class IdempotencyProbeTests(unittest.TestCase):
     def _run_copy(self, head):
         """
         Drive copy_aip_to_wasabi with `head` as the probe's answer.
-        Returns (result, uploads, deletes).
+        Returns (result, uploads, deletes); self.am_urls records every
+        AM request made.
         """
         uploads = []
         deletes = []
+        self.am_urls = []
 
         def fake_get(url, **kwargs):
+            self.am_urls.append(url)
             if url.endswith('/download/'):
                 return FakeDownloadResponse()
             return FakeMetaResponse()
@@ -88,18 +93,32 @@ class IdempotencyProbeTests(unittest.TestCase):
             result = aip_ops.copy_aip_to_wasabi(UUID, 'codu:x')
         return result, uploads, deletes
 
-    def test_forbidden_head_copies_instead_of_skipping(self):
+    def test_forbidden_head_fails_fast_without_copying(self):
         result, uploads, deletes = self._run_copy({
             'exists': None, 'forbidden': True, 'bucket': 'aip-bucket',
             'content_length': None,
         })
-        self.assertTrue(result['ok'], result.get('error'))
+        self.assertFalse(result['ok'])
+        self.assertIn('403', result['error'])
+        self.assertIn('nothing was copied', result['error'])
         self.assertFalse(result.get('idempotent'))
-        self.assertEqual(len(uploads), 1)
+        self.assertEqual(uploads, [])
         self.assertEqual(deletes, [])
+        # No AIP download was requested from Archivematica either.
+        self.assertFalse(any(u.endswith('/download/') for u in self.am_urls))
+
+    def test_forbidden_error_is_retryable_for_repov2(self):
+        # repov2 dead-letters "AM status is DELETED" and budgets
+        # "not found in ..."; the 403 error must match neither.
+        result, _, _ = self._run_copy({
+            'exists': None, 'forbidden': True, 'bucket': 'aip-bucket',
+            'content_length': None,
+        })
+        self.assertNotIn('AM status is DELETED', result['error'])
+        self.assertNotIn('not found in', result['error'])
 
     def test_forbidden_head_is_logged(self):
-        with self.assertLogs('lib.aip_ops', level='WARNING') as logs:
+        with self.assertLogs('lib.aip_ops', level='ERROR') as logs:
             self._run_copy({
                 'exists': None, 'forbidden': True, 'bucket': 'aip-bucket',
                 'content_length': None,
@@ -115,12 +134,22 @@ class IdempotencyProbeTests(unittest.TestCase):
         self.assertEqual(result['bytes'], SIZE)
         self.assertEqual(uploads, [])
 
-    def test_existing_copy_of_unknown_size_is_replaced(self):
+    def test_existing_copy_of_unknown_size_is_copied_over_not_deleted(self):
+        # S3 replaces the object only when the new upload completes, so
+        # a delete first would only risk the copy that is there.
         result, uploads, deletes = self._run_copy({
             'exists': True, 'bucket': 'aip-bucket', 'content_length': None,
         })
         self.assertTrue(result['ok'], result.get('error'))
         self.assertFalse(result.get('idempotent'))
+        self.assertEqual(deletes, [])
+        self.assertEqual(len(uploads), 1)
+
+    def test_size_mismatch_still_deletes_then_copies(self):
+        result, uploads, deletes = self._run_copy({
+            'exists': True, 'bucket': 'aip-bucket', 'content_length': SIZE - 1,
+        })
+        self.assertTrue(result['ok'], result.get('error'))
         self.assertEqual(len(deletes), 1)
         self.assertEqual(len(uploads), 1)
 
