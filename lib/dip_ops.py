@@ -31,6 +31,16 @@ MD5, with the part sizes from HeadObject), and the upload is one PutObject
 carrying Content-MD5, so Wasabi rejects corrupted bytes itself. Nothing is
 ever deleted: a PutObject replaces an object only once it is complete.
 
+The part-by-part check is the main path for new DIPs, not an edge case.
+Archivematica uploads every file of 8 MiB or more in parts (boto3
+upload_fileobj with the default TransferConfig), so from P3 on, every
+served file that size has a multipart ETag. Only 6 files in the backfill
+are multipart, which makes the check look rare; without it, every large
+new file would be checked by size alone.
+
+What Wasabi already holds comes from wasabi_copies(), one listing for a
+whole run, rather than a HeadObject per file.
+
 The caller builds the two clients once (dcp.make_client(),
 wasabi._make_client()) and passes them in. A build costs about 45 ms, and
 a built client is safe to share between threads.
@@ -197,24 +207,23 @@ class _PartDigests:
         return hashlib.md5(b''.join(self._digests)).hexdigest() + f'-{len(self._digests)}'
 
 
-def _error_code(err):
-    return err.response.get('Error', {}).get('Code') if isinstance(err, ClientError) else None
-
-
-def _wasabi_head(client, bucket, key):
+def wasabi_copies(wasabi_client, locs, prefixes=None):
     """
-    (size, etag) of the Wasabi copy, or None when there is none. A 403
-    reads as "none" too: it can't prove the copy is there, and copying
-    over it is safe (one verified PutObject, never a delete). Anything
-    else raises.
+    {rel: (size, etag)} for every object under the Wasabi DIP prefix, or
+    under each of `prefixes` (relative to it, as in served_keys). One
+    listing of 1,000 keys a page: about 110 requests for the whole store,
+    where a HeadObject per file would be about 108,000. The backfill lists
+    the run's prefixes; the P3 route lists the one DIP folder.
+
+    A listing error raises: without the listing, nothing can be skipped.
     """
-    try:
-        resp = client.head_object(Bucket=bucket, Key=key)
-    except ClientError as err:
-        if _error_code(err) in ('404', 'NoSuchKey', 'NotFound', '403', 'AccessDenied'):
-            return None
-        raise
-    return resp.get('ContentLength'), (resp.get('ETag') or '').strip('"')
+    bucket, base = locs[1]
+    found = {}
+    for p in prefixes or ['']:
+        for obj in dcp.iter_objects(bucket, base + p.lstrip('/'), client=wasabi_client):
+            if obj['key'].startswith(base):
+                found[obj['key'][len(base):]] = (obj['size'], obj['etag'])
+    return found
 
 
 def _result(item, outcome, error=None, verified=None):
@@ -227,21 +236,26 @@ def _result(item, outcome, error=None, verified=None):
     }
 
 
-def copy_file(item, dcp_client, wasabi_client, locs, execute=True):
+def copy_file(item, dcp_client, wasabi_client, locs, execute=True, existing=None):
     """
     Copy one served file and verify it. `item` is a served_keys entry
-    (key, rel, size, etag from the DCP listing); `locs` is locations().
+    (key, rel, size, etag from the DCP listing); `locs` is locations();
+    `existing` is the (size, etag) of the Wasabi copy from
+    wasabi_copies(), or None when Wasabi has none.
 
     Returns {'key': rel, 'outcome', 'bytes', 'error', 'verified'}, where
     outcome is
       'skipped'    Wasabi already holds it: same size and, for a
                    single-part DCP object, the same ETag (both MD5s).
-                   A multipart DCP object (6 PDFs) is compared by size.
+                   A multipart DCP object is compared by size alone:
+                   its ETag is not an MD5, so it can never equal the
+                   one Wasabi gives our single PutObject.
       'would_copy' execute=False and the file isn't there yet.
       'copied'     read, checked and written. `verified` says how the
                    bytes read from DCP were checked: 'md5' against a
                    single-part ETag; 'parts' against a multipart ETag,
-                   with the part sizes from HeadObject; 'size' only,
+                   with the part sizes from HeadObject (every new file
+                   of 8 MiB or more; see the module docstring); 'size' only,
                    when DCP wouldn't give the part sizes.
       'failed'     anything else; `error` says what. Nothing was deleted,
                    and a re-run tries again.
@@ -253,10 +267,6 @@ def copy_file(item, dcp_client, wasabi_client, locs, execute=True):
     size = item.get('size')
     etag = (item.get('etag') or '').lower()
 
-    try:
-        existing = _wasabi_head(wasabi_client, wasabi_bucket, target)
-    except (ClientError, BotoCoreError) as err:
-        return _result(item, 'failed', f'wasabi head failed: {err}')
     if existing is not None:
         have_size, have_etag = existing
         same_size = have_size is not None and size is not None and int(have_size) == int(size)

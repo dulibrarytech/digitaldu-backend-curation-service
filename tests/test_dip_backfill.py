@@ -8,8 +8,8 @@
 
 """
 Tests for scripts/dip_backfill.py: dry run, copying with several workers,
-resuming, one failure not stopping the rest, --prefix and --limit, and
-main()'s exit codes.
+resuming, one failure not stopping the rest, --prefix and --limit, the one
+Wasabi listing per run, and main()'s exit codes.
 
 Both stores are an in-memory fake S3 keyed by bucket and key, safe to call
 from several threads, so the tests run the real worker pool.
@@ -51,17 +51,27 @@ def not_found(op):
                         'ResponseMetadata': {'HTTPStatusCode': 404}}, op)
 
 
+def access_denied(op):
+    return ClientError({'Error': {'Code': 'AccessDenied', 'Message': 'Access Denied'},
+                        'ResponseMetadata': {'HTTPStatusCode': 403}}, op)
+
+
 class FakeS3:
-    """Just enough of an S3 client, keyed by (bucket, key)."""
+    """
+    Just enough of an S3 client, keyed by (bucket, key). `calls` records
+    each listing (by prefix) and each HeadObject (by key).
+    """
 
     def __init__(self, objects=None, etags=None):
         self.objects = dict(objects or {})
         self.etags = dict(etags or {})
         self.puts = []
+        self.calls = []
         self.lock = threading.Lock()
 
     def list_objects_v2(self, Bucket, Prefix, ContinuationToken=None):
         with self.lock:
+            self.calls.append(('list', Prefix))
             keys = sorted(k for (b, k) in self.objects if b == Bucket and k.startswith(Prefix))
             return {
                 'IsTruncated': False,
@@ -77,6 +87,7 @@ class FakeS3:
 
     def head_object(self, Bucket, Key):
         with self.lock:
+            self.calls.append(('head', Key))
             if (Bucket, Key) not in self.objects:
                 raise not_found('HeadObject')
             data = self.objects[(Bucket, Key)]
@@ -190,6 +201,25 @@ class RunTests(unittest.TestCase):
         self.assertEqual(summary['copied'], 0)
         self.assertEqual(target.puts, [])
 
+    def test_a_dry_run_after_a_copy_reports_everything_as_skipped(self):
+        source, target = dcp_store(), FakeS3()
+        run(source, target, workers=4, execute=True)
+        target.puts.clear()
+        summary, _, _ = run(source, target, workers=4, execute=False)
+        self.assertEqual(summary['skipped'], 5)
+        self.assertEqual(summary['would_copy'], 0)
+        self.assertEqual(target.puts, [])
+
+    def test_wasabi_is_listed_once_and_never_headed(self):
+        """
+        What Wasabi holds comes from one listing of the run's prefix (about
+        110 requests for the whole store), not a HeadObject per file
+        (about 108,000).
+        """
+        source, target = dcp_store(), FakeS3()
+        run(source, target, workers=4, execute=True)
+        self.assertEqual(target.calls, [('list', WASABI_LOC[1])])
+
     def test_one_failure_does_not_stop_the_rest(self):
         source = dcp_store(etags={f'{FOLDER}/objects/a-page.pdf': md5(b'the original')})
         target = FakeS3()
@@ -207,6 +237,7 @@ class RunTests(unittest.TestCase):
         self.assertEqual({r['key'] for r in results},
                          {f'{OTHER}/thumbnails/b.jpg', f'{OTHER}/objects/b-photo.jpg'})
         self.assertEqual(summary['copied'], 2)
+        self.assertEqual(target.calls, [('list', f'{WASABI_LOC[1]}{OTHER}/')])
 
     def test_limit_stops_after_n_served_files(self):
         source, target = dcp_store(), FakeS3()
@@ -259,6 +290,20 @@ class MainTests(unittest.TestCase):
         with patch.object(config, 'WASABI_DIP_BUCKET', None):
             self.assertEqual(dip_backfill.main([]), 1)
 
+    def test_exit_1_and_nothing_copied_when_wasabi_cannot_be_listed(self):
+        source, target = dcp_store(), FakeS3()
+
+        def denied(**kwargs):
+            raise access_denied('ListObjectsV2')
+
+        a, b = self.clients(source, target)
+        with a, b, patch.object(target, 'list_objects_v2', denied), \
+                patch('sys.stdout', new_callable=io.StringIO), \
+                self.assertLogs('dip_backfill', level='ERROR') as logs:
+            self.assertEqual(dip_backfill.main(['--execute']), 1)
+        self.assertIn('listing failed', '\n'.join(logs.output))
+        self.assertEqual(target.puts, [])
+
     def test_exit_3_when_nothing_is_listed(self):
         # A --prefix that already includes dip-store/ lists nothing: that
         # must not look like a clean run.
@@ -291,6 +336,24 @@ class MainTests(unittest.TestCase):
         # Whatever finished was recorded; nothing was lost to the pool.
         self.assertEqual(summary['files'], len(lines) - 1)
         self.assertEqual(summary['copied'], len(target.puts))
+
+    def test_exit_130_when_interrupted_during_the_wasabi_listing(self):
+        # A Ctrl-C before any file is recorded is an interruption, not
+        # "nothing listed" (exit 3).
+        source, target = dcp_store(), FakeS3()
+
+        def interrupt(**kwargs):
+            raise KeyboardInterrupt
+
+        a, b = self.clients(source, target)
+        with a, b, patch.object(target, 'list_objects_v2', interrupt), \
+                patch('sys.stdout', new_callable=io.StringIO) as out:
+            code = dip_backfill.main(['--execute'])
+        self.assertEqual(code, 130)
+        summary = json.loads(out.getvalue().splitlines()[-1])['summary']
+        self.assertTrue(summary['interrupted'])
+        self.assertEqual(summary['files'], 0)
+        self.assertEqual(target.puts, [])
 
     def test_builds_each_client_once_for_the_whole_run(self):
         source, target = dcp_store(), FakeS3()

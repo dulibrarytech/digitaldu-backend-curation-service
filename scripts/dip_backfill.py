@@ -23,13 +23,15 @@ already has: no database and no input file.
 
 Safety model:
   * DRY-RUN BY DEFAULT. Without --execute it only reports what it would
-    copy (it still checks Wasabi for what is already there).
+    copy (it still lists Wasabi to see what is already there).
   * Never deletes anything.
   * Every copied file is verified: the MD5 of the bytes read from DCP
     against DCP's ETag (part by part for a multipart object), and
     Content-MD5 on the upload.
   * A file Wasabi already holds with the same size and ETag is skipped,
-    so an interrupted run just starts again.
+    so an interrupted run just starts again. What Wasabi holds comes from
+    one listing at the start (about 110 requests for the whole store),
+    not a request per file, so a full dry run takes minutes.
   * Ctrl-C stops taking new files, lets the copies in flight finish (a
     copy can't be cut short), records them, and writes the summary with
     "interrupted": true. A second Ctrl-C abandons the copies in flight;
@@ -58,7 +60,7 @@ stderr.
 Exit codes: 0 = every served file is copied or already there;
 2 = some files failed; 3 = nothing was listed (a wrong --prefix, or a
 prefix that already includes dip-store/); 130 = interrupted;
-1 = config error.
+1 = config error, or DCP or Wasabi could not be listed.
 """
 
 import argparse
@@ -67,6 +69,8 @@ import logging
 import sys
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
+
+from botocore.exceptions import BotoCoreError, ClientError
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -91,8 +95,10 @@ def run(dcp_client, wasabi_client, locs, prefixes=None, limit=None,
     """
     Copy (or, without execute, plan) every served file. Writes one JSON
     line per file and a summary line to `out`; returns the summary.
-    Files are handed to the pool a few at a time, so memory stays flat
-    over a 108,000-file run.
+    Wasabi is listed once, up front, for the same prefixes; a listing
+    error raises before anything is copied. Files are handed to the pool
+    a few at a time, so the pool's memory stays flat over a 108,000-file
+    run (the Wasabi listing itself is about 40 MB at that size).
     """
     workers = max(1, workers)
     summary = {outcome: 0 for outcome in OUTCOMES}
@@ -116,11 +122,14 @@ def run(dcp_client, wasabi_client, locs, prefixes=None, limit=None,
     pending = set()
     pool = ThreadPoolExecutor(max_workers=workers)
     try:
+        existing = dip_ops.wasabi_copies(wasabi_client, locs, prefixes)
+        logger.info('wasabi already holds %d files under the run\'s prefixes', len(existing))
         for n, item in enumerate(served_items(dcp_client, locs, prefixes), 1):
             if limit and n > limit:
                 break
             pending.add(pool.submit(
                 dip_ops.copy_file, item, dcp_client, wasabi_client, locs, execute,
+                existing.get(item['rel']),
             ))
             if len(pending) >= workers * 4:
                 done, pending = wait(pending, return_when=FIRST_COMPLETED)
@@ -189,6 +198,9 @@ def main(argv=None):
         summary = run(dcp_client, wasabi_client, locs, prefixes=args.prefix,
                       limit=args.limit, workers=args.workers,
                       execute=args.execute, out=out)
+    except (ClientError, BotoCoreError) as e:
+        logger.error('listing failed: %s', e)
+        return 1
     finally:
         if args.log:
             out.close()
@@ -201,6 +213,11 @@ def main(argv=None):
         summary['bytes_copied'] / 1024 ** 3, summary['skipped'],
         summary['would_copy'], summary['failed'],
     )
+    # Interrupted first: a Ctrl-C during the listings records no files,
+    # and that is not "nothing listed".
+    if summary['interrupted']:
+        logger.warning('interrupted: re-run to continue; what landed is skipped')
+        return 130
     if summary['files'] == 0:
         logger.warning('nothing listed under s3://%s/%s%s — check --prefix (it is '
                        'relative to the DIP location, without dip-store/)',
@@ -210,9 +227,6 @@ def main(argv=None):
     if not args.execute:
         logger.info('dry-run only — re-run with --execute to copy, then run '
                     'dcp_inventory.py check-served')
-    if summary['interrupted']:
-        logger.warning('interrupted: re-run to continue; what landed is skipped')
-        return 130
     return 0 if summary['failed'] == 0 else 2
 
 

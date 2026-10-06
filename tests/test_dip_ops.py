@@ -7,8 +7,8 @@
 #     http://www.apache.org/licenses/LICENSE-2.0
 
 """
-Unit tests for lib/dip_ops.py: the served-file rule, the verified copy and
-the completeness check.
+Unit tests for lib/dip_ops.py: the served-file rule, the Wasabi listing,
+the verified copy and the completeness check.
 
 DCP and Wasabi are real boto3 clients with botocore Stubbers, so nothing
 touches the network. The clients are built with wasabi._session_from_keys,
@@ -24,6 +24,7 @@ import io
 import unittest
 from unittest.mock import patch
 
+from botocore.exceptions import ClientError
 from botocore.response import StreamingBody
 from botocore.stub import ANY, Stubber
 
@@ -128,6 +129,54 @@ class LocationsTests(unittest.TestCase):
             )
 
 
+class WasabiCopiesTests(unittest.TestCase):
+
+    def setUp(self):
+        self.wasabi = s3_client()
+        self.stub = Stubber(self.wasabi)
+        self.stub.activate()
+        self.addCleanup(self.stub.deactivate)
+
+    def page(self, prefix, entries, token=None, next_token=None):
+        resp = {
+            'IsTruncated': next_token is not None,
+            'Contents': [
+                {'Key': WASABI_LOC[1] + rel, 'Size': size, 'ETag': f'"{etag}"'}
+                for rel, size, etag in entries
+            ],
+        }
+        if next_token:
+            resp['NextContinuationToken'] = next_token
+        params = {'Bucket': WASABI_LOC[0], 'Prefix': prefix}
+        if token:
+            params['ContinuationToken'] = token
+        self.stub.add_response('list_objects_v2', resp, params)
+
+    def test_indexes_every_page_of_the_listing_by_rel(self):
+        self.page(WASABI_LOC[1], [(f'{FOLDER}/thumbnails/a.jpg', 4, 'aa')], next_token='t1')
+        self.page(WASABI_LOC[1], [(f'{FOLDER}/objects/a.pdf', 9, 'bb-2')], token='t1')
+        out = dip_ops.wasabi_copies(self.wasabi, LOCS)
+        self.assertEqual(out, {
+            f'{FOLDER}/thumbnails/a.jpg': (4, 'aa'),
+            f'{FOLDER}/objects/a.pdf': (9, 'bb-2'),
+        })
+        self.stub.assert_no_pending_responses()
+
+    def test_lists_only_the_given_prefixes(self):
+        self.page(f'{WASABI_LOC[1]}{FOLDER}/', [(f'{FOLDER}/thumbnails/a.jpg', 4, 'aa')])
+        self.page(f'{WASABI_LOC[1]}other/', [])
+        out = dip_ops.wasabi_copies(self.wasabi, LOCS, [f'{FOLDER}/', '/other/'])
+        self.assertEqual(out, {f'{FOLDER}/thumbnails/a.jpg': (4, 'aa')})
+        self.stub.assert_no_pending_responses()
+
+    def test_a_listing_error_raises(self):
+        # Nothing can be skipped without the listing, so the caller stops.
+        self.stub.add_client_error('list_objects_v2', service_error_code='AccessDenied',
+                                   http_status_code=403)
+        with self.assertRaises(ClientError):
+            dip_ops.wasabi_copies(self.wasabi, LOCS)
+
+
 class CopyFileTests(unittest.TestCase):
 
     def setUp(self):
@@ -139,18 +188,6 @@ class CopyFileTests(unittest.TestCase):
         self.wasabi_stub.activate()
         self.addCleanup(self.dcp_stub.deactivate)
         self.addCleanup(self.wasabi_stub.deactivate)
-
-    def head(self, rel, size=None, etag=None, error=None):
-        params = {'Bucket': WASABI_LOC[0], 'Key': WASABI_LOC[1] + rel}
-        if error:
-            self.wasabi_stub.add_client_error(
-                'head_object', service_error_code=error,
-                http_status_code=int(error), expected_params=params,
-            )
-        else:
-            self.wasabi_stub.add_response(
-                'head_object', {'ContentLength': size, 'ETag': f'"{etag}"'}, params,
-            )
 
     def get(self, rel, data):
         self.dcp_stub.add_response(
@@ -172,21 +209,22 @@ class CopyFileTests(unittest.TestCase):
         )
 
     def done(self):
+        # Every stubbed call was made, and nothing else: a call with no
+        # stub left raises inside copy_file and fails the test.
         self.dcp_stub.assert_no_pending_responses()
         self.wasabi_stub.assert_no_pending_responses()
 
     def test_skips_a_file_wasabi_holds_with_the_same_size_and_etag(self):
         rel = f'{FOLDER}/thumbnails/a.jpg'
         data = b'jpeg'
-        self.head(rel, size=len(data), etag=md5(data))
-        out = dip_ops.copy_file(item(rel, data), self.dcp, self.wasabi, LOCS)
+        out = dip_ops.copy_file(item(rel, data), self.dcp, self.wasabi, LOCS,
+                                existing=(len(data), md5(data)))
         self.assertEqual(out['outcome'], 'skipped')
         self.done()
 
     def test_copies_a_missing_file_with_content_md5_and_type(self):
         rel = f'{FOLDER}/objects/a-page.pdf'
         data = b'%PDF-1.7 some bytes'
-        self.head(rel, error='404')
         self.get(rel, data)
         self.put(rel, data, 'application/pdf')
         out = dip_ops.copy_file(item(rel, data), self.dcp, self.wasabi, LOCS)
@@ -199,7 +237,6 @@ class CopyFileTests(unittest.TestCase):
     def test_a_wasabi_put_error_is_a_failure_not_a_raise(self):
         rel = f'{FOLDER}/objects/a-page.pdf'
         data = b'%PDF-1.7 some bytes'
-        self.head(rel, error='404')
         self.get(rel, data)
         self.wasabi_stub.add_client_error(
             'put_object', service_error_code='AccessDenied', http_status_code=403,
@@ -215,7 +252,6 @@ class CopyFileTests(unittest.TestCase):
         # stream ends early or the connection drops while reading.
         rel = f'{FOLDER}/objects/a-page.pdf'
         data = b'%PDF-1.7 some bytes'
-        self.head(rel, error='404')
         truncated = StreamingBody(io.BytesIO(data[:5]), len(data))
         self.dcp_stub.add_response(
             'get_object', {'Body': truncated, 'ContentLength': len(data)},
@@ -226,30 +262,19 @@ class CopyFileTests(unittest.TestCase):
         self.assertIn('dcp read failed', out['error'])
         self.done()
 
-    def test_a_403_on_the_check_copies_rather_than_skips(self):
-        rel = f'{FOLDER}/thumbnails/a.jpg'
-        data = b'jpeg'
-        self.head(rel, error='403')
-        self.get(rel, data)
-        self.put(rel, data, 'image/jpeg')
-        out = dip_ops.copy_file(item(rel, data), self.dcp, self.wasabi, LOCS)
-        self.assertEqual(out['outcome'], 'copied')
-        self.done()
-
     def test_recopies_when_the_wasabi_etag_differs(self):
         rel = f'{FOLDER}/thumbnails/a.jpg'
         data = b'jpeg'
-        self.head(rel, size=len(data), etag=md5(b'other'))
         self.get(rel, data)
         self.put(rel, data, 'image/jpeg')
-        out = dip_ops.copy_file(item(rel, data), self.dcp, self.wasabi, LOCS)
+        out = dip_ops.copy_file(item(rel, data), self.dcp, self.wasabi, LOCS,
+                                existing=(len(data), md5(b'othr')))
         self.assertEqual(out['outcome'], 'copied')
         self.done()
 
     def test_an_md5_mismatch_fails_before_anything_is_written(self):
         rel = f'{FOLDER}/objects/a-page.pdf'
         data = b'%PDF-1.7 corrupted in transit'
-        self.head(rel, error='404')
         self.get(rel, data)
         out = dip_ops.copy_file(item(rel, data, etag=md5(b'original')), self.dcp, self.wasabi, LOCS)
         self.assertEqual(out['outcome'], 'failed')
@@ -260,7 +285,6 @@ class CopyFileTests(unittest.TestCase):
         rel = f'{FOLDER}/objects/a-page.pdf'
         data = b'%PDF'
         listed = dict(item(rel, data), size=10)
-        self.head(rel, error='404')
         self.get(rel, data)
         out = dip_ops.copy_file(listed, self.dcp, self.wasabi, LOCS)
         self.assertEqual(out['outcome'], 'failed')
@@ -270,8 +294,8 @@ class CopyFileTests(unittest.TestCase):
     def test_a_multipart_dcp_object_is_compared_by_size(self):
         rel = f'{FOLDER}/objects/big.pdf'
         data = b'%PDF big'
-        self.head(rel, size=len(data), etag=md5(data))
-        out = dip_ops.copy_file(item(rel, data, etag='abcdef-3'), self.dcp, self.wasabi, LOCS)
+        out = dip_ops.copy_file(item(rel, data, etag='abcdef-3'), self.dcp, self.wasabi, LOCS,
+                                existing=(len(data), md5(data)))
         self.assertEqual(out['outcome'], 'skipped')
         self.done()
 
@@ -289,10 +313,11 @@ class CopyFileTests(unittest.TestCase):
             )
 
     def test_a_multipart_dcp_object_is_verified_part_by_part(self):
+        # The usual case from P3 on: Archivematica uploads every file of
+        # 8 MiB or more in parts.
         rel = f'{FOLDER}/objects/big.pdf'
         data = bytes(range(256)) * 40  # 10,240 bytes in parts of 4,096
         etag, sizes = self.multipart(data, 4096)
-        self.head(rel, error='404')
         self.head_parts(rel, sizes)
         self.get(rel, data)
         self.put(rel, data, 'application/pdf')
@@ -301,11 +326,22 @@ class CopyFileTests(unittest.TestCase):
         self.assertEqual(out['verified'], 'parts')
         self.done()
 
+    def test_a_multipart_dcp_object_of_another_size_is_recopied(self):
+        rel = f'{FOLDER}/objects/big.pdf'
+        data = bytes(range(256)) * 40
+        etag, sizes = self.multipart(data, 4096)
+        self.head_parts(rel, sizes)
+        self.get(rel, data)
+        self.put(rel, data, 'application/pdf')
+        out = dip_ops.copy_file(item(rel, data, etag=etag), self.dcp, self.wasabi, LOCS,
+                                existing=(len(data) - 1, md5(data[:-1])))
+        self.assertEqual(out['outcome'], 'copied')
+        self.done()
+
     def test_a_multipart_dcp_object_whose_bytes_differ_fails_before_the_put(self):
         rel = f'{FOLDER}/objects/big.pdf'
         data = bytes(range(256)) * 40
         etag, sizes = self.multipart(data, 4096)
-        self.head(rel, error='404')
         self.head_parts(rel, sizes)
         self.get(rel, data[:-1] + b'X')  # same size, one byte off
         out = dip_ops.copy_file(item(rel, data, etag=etag), self.dcp, self.wasabi, LOCS)
@@ -316,7 +352,6 @@ class CopyFileTests(unittest.TestCase):
     def test_a_multipart_dcp_object_falls_back_to_a_size_check_without_part_sizes(self):
         rel = f'{FOLDER}/objects/big.pdf'
         data = b'%PDF big'
-        self.head(rel, error='404')
         self.dcp_stub.add_client_error(
             'head_object', service_error_code='InvalidRequest', http_status_code=400,
         )
@@ -340,7 +375,6 @@ class CopyFileTests(unittest.TestCase):
     def test_a_wasabi_etag_that_is_not_the_md5_fails(self):
         rel = f'{FOLDER}/thumbnails/a.jpg'
         data = b'jpeg'
-        self.head(rel, error='404')
         self.get(rel, data)
         self.put(rel, data, 'image/jpeg', etag='0' * 32)
         out = dip_ops.copy_file(item(rel, data), self.dcp, self.wasabi, LOCS)
@@ -350,22 +384,20 @@ class CopyFileTests(unittest.TestCase):
 
     def test_dry_run_reads_and_writes_nothing(self):
         rel = f'{FOLDER}/thumbnails/a.jpg'
-        self.head(rel, error='404')
         out = dip_ops.copy_file(item(rel, b'jpeg'), self.dcp, self.wasabi, LOCS, execute=False)
         self.assertEqual(out['outcome'], 'would_copy')
         self.done()
 
-    def test_a_wasabi_error_on_the_check_is_a_failure_not_a_raise(self):
+    def test_dry_run_reports_a_file_already_there_as_skipped(self):
         rel = f'{FOLDER}/thumbnails/a.jpg'
-        self.head(rel, error='500')
-        out = dip_ops.copy_file(item(rel, b'jpeg'), self.dcp, self.wasabi, LOCS)
-        self.assertEqual(out['outcome'], 'failed')
-        self.assertIn('wasabi head failed', out['error'])
+        data = b'jpeg'
+        out = dip_ops.copy_file(item(rel, data), self.dcp, self.wasabi, LOCS, execute=False,
+                                existing=(len(data), md5(data)))
+        self.assertEqual(out['outcome'], 'skipped')
         self.done()
 
     def test_a_dcp_read_error_is_a_failure(self):
         rel = f'{FOLDER}/thumbnails/a.jpg'
-        self.head(rel, error='404')
         self.dcp_stub.add_client_error('get_object', service_error_code='NoSuchKey',
                                        http_status_code=404)
         out = dip_ops.copy_file(item(rel, b'jpeg'), self.dcp, self.wasabi, LOCS)
