@@ -52,6 +52,10 @@ WASABI_BUCKET = os.getenv('WASABI_BUCKET')
 # WASABI_AIP_BUCKET is REQUIRED by /api/v2/aip/*; unset, those routes
 # refuse with ok=false rather than writing AIPs to the batch bucket.
 WASABI_AIP_BUCKET = os.getenv('WASABI_AIP_BUCKET')
+# The served copy of each DIP (thumbnails, METS, JPG/PDF access files),
+# conventionally s3://library-repository/dip-store/. lib/dip_ops.py and
+# scripts/dip_backfill.py write here; repov2's dip-store gateway reads it.
+WASABI_DIP_BUCKET = os.getenv('WASABI_DIP_BUCKET')
 WASABI_PROFILE = os.getenv('WASABI_PROFILE')
 # Numeric gid of the shared staff group (e.g. `domain users`) that
 # reset_permissions restores on 001-ready batch folders. UID is retired:
