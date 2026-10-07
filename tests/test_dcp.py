@@ -142,8 +142,8 @@ class SessionIsolationTest(unittest.TestCase):
     """
     Real boto3 sessions (no requests): nothing from the environment or
     the AWS config files reaches the DCP client, and building one never
-    touches os.environ. The profile variables used to be popped and
-    restored around the build, which raced across threads.
+    touches os.environ (popping the profile variables around the build
+    raced across threads).
     """
 
     def test_profile_variables_are_neither_read_nor_touched(self):
@@ -163,8 +163,7 @@ class SessionIsolationTest(unittest.TestCase):
             client = dcp.make_client()
             self.assertEqual(os.environ['AWS_PROFILE'], 'no-such-profile')
             self.assertEqual(os.environ['AWS_DEFAULT_PROFILE'], '')
-        # A missing profile name in the environment used to raise
-        # ProfileNotFound; now it is simply not consulted.
+        # A missing profile name in the environment is simply not consulted.
         self.assertEqual(seen_at_session['AWS_PROFILE'], 'no-such-profile')
         self.assertEqual(seen_at_session['AWS_DEFAULT_PROFILE'], '')
         self.assertEqual(client.meta.region_name, 'us-east-1')

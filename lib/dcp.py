@@ -20,18 +20,7 @@ This module builds the boto3 client for it and wraps the calls the
 curation service needs: probe a location, list a prefix, and open a
 (ranged) read of one object.
 
-It is separate from lib/wasabi.py on purpose: a different provider, with
-different credentials and region rules. The DCP client is built from the
-explicit DCP_* settings only. It never uses boto3's default credential
-chain, never takes a profile name from the environment, and ignores
-~/.aws/config and ~/.aws/credentials entirely, so the Wasabi key (in
-AWS_* or a profile) can share this process without reaching DCP, and
-vice versa.
-
 Locations use the WASABI_AIP_BUCKET form, `s3://<bucket>/<prefix>/`:
-
-    DCP_DIP_LOCATION=s3://dcp-archivesdu-dip-store/dip-store/
-    DCP_AIP_LOCATION=s3://dcp-archivesdu-aip-store/aip-store/
 """
 
 import time
@@ -98,15 +87,10 @@ def location(setting):
 
 def make_client(probe=False):
     """
-    Build a boto3 S3 client for DCP from the explicit DCP_* settings.
-
-    probe=True uses the single-attempt, short-timeout config for health
-    checks. The session comes from wasabi._session_from_keys with the
-    AWS config files switched off, so neither a profile name in the
-    environment nor a [default] profile on disk can change how this
-    client signs or addresses requests. Building is safe from any
-    thread; a built client is safe to share between threads, so build
-    one per job rather than one per call.
+    Build a boto3 S3 client for DCP from the explicit DCP_* settings;
+    probe=True uses the single-attempt, short-timeout config. The session
+    (wasabi._session_from_keys, AWS config files off) can be built from
+    any thread; a built client is shareable, so build one per job.
     """
     if not is_configured():
         raise RuntimeError(
@@ -199,13 +183,10 @@ def health_check():
                         'ok', 'error'}],
          'elapsed_ms': int}
 
-    The probe is a prefix listing, not head_bucket, because it needs only
-    ListBucket on the prefix: the narrowest grant DCP may issue. A
-    location is ok only when the listing returns a key (`keys` is 1):
-    both DCP locations hold thousands of objects, so an empty answer
-    means the bucket or prefix in the setting is wrong, not that the
-    store is fine. (A local MinIO must hold at least one object per
-    location to probe green.)
+    A prefix listing, not head_bucket: it needs only ListBucket on the
+    prefix, the narrowest grant DCP may issue. A location is ok only when
+    the listing returns a key: both hold thousands of objects, so an empty
+    answer means the setting is wrong (a local MinIO needs one object).
     """
     started = time.monotonic()
     out = {
@@ -228,8 +209,7 @@ def health_check():
     try:
         client = make_client(probe=True)
     except Exception as e:  # noqa: BLE001
-        # A malformed DCP_ENDPOINT_URL raises ValueError from botocore;
-        # whatever the cause, the probe reports it rather than raising.
+        # e.g. ValueError for a malformed DCP_ENDPOINT_URL; never raise.
         out['error'] = f'{type(e).__name__}: {e}'
         return done()
 

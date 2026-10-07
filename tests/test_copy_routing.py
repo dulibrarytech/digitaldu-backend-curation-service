@@ -45,7 +45,7 @@ class LargeAipRoutingTests(unittest.TestCase):
             patch.object(config, 'ARCHIVEMATICA_STORAGE_API', 'https://am:8000/api'),
             patch.object(config, 'ARCHIVEMATICA_STORAGE_USERNAME', 'u'),
             patch.object(config, 'ARCHIVEMATICA_STORAGE_API_KEY', 'k'),
-            patch.object(config, 'DURACLOUD_API', 'archivesdu.duracloud.org/durastore/'),
+            patch.object(config, 'DURACLOUD_API', 'duracloud.test.example/durastore/'),
             patch.object(config, 'DURACLOUD_USER', 'u'),
             patch.object(config, 'DURACLOUD_PWD', 'p'),
             patch.object(config, 'AIP_DURACLOUD_THRESHOLD_BYTES', 1_000_000_000),

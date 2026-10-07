@@ -14,8 +14,8 @@
 
 """
 The DIP copy core: DuraCloud Preserve (DCP) to Wasabi, for the files the
-public site serves (plan P2). scripts/dip_backfill.py uses it now; the
-P3 ingest route will use it for each new DIP.
+public site serves. scripts/dip_backfill.py uses it for the backfill; the
+ingest route will use it for each new DIP.
 
 What is copied, under a DIP folder (<eight 4-hex-digit segments>/<folder>/):
   - everything in thumbnails/
@@ -25,25 +25,17 @@ Never a leftover DuraCloud chunk artifact (*.dura-chunk-*, *.dura-manifest).
 TIFF, JP2 and audio/video stay in DCP: conversions read TIFFs there, and
 nothing reads the rest from the DIP store.
 
-copy_file verifies each file on the way: the MD5 of the bytes read from
-DCP must match DCP's ETag (for a multipart object, the MD5 of each part's
-MD5, with the part sizes from HeadObject), and the upload is one PutObject
-carrying Content-MD5, so Wasabi rejects corrupted bytes itself. Nothing is
-ever deleted: a PutObject replaces an object only once it is complete.
+copy_file verifies each file: the MD5 of the bytes read from DCP must
+match DCP's ETag (part by part for a multipart object, with the part
+sizes from HeadObject), and the upload is one PutObject carrying
+Content-MD5. Nothing is ever deleted: a PutObject replaces an object only
+once it is complete. The part-by-part check is the main path, not an edge
+case: Archivematica uploads every file of 8 MiB or more in parts, so only
+the backfill's 6 multipart files make it look rare.
 
-The part-by-part check is the main path for new DIPs, not an edge case.
-Archivematica uploads every file of 8 MiB or more in parts (boto3
-upload_fileobj with the default TransferConfig), so from P3 on, every
-served file that size has a multipart ETag. Only 6 files in the backfill
-are multipart, which makes the check look rare; without it, every large
-new file would be checked by size alone.
-
-What Wasabi already holds comes from wasabi_copies(), one listing for a
-whole run, rather than a HeadObject per file.
-
-The caller builds the two clients once (dcp.make_client(),
-wasabi._make_client()) and passes them in. A build costs about 45 ms, and
-a built client is safe to share between threads.
+What Wasabi already holds comes from wasabi_copies(), one listing per run
+rather than a HeadObject per file. The caller builds the two clients once
+(about 45 ms each; safe to share between threads) and passes them in.
 """
 
 import base64
@@ -157,11 +149,7 @@ def _part_count(etag):
 
 
 def _part_sizes(dcp_client, bucket, key, count):
-    """
-    The size of each part of a multipart object, from HeadObject with
-    PartNumber. None when DCP won't say; a plain size check is then all
-    that is left.
-    """
+    """Part sizes from HeadObject(PartNumber), or None when DCP won't say."""
     sizes = []
     try:
         for number in range(1, count + 1):
@@ -175,9 +163,8 @@ def _part_sizes(dcp_client, bucket, key, count):
 
 class _PartDigests:
     """
-    MD5 per part of a stream, split at the given part sizes, so a
-    multipart ETag can be recomputed in the same pass over the bytes:
-    the MD5 of the concatenated part digests, then '-N'.
+    MD5 per part of a stream split at the given sizes: the multipart ETag
+    (MD5 of the concatenated part digests, then '-N') in one pass.
     """
 
     def __init__(self, sizes):
@@ -210,12 +197,10 @@ class _PartDigests:
 def wasabi_copies(wasabi_client, locs, prefixes=None):
     """
     {rel: (size, etag)} for every object under the Wasabi DIP prefix, or
-    under each of `prefixes` (relative to it, as in served_keys). One
-    listing of 1,000 keys a page: about 110 requests for the whole store,
-    where a HeadObject per file would be about 108,000. The backfill lists
-    the run's prefixes; the P3 route lists the one DIP folder.
-
-    A listing error raises: without the listing, nothing can be skipped.
+    under each of `prefixes` (relative to it): about 110 listing requests
+    for the whole store against 108,000 HeadObjects. The backfill lists
+    the run's prefixes; the ingest route lists one DIP folder. A listing error
+    raises: without it, nothing can be skipped.
     """
     bucket, base = locs[1]
     found = {}
@@ -243,24 +228,16 @@ def copy_file(item, dcp_client, wasabi_client, locs, execute=True, existing=None
     `existing` is the (size, etag) of the Wasabi copy from
     wasabi_copies(), or None when Wasabi has none.
 
-    Returns {'key': rel, 'outcome', 'bytes', 'error', 'verified'}, where
-    outcome is
-      'skipped'    Wasabi already holds it: same size and, for a
-                   single-part DCP object, the same ETag (both MD5s).
-                   A multipart DCP object is compared by size alone:
-                   its ETag is not an MD5, so it can never equal the
-                   one Wasabi gives our single PutObject.
+    Returns {'key': rel, 'outcome', 'bytes', 'error', 'verified'}:
+      'skipped'    Wasabi holds it: same size and, for a single-part DCP
+                   object, the same ETag. A multipart ETag is not an MD5,
+                   so those compare by size alone.
       'would_copy' execute=False and the file isn't there yet.
-      'copied'     read, checked and written. `verified` says how the
-                   bytes read from DCP were checked: 'md5' against a
-                   single-part ETag; 'parts' against a multipart ETag,
-                   with the part sizes from HeadObject (every new file
-                   of 8 MiB or more; see the module docstring); 'size' only,
-                   when DCP wouldn't give the part sizes.
-      'failed'     anything else; `error` says what. Nothing was deleted,
-                   and a re-run tries again.
-    Never raises for a single file's trouble, so one failure doesn't
-    stop a run.
+      'copied'     read, checked and written. `verified`: 'md5' against a
+                   single-part ETag, 'parts' against a multipart ETag, or
+                   'size' only when DCP wouldn't give the part sizes.
+      'failed'     anything else; `error` says what. A re-run tries again.
+    Never raises for one file's trouble, so one failure doesn't stop a run.
     """
     (dcp_bucket, _), (wasabi_bucket, wasabi_prefix) = locs
     target = wasabi_prefix + item['rel']
@@ -342,17 +319,13 @@ def copy_file(item, dcp_client, wasabi_client, locs, execute=True, existing=None
 
 def check_complete(dip_path, expected_size, dcp_client, sip_uuid=None):
     """
-    Is the whole DIP in DCP? P3's ingest gate, run before anything is
-    copied: every file in the folder, served or not, must add up to
-    Archivematica's recorded size, and the METS must be there.
-
-    `dip_path` is the folder relative to DCP_DIP_LOCATION's prefix.
-    Leftover chunk artifacts are left out of the sum. With `sip_uuid`,
-    the METS must be METS.<sip_uuid>.xml; without it, any METS.*.xml at
-    the top of the folder counts.
+    Is the whole DIP in DCP? The ingest gate: every file in the folder
+    (served or not, chunk artifacts excluded) must add up to
+    Archivematica's recorded size, and the METS must be there (named
+    METS.<sip_uuid>.xml when `sip_uuid` is given). `dip_path` is relative
+    to DCP_DIP_LOCATION's prefix; only DCP is read.
 
     Returns {'complete', 'dcp_bytes', 'expected_bytes', 'files', 'mets'}.
-    Reads DCP only, so it needs DCP_DIP_LOCATION but not WASABI_DIP_BUCKET.
     """
     bucket, prefix = dcp.location('DCP_DIP_LOCATION')
     folder = prefix + dip_path.strip('/') + '/'

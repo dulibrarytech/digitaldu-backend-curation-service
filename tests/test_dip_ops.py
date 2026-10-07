@@ -33,7 +33,7 @@ from lib import dip_ops, wasabi
 
 FOLDER = '0000/f75f/3cf8/4b3d/b494/e0ec/2017/2508/pkg-uuid_U158.03.0157.00096'
 DCP_LOC = ('dcp-test-dip-store', 'dip-store/')
-WASABI_LOC = ('library-repository', 'dip-store/')
+WASABI_LOC = ('test-dip-store', 'dip-store/')
 LOCS = (DCP_LOC, WASABI_LOC)
 
 
@@ -119,13 +119,13 @@ class LocationsTests(unittest.TestCase):
     def test_parses_both_locations(self):
         with patch.multiple(
             config,
-            WASABI_DIP_BUCKET='s3://library-repository/dip-store/',
-            DCP_DIP_LOCATION='s3://dcp-archivesdu-dip-store/dip-store/',
+            WASABI_DIP_BUCKET='s3://test-dip-store/dip-store/',
+            DCP_DIP_LOCATION='s3://dcp-test-dip-store/dip-store/',
         ):
             self.assertEqual(
                 dip_ops.locations(),
-                (('dcp-archivesdu-dip-store', 'dip-store/'),
-                 ('library-repository', 'dip-store/')),
+                (('dcp-test-dip-store', 'dip-store/'),
+                 ('test-dip-store', 'dip-store/')),
             )
 
 
@@ -313,7 +313,7 @@ class CopyFileTests(unittest.TestCase):
             )
 
     def test_a_multipart_dcp_object_is_verified_part_by_part(self):
-        # The usual case from P3 on: Archivematica uploads every file of
+        # The usual case for new DIPs: Archivematica uploads every file of
         # 8 MiB or more in parts.
         rel = f'{FOLDER}/objects/big.pdf'
         data = bytes(range(256)) * 40  # 10,240 bytes in parts of 4,096
@@ -417,7 +417,7 @@ class CheckCompleteTests(unittest.TestCase):
         self.addCleanup(self.stub.deactivate)
         patcher = patch.multiple(
             config,
-            WASABI_DIP_BUCKET='s3://library-repository/dip-store/',
+            WASABI_DIP_BUCKET=f's3://{WASABI_LOC[0]}/{WASABI_LOC[1]}',
             DCP_DIP_LOCATION=f's3://{DCP_LOC[0]}/{DCP_LOC[1]}',
         )
         patcher.start()

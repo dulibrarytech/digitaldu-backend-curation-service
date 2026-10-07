@@ -14,7 +14,7 @@
 
 """
 Copy the served DIP files from DuraCloud Preserve to Wasabi: the one-off
-backfill of plan P2.
+backfill before serving switches to the Wasabi copy.
 
 Lists dip-store/ in DCP (DCP_DIP_LOCATION) and copies every served file
 (thumbnails, METS, JPG and PDF access files; see lib/dip_ops.py) to
@@ -29,17 +29,14 @@ Safety model:
     against DCP's ETag (part by part for a multipart object), and
     Content-MD5 on the upload.
   * A file Wasabi already holds with the same size and ETag is skipped,
-    so an interrupted run just starts again. What Wasabi holds comes from
-    one listing at the start (about 110 requests for the whole store),
-    not a request per file, so a full dry run takes minutes.
-  * Ctrl-C stops taking new files, lets the copies in flight finish (a
-    copy can't be cut short), records them, and writes the summary with
-    "interrupted": true. A second Ctrl-C abandons the copies in flight;
-    the re-run skips whatever landed.
+    so an interrupted run just starts again. Wasabi is listed once at
+    the start (about 110 requests), so a full dry run takes minutes.
+  * Ctrl-C stops taking new files, lets the copies in flight finish,
+    records them, and writes the summary with "interrupted": true. A
+    second Ctrl-C abandons them; the re-run skips whatever landed.
 
-Disk: a file over 64 MiB is spooled to the temporary directory while it
-is verified, up to --workers x 2.1 GB at once (the largest PDFs). Point
-TMPDIR at a disk with that much room.
+Disk: a file over 64 MiB is spooled to TMPDIR while it is verified, up to
+--workers x 2.1 GB at once. Point TMPDIR at a disk with that much room.
 
 Usage (on libsftp01, service env loaded):
 
@@ -93,12 +90,11 @@ def served_items(dcp_client, locs, prefixes):
 def run(dcp_client, wasabi_client, locs, prefixes=None, limit=None,
         workers=4, execute=False, out=sys.stdout):
     """
-    Copy (or, without execute, plan) every served file. Writes one JSON
-    line per file and a summary line to `out`; returns the summary.
-    Wasabi is listed once, up front, for the same prefixes; a listing
-    error raises before anything is copied. Files are handed to the pool
-    a few at a time, so the pool's memory stays flat over a 108,000-file
-    run (the Wasabi listing itself is about 40 MB at that size).
+    Copy (or, without execute, plan) every served file; one JSON line per
+    file and a summary line to `out`, and the summary returned. Wasabi is
+    listed once up front (a listing error raises before anything is
+    copied). Files go to the pool a few at a time, so memory stays flat
+    over a 108,000-file run (the Wasabi listing itself is about 40 MB).
     """
     workers = max(1, workers)
     summary = {outcome: 0 for outcome in OUTCOMES}
@@ -138,8 +134,7 @@ def run(dcp_client, wasabi_client, locs, prefixes=None, limit=None,
         for future in pending:
             record(future.result())
     except KeyboardInterrupt:
-        # Take no more files; the copies in flight finish (a thread can't
-        # be cut short), the queued ones are dropped for the re-run.
+        # No more files; the copies in flight finish, the queue is dropped.
         summary['interrupted'] = True
         logger.warning('interrupted: finishing the copies in flight, dropping the queue')
         pool.shutdown(wait=True, cancel_futures=True)
@@ -213,8 +208,7 @@ def main(argv=None):
         summary['bytes_copied'] / 1024 ** 3, summary['skipped'],
         summary['would_copy'], summary['failed'],
     )
-    # Interrupted first: a Ctrl-C during the listings records no files,
-    # and that is not "nothing listed".
+    # Interrupted first: a Ctrl-C during the listings records no files.
     if summary['interrupted']:
         logger.warning('interrupted: re-run to continue; what landed is skipped')
         return 130

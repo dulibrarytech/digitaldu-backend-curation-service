@@ -78,22 +78,17 @@ def _parse_bucket(raw):
 def _session_from_keys(access_key_id, secret_access_key, region=None,
                        read_aws_config=True):
     """
-    A boto3 Session for an explicit key pair.
-
-    The session never takes a profile name from AWS_PROFILE or
-    AWS_DEFAULT_PROFILE. Set, those make boto3 load a named profile from
-    ~/.aws/config even when keys are passed, and raise ProfileNotFound
-    when the profile is absent (or the value is blank). Overriding the
-    `profile` session variable switches that lookup off without
-    touching os.environ, so any number of threads can build clients at
-    once. The old approach, popping the variables and restoring them,
-    raced: one thread restored them in the middle of another's build.
+    A boto3 Session for an explicit key pair that never reads a profile
+    name from AWS_PROFILE / AWS_DEFAULT_PROFILE (set, those make boto3
+    load a named profile even when keys are passed, and raise
+    ProfileNotFound when it is absent). The `profile` session variable is
+    overridden instead of popping the environment, so any number of
+    threads can build clients at once.
 
     read_aws_config=False also ignores ~/.aws/config and
-    ~/.aws/credentials altogether, so nothing in a [default] profile
-    (addressing style, signature version) reaches the client. The DCP
-    client uses that; the Wasabi client keeps reading the files, as it
-    always has.
+    ~/.aws/credentials, so nothing in a [default] profile (addressing
+    style, signature version) reaches the client: the DCP client's choice.
+    The Wasabi client keeps reading the files, as it always has.
     """
     session_vars = {'profile': (None, None, None, None)}
     if not read_aws_config:
@@ -162,10 +157,9 @@ def _wasabi_keys():
 
 def credential_source():
     """
-    Where the Wasabi key comes from, by setting name: 'WASABI_*',
-    'AWS_* (fallback)', 'WASABI_PROFILE', or None when nothing is set.
-    Same order as _make_client. Names only, never values; the startup
-    log prints it so a key move that didn't take effect is visible.
+    Which settings the Wasabi key comes from, in _make_client's order:
+    'WASABI_*', 'AWS_* (fallback)', 'WASABI_PROFILE', or None. Logged at
+    startup, so a key move that didn't take effect is visible.
     """
     if config.WASABI_ACCESS_KEY_ID and config.WASABI_SECRET_ACCESS_KEY:
         return 'WASABI_*'
@@ -178,10 +172,9 @@ def credential_source():
 
 def half_set_key_pairs():
     """
-    Key-pair settings where exactly one of the two names is set, as
-    'WASABI_ACCESS_KEY_ID without WASABI_SECRET_ACCESS_KEY'. _wasabi_keys
-    skips a half-set pair silently, which is right for the client but
-    hides a typo in a key move; the startup log warns about it.
+    Key pairs with exactly one name set, as 'WASABI_ACCESS_KEY_ID without
+    WASABI_SECRET_ACCESS_KEY'. _wasabi_keys skips such a pair silently,
+    which would hide a typo in a key move; the startup log warns instead.
     """
     pairs = (
         ('WASABI_ACCESS_KEY_ID', config.WASABI_ACCESS_KEY_ID,
@@ -201,12 +194,7 @@ def half_set_key_pairs():
 
 
 def _client_from_keys(access_key_id, secret_access_key, region=None):
-    """
-    Build an S3 client from explicit access-key + secret. The session
-    comes from _session_from_keys, so a profile name in the environment
-    is never consulted (it used to raise ProfileNotFound on the live
-    host, twice).
-    """
+    """Build an S3 client from explicit keys (see _session_from_keys)."""
     session = _session_from_keys(access_key_id, secret_access_key, region)
     return session.client(
         's3',
@@ -571,14 +559,10 @@ def head_object(key, bucket_config=None):
     upload entirely.
 
     Distinguishes "not there" (returns exists=False, no raise) from
-    transport / auth errors (raises). 403 Forbidden proves nothing
-    either way: a policy without bucket-wide s3:ListBucket answers a
-    MISSING key with 403, and so does a request the policy rejects
-    outright (source IP, clock skew). It returns exists=None ("can't
-    tell") with forbidden=True. The AIP copies fail fast on it, copying
-    and deleting nothing: the service key keeps bucket-wide ListBucket,
-    so a missing key answers 404 and a 403 can only mean the request
-    was denied.
+    transport / auth errors (raises). A 403 proves nothing either way (a
+    policy without bucket-wide s3:ListBucket answers a MISSING key with
+    403, and so does a denied request), so it returns exists=None with
+    forbidden=True; the AIP copies fail fast on it.
 
     `bucket_config` mirrors upload_fileobj — AIP callers pass
     config.WASABI_AIP_BUCKET; otherwise we fall back to
@@ -606,9 +590,7 @@ def head_object(key, bucket_config=None):
                 'key': full_key,
                 'content_length': None,
             }
-        # 403 — can't tell whether the key exists (see docstring). Never
-        # report it as present: a copy that trusted that would record
-        # success without uploading anything.
+        # 403: can't tell whether the key exists (see docstring).
         if code == '403':
             return {
                 'exists': None,

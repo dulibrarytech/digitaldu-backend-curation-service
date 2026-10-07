@@ -357,7 +357,7 @@ class OpenStreamEncodingTests(unittest.TestCase):
 
     def setUp(self):
         for name, value in (
-            ('DURACLOUD_API', 'archivesdu.duracloud.org/durastore/'),
+            ('DURACLOUD_API', 'duracloud.test.example/durastore/'),
             ('DURACLOUD_USER', 'u'),
             ('DURACLOUD_PWD', 'p'),
         ):
@@ -402,7 +402,7 @@ class CopyFlowTests(unittest.TestCase):
     def setUp(self):
         patches = [
             patch.object(config, 'WASABI_AIP_BUCKET', 's3://aip-bucket/aip-store/'),
-            patch.object(config, 'DURACLOUD_API', 'archivesdu.duracloud.org/durastore/'),
+            patch.object(config, 'DURACLOUD_API', 'duracloud.test.example/durastore/'),
             patch.object(config, 'DURACLOUD_USER', 'u'),
             patch.object(config, 'DURACLOUD_PWD', 'p'),
             patch.object(config, 'ARCHIVEMATICA_STORAGE_API', 'https://am:8000/api'),

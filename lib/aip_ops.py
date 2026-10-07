@@ -125,10 +125,9 @@ _PROGRESS_UUID_RE = re.compile(
 
 def _forbidden_error(key):
     """
-    The error both AIP copy paths return when the idempotency HEAD
-    answers 403. repov2 treats it as retryable (it names neither a
-    deleted AIP nor a missing one), so the copy runs again once access
-    is fixed.
+    The error both AIP copy paths return on a 403 from the idempotency
+    HEAD. Worded so repov2 retries it (it names neither a deleted nor a
+    missing AIP).
     """
     return (
         f'wasabi answered 403 (forbidden) for HEAD {key}: cannot tell '
@@ -376,12 +375,10 @@ def copy_aip_to_wasabi(aip_uuid, repo_uuid):
 
     bucket_name = head.get('bucket')
     if head.get('forbidden'):
-        # A 403 proves nothing about the key, so neither skipping nor
-        # copying is safe: a copy over an unseen good object could
-        # replace it, and the cleanup after a failed copy could delete
-        # it. The service key keeps bucket-wide s3:ListBucket, so a
-        # missing key answers 404 and a 403 means the request was
-        # denied. Fail, and let the retry run once access is fixed.
+        # A 403 proves nothing, so neither skipping nor copying is safe
+        # (a copy could replace, and a failed copy's cleanup delete, a
+        # good object it couldn't see). Fail; the retry runs once access
+        # is fixed.
         logger.error(
             'copy_aip_to_wasabi HEAD_FORBIDDEN key=%s — Wasabi answered 403, '
             'so the copy cannot tell whether %s already holds the AIP; '
@@ -409,10 +406,8 @@ def copy_aip_to_wasabi(aip_uuid, repo_uuid):
             )
             return out
         if existing_size is None:
-            # S3 always reports a size, so this is unexpected. Copy over
-            # the object without deleting it first: S3 replaces it only
-            # once the new upload completes, so a failed copy loses
-            # nothing.
+            # Unexpected (S3 always reports a size). Copy over it without a
+            # delete: S3 replaces an object only when the new upload completes.
             logger.warning(
                 'copy_aip_to_wasabi UNKNOWN_SIZE key=%s — copying over it',
                 key,

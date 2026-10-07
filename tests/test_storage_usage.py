@@ -61,8 +61,8 @@ class StorageUsageTests(unittest.TestCase):
                          os.path.join(self.tmp.name, 'usage.json')),
             patch.object(storage_usage, '_COMPUTING_MARKER',
                          os.path.join(self.tmp.name, 'usage.computing')),
-            patch.object(config, 'WASABI_BUCKET', 's3://library-special-collections/'),
-            patch.object(config, 'WASABI_AIP_BUCKET', 's3://library-repository/aip-store/'),
+            patch.object(config, 'WASABI_BUCKET', 's3://test-bucket/'),
+            patch.object(config, 'WASABI_AIP_BUCKET', 's3://aip-bucket/aip-store/'),
             # Run "background" recomputes inline for determinism.
             patch.object(storage_usage, '_spawn', lambda fn: fn()),
         ]
@@ -73,8 +73,8 @@ class StorageUsageTests(unittest.TestCase):
 
     def _client(self):
         return FakeClient({
-            ('library-special-collections', ''): _pages([100, 200, 300]),
-            ('library-repository', 'aip-store/'): _pages([1_000_000, 2_000_000]),
+            ('test-bucket', ''): _pages([100, 200, 300]),
+            ('aip-bucket', 'aip-store/'): _pages([1_000_000, 2_000_000]),
         })
 
     def test_compute_sums_both_buckets_with_prefixes(self):
@@ -86,11 +86,11 @@ class StorageUsageTests(unittest.TestCase):
         self.assertEqual(cache['buckets']['aip_store']['objects'], 2)
         self.assertEqual(cache['buckets']['aip_store']['bytes'], 3_000_000)
         # The AIP walk is scoped to its base prefix.
-        self.assertIn(('library-repository', 'aip-store/'), client.calls)
+        self.assertIn(('aip-bucket', 'aip-store/'), client.calls)
 
     def test_one_broken_bucket_does_not_hide_the_other(self):
         client = FakeClient({
-            ('library-repository', 'aip-store/'): _pages([5]),
+            ('aip-bucket', 'aip-store/'): _pages([5]),
         })
 
         real_get_paginator = client.get_paginator
@@ -100,7 +100,7 @@ class StorageUsageTests(unittest.TestCase):
             orig = p.paginate
 
             def paginate(Bucket=None, Prefix=None):  # noqa: N803
-                if Bucket == 'library-special-collections':
+                if Bucket == 'test-bucket':
                     raise RuntimeError('listing exploded')
                 return orig(Bucket=Bucket, Prefix=Prefix)
             p.paginate = paginate

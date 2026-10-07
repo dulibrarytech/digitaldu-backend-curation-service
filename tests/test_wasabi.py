@@ -472,15 +472,10 @@ class MakeClientCredentialResolutionTest(unittest.TestCase):
 
 class SessionFromKeysTest(unittest.TestCase):
     """
-    Real boto3 sessions, no requests. A profile name in the environment
-    used to be popped and restored around the build, which raced across
-    threads (the startup probe thread against a request, or a
-    multi-threaded script). Now it is simply never consulted, and
-    os.environ is never written.
-
-    This regression bit twice on the live curation host: AWS_PROFILE named
-    a profile missing from ~/.aws/config, and both boto3.Session() and
-    session.client() raised ProfileNotFound.
+    Real boto3 sessions, no requests. A profile name in the environment is
+    never consulted and os.environ is never written: popping the
+    variables around the build raced across threads, and the live host's
+    AWS_PROFILE names a profile that is not in ~/.aws/config.
     """
 
     def _build(self):

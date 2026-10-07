@@ -95,8 +95,7 @@ def _probe_wasabi_at_startup():
     never a non-booting service.
     """
     try:
-        # Which settings the key came from (names only), so a key move
-        # that never took effect shows up in the log.
+        # Names only: shows a key move that never took effect.
         logger.info(
             'wasabi credentials: %s',
             wasabi.credential_source() or 'none configured',
@@ -156,11 +155,9 @@ def _probe_dcp_at_startup():
 
 def _start_dcp_probe_thread():
     """
-    Run the DuraCloud Preserve probe on a daemon thread, so an
-    unreachable DCP can't delay a gunicorn worker's boot. Started once
-    per process from the module level below, not from create_app(): the
-    tests build apps freely, and must never start a probe that reads
-    whatever DCP_* the host environment holds.
+    Run the DCP probe on a daemon thread, so an unreachable DCP can't
+    delay a worker's boot. Started once per process at import, not from
+    create_app(): the tests build apps freely and must never probe.
     """
     threading.Thread(
         target=_probe_dcp_at_startup, name='dcp-startup-probe', daemon=True,

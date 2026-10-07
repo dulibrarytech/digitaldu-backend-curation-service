@@ -38,7 +38,7 @@ from scripts import dip_backfill
 FOLDER = '0000/f75f/3cf8/4b3d/b494/e0ec/2017/2508/pkg-uuid_U158.03.0157.00096'
 OTHER = '1111/f75f/3cf8/4b3d/b494/e0ec/2017/2508/pkg-other'
 DCP_LOC = ('dcp-test-dip-store', 'dip-store/')
-WASABI_LOC = ('library-repository', 'dip-store/')
+WASABI_LOC = ('test-dip-store', 'dip-store/')
 LOCS = (DCP_LOC, WASABI_LOC)
 
 

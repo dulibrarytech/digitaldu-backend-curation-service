@@ -40,7 +40,7 @@ class AipListObjectsTests(unittest.TestCase):
         self.env = patch.dict(os.environ, {'API_KEY': API_KEY})
         self.env.start()
         self.bucket = patch.object(
-            config, 'WASABI_AIP_BUCKET', 's3://library-repository/aip-store/'
+            config, 'WASABI_AIP_BUCKET', 's3://aip-bucket/aip-store/'
         )
         self.bucket.start()
 

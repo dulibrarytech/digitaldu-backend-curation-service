@@ -557,9 +557,8 @@ def copy_aip_from_duracloud(aip_uuid, repo_uuid):
         return done(f'wasabi head_object failed: {e}')
     bucket_name = head.get('bucket')
     if head.get('forbidden'):
-        # Same rule as the AM path: a 403 proves nothing, and the
-        # verification cleanup below deletes whatever is at the key, so
-        # a copy over an unseen good object could end in its deletion.
+        # Same rule as the AM path: a 403 proves nothing, and the cleanup
+        # after a failed copy would delete whatever is at the key.
         logger.error(
             'copy_aip_from_duracloud HEAD_FORBIDDEN key=%s — Wasabi answered '
             '403, so the copy cannot tell whether %s already holds the AIP; '
