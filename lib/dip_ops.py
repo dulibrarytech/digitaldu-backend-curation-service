@@ -74,6 +74,17 @@ _CONTENT_TYPES = {
 _SPOOL_BYTES = 64 * 1024 * 1024
 _READ_BYTES = 1024 * 1024
 
+# copy_dip tries a file whose read or put broke this many more times
+# before counting it as failed (copy_file names both with these prefixes).
+_TRANSIENT_RETRIES = 2
+_TRANSIENT_ERROR_PREFIXES = ('dcp read ', 'wasabi put failed')
+
+
+def _transient_failure(result):
+    return result['outcome'] == 'failed' and (result['error'] or '').startswith(
+        _TRANSIENT_ERROR_PREFIXES
+    )
+
 
 def locations():
     """
@@ -366,7 +377,8 @@ def copy_dip(dip_path, expected_size, sip_uuid=None):
                    (ok=true).
       'failed'     at least one file failed (`failures`: key and error,
                    the first 10). The others were copied; a retry skips
-                   them.
+                   them. A read or put that breaks is tried three times
+                   in all first: botocore retries requests, not a body read.
     Raises RuntimeError for a missing setting, and ClientError or
     BotoCoreError when a listing fails.
     """
@@ -402,6 +414,12 @@ def copy_dip(dip_path, expected_size, sip_uuid=None):
     for item in served_keys(listing, dcp_prefix):
         result = copy_file(item, dcp_client, wasabi_client, locs,
                            existing=existing.get(item['rel']))
+        for _ in range(_TRANSIENT_RETRIES):
+            if not _transient_failure(result):
+                break
+            logger.warning('dip copy retrying %s after: %s', result['key'], result['error'])
+            result = copy_file(item, dcp_client, wasabi_client, locs,
+                               existing=existing.get(item['rel']))
         outcome = result['outcome']
         logger.info('dip copy %s %s verified=%s', outcome, result['key'], result['verified'])
         out['files']['total'] += 1

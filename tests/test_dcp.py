@@ -408,19 +408,26 @@ class HealthCheckTest(unittest.TestCase):
                 patch.object(dcp, 'make_client', return_value=client):
             out = dcp.health_check()
         self.assertFalse(out['ok'])
-        (dip,) = out['locations']
+        dip, aip = out['locations']
         self.assertFalse(dip['ok'])
         self.assertEqual(dip['keys'], 0)
         self.assertIn('DCP_DIP_LOCATION', dip['error'])
+        self.assertEqual(aip['error'], 'DCP_AIP_LOCATION is not configured')
 
-    def test_only_configured_locations_are_probed(self):
+    def test_a_missing_location_is_reported_not_skipped(self):
+        # With the key set, DCP is the source for whatever reads a
+        # location, so an unset one is a misconfiguration, not an option.
         client, stub = self._stubbed_probe_client()
         stub.add_response('list_objects_v2', one_key_listing('dip-store/a'))
         with configured(DCP_AIP_LOCATION=None), \
                 patch.object(dcp, 'make_client', return_value=client):
             out = dcp.health_check()
-        self.assertTrue(out['ok'])
-        self.assertEqual([loc['name'] for loc in out['locations']], ['dip'])
+        self.assertFalse(out['ok'])
+        self.assertEqual([loc['name'] for loc in out['locations']], ['dip', 'aip'])
+        dip, aip = out['locations']
+        self.assertTrue(dip['ok'])
+        self.assertFalse(aip['ok'])
+        self.assertEqual(aip['error'], 'DCP_AIP_LOCATION is not configured')
         stub.assert_no_pending_responses()
 
     def test_no_locations_is_not_ok(self):

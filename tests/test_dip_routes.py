@@ -13,7 +13,7 @@ the served files only, the resume, and the failure shapes (200 with
 ok=false, never a 5xx).
 
 DCP and Wasabi are the in-memory fake S3 of test_dip_backfill.py, so the
-real copy code and its thread pool run.
+real copy code runs (one file at a time: the route has no pool).
 
 Run:
     python -m pytest tests/test_dip_routes.py -v
@@ -177,6 +177,77 @@ class CopyDipRouteTests(unittest.TestCase):
         body = res.get_json()
         self.assertEqual((body['ok'], body['status']), (False, 'failed'))
         self.assertIn('WASABI_DIP_BUCKET', body['error'])
+
+    def test_refuses_a_body_that_is_not_an_object(self):
+        for body in ([1, 2], 'abc', 42):
+            res = self.client.post('/api/v2/dip/copy-to-wasabi', json=body, headers=AUTH)
+            self.assertEqual(res.status_code, 400, body)
+            self.assertIn('JSON object', res.get_json()['error'])
+
+    def test_refuses_control_characters_and_overlong_paths(self):
+        for dip_path in (
+            '0000/f75f/3cf8/4b3d/b494/e0ec/2017/2508/pkg\nFORGED',
+            '0000/f75f/3cf8/4b3d/b494/e0ec/2017/2508/pkg\x00',
+            '0000/f75f/3cf8/4b3d/b494/e0ec/2017/2508/' + 'p' * 1000,
+        ):
+            res = self.post(dip_path=dip_path)
+            self.assertEqual(res.status_code, 400, repr(dip_path)[:60])
+        self.assertEqual(self.target.puts, [])
+
+    def test_an_upper_case_sip_uuid_still_finds_the_mets(self):
+        body = self.post(sip_uuid=SIP.upper()).get_json()
+        self.assertTrue(body['ok'], body)
+        self.assertEqual(body['status'], 'copied')
+
+    def test_a_read_that_breaks_once_is_tried_again(self):
+        failures = []
+
+        class Flaky(FakeS3):
+            def get_object(self, Bucket, Key):
+                if Key.endswith('objects/a-page.pdf') and not failures:
+                    failures.append(Key)
+                    raise ClientError({'Error': {'Code': 'InternalError', 'Message': 'again'},
+                                       'ResponseMetadata': {'HTTPStatusCode': 500}}, 'GetObject')
+                return super().get_object(Bucket, Key)
+
+        self.source = Flaky(self.source.objects, self.source.etags)
+        body = self.post().get_json()
+        self.assertTrue(body['ok'], body)
+        self.assertEqual(body['files'], {'total': 4, 'copied': 4, 'skipped': 0, 'failed': 0})
+        self.assertEqual(len(failures), 1)
+
+    def test_a_read_that_keeps_breaking_fails_the_file_after_three_tries(self):
+        tries = []
+
+        class Broken(FakeS3):
+            def get_object(self, Bucket, Key):
+                if Key.endswith('objects/a-page.pdf'):
+                    tries.append(Key)
+                    raise ClientError({'Error': {'Code': 'InternalError', 'Message': 'no'},
+                                       'ResponseMetadata': {'HTTPStatusCode': 500}}, 'GetObject')
+                return super().get_object(Bucket, Key)
+
+        self.source = Broken(self.source.objects, self.source.etags)
+        body = self.post().get_json()
+        self.assertEqual(body['status'], 'failed')
+        self.assertEqual(body['files']['failed'], 1)
+        self.assertEqual(len(tries), 3)
+        self.assertIn('dcp read failed', body['failures'][0]['error'])
+
+    def test_a_paged_dcp_listing_is_read_whole(self):
+        self.source.page_size = 2
+        body = self.post().get_json()
+        self.assertTrue(body['ok'], body)
+        self.assertEqual((body['dcp_bytes'], body['expected_bytes']), (TOTAL, TOTAL))
+        self.assertGreater(len([c for c in self.source.calls if c[0] == 'list']), 1)
+
+    def test_the_app_registers_the_route(self):
+        from app import create_app
+        with patch.dict(os.environ, {'API_KEY': AUTH['X-API-Key']}), \
+                patch.object(wasabi, 'health_check', return_value={'ok': False, 'error': 'test'}):
+            app = create_app()
+        rules = {rule.rule for rule in app.url_map.iter_rules()}
+        self.assertIn('/api/v2/dip/copy-to-wasabi', rules)
 
     def test_a_listing_error_is_a_failed_200(self):
         def denied(**kwargs):

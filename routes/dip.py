@@ -64,8 +64,10 @@ dip_bp = Blueprint('dip', __name__, url_prefix='/api/v2/dip')
 _UUID_RE = re.compile(
     r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', re.IGNORECASE,
 )
-# Eight 4-hex-digit segments, then one folder name (not . or ..).
-_DIP_PATH_RE = re.compile(r'^(?:[0-9a-fA-F]{4}/){8}(?!\.\.?$)[^/]+$')
+# Eight 4-hex-digit segments, then one folder name (not . or .., and no
+# control characters: the path is logged). An S3 key is at most 1,024 bytes.
+_DIP_PATH_RE = re.compile(r'^(?:[0-9a-fA-F]{4}/){8}(?!\.\.?$)[^/\x00-\x1f\x7f]+$')
+_DIP_PATH_MAX_BYTES = 1024
 
 
 @dip_bp.route('/copy-to-wasabi', methods=['POST'])
@@ -77,13 +79,19 @@ def copy_to_wasabi():
     CONTRACT (as for the AIP routes): a bad request is 400; a failed
     attempt is 200 with ok=false, never a 5xx.
     """
-    body = request.get_json(silent=True) or {}
-    sip_uuid = str(body.get('sip_uuid') or '').strip()
+    body = request.get_json(silent=True)
+    if body is None:
+        body = {}
+    if not isinstance(body, dict):
+        return jsonify({'ok': False, 'error': 'the body must be a JSON object'}), 400
+    # Lower-cased: the METS is named for the SIP, and Archivematica's uuids
+    # are lowercase.
+    sip_uuid = str(body.get('sip_uuid') or '').strip().lower()
     dip_path = str(body.get('dip_path') or '').strip().strip('/')
     expected_size = body.get('expected_size')
     if not _UUID_RE.match(sip_uuid):
         return jsonify({'ok': False, 'error': 'sip_uuid must be a UUID'}), 400
-    if not _DIP_PATH_RE.match(dip_path):
+    if not _DIP_PATH_RE.match(dip_path) or len(dip_path.encode('utf-8')) > _DIP_PATH_MAX_BYTES:
         return jsonify({
             'ok': False,
             'error': 'dip_path must be eight 4-hex-digit segments and a folder name',

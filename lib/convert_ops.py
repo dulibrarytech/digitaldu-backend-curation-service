@@ -29,10 +29,11 @@ carry a leading 'dip-store/' segment (URL =
 /durastore/dip-store/dip-store/<path> — verified against the live
 store).
 
-Once curation has its DCP key (DCP_* and DCP_DIP_LOCATION), the TIFF
-comes from DuraCloud Preserve instead: the object <DCP_DIP_LOCATION
-prefix><full_path>, read over S3 (lib/dcp.py), with the same size cap and
-short-read check.
+Once curation has its DCP key (DCP_*), the TIFF comes from DuraCloud
+Preserve instead, and DCP_DIP_LOCATION must then be set (a missing
+location is an error, never a fallback to the API): the object
+<DCP_DIP_LOCATION prefix><full_path>, read over S3 (lib/dcp.py), with the
+same size cap and short-read check.
 """
 
 import io
@@ -152,7 +153,7 @@ def fetch_tiff(full_path):
     into .dura-chunk-* parts that cannot be fetched raw anyway.
     With a DCP key it reads DCP instead (_fetch_tiff_from_dcp).
     """
-    if dcp.is_configured() and config.DCP_DIP_LOCATION:
+    if dcp.is_configured():
         return _fetch_tiff_from_dcp(full_path)
     if not (config.DURACLOUD_API and config.DURACLOUD_USER and config.DURACLOUD_PWD):
         raise ConvertError('DuraCloud is not configured (DURACLOUD_* env)')
@@ -219,7 +220,11 @@ def _fetch_tiff_from_dcp(full_path):
     InvalidRequest; a body that ends short (botocore raises at the end)
     -> ConvertError naming in-transit truncation, so a retry may succeed.
     """
-    bucket, prefix = dcp.location('DCP_DIP_LOCATION')
+    try:
+        bucket, prefix = dcp.location('DCP_DIP_LOCATION')
+    except RuntimeError as e:
+        # The key is set, so DCP is the source: never the API instead.
+        raise ConvertError(f'{e}: set it in the curation service .env and restart')
     client = dcp.make_client()
     key = prefix + str(full_path).lstrip('/')
     max_bytes = int(getattr(config, 'DERIVATIVE_MAX_SOURCE_BYTES', 0) or 0)

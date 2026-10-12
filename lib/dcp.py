@@ -187,6 +187,8 @@ def health_check():
     prefix, the narrowest grant DCP may issue. A location is ok only when
     the listing returns a key: both hold thousands of objects, so an empty
     answer means the setting is wrong (a local MinIO needs one object).
+    An unset location is reported as not ok too: with the key set, DCP is
+    the source for whatever reads that location.
     """
     started = time.monotonic()
     out = {
@@ -214,8 +216,6 @@ def health_check():
         return done()
 
     for name, setting in LOCATION_SETTINGS:
-        if not getattr(config, setting, None):
-            continue
         loc = {
             'name': name,
             'setting': setting,
@@ -225,6 +225,10 @@ def health_check():
             'ok': False,
             'error': None,
         }
+        if not getattr(config, setting, None):
+            loc['error'] = f'{setting} is not configured'
+            out['locations'].append(loc)
+            continue
         try:
             loc['bucket'], loc['prefix'] = location(setting)
             resp = client.list_objects_v2(
@@ -248,7 +252,7 @@ def health_check():
             loc['error'] = f'{type(e).__name__}: {e}'
         out['locations'].append(loc)
 
-    if not out['locations']:
+    if not any(loc['bucket'] for loc in out['locations']):
         out['error'] = (
             'no location configured (DCP_DIP_LOCATION, DCP_AIP_LOCATION)'
         )

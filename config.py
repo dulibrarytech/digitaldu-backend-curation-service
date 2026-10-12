@@ -117,7 +117,8 @@ DURACLOUD_PWD = os.getenv('DURACLOUD_PWD')
 # configured", the DIP copy route refuses, and the large-AIP copies and
 # conversions read the DuraCloud API (DURACLOUD_* above). Set, they read
 # DCP (lib/duracloud_ops.py, lib/convert_ops.py), as do the backfill
-# script and the DIP copy route: the key is the switch.
+# script and the DIP copy route: the key is the switch, and both locations
+# must then be set (a missing one is an error, never a fallback to the API).
 DCP_ACCESS_KEY_ID = os.getenv('DCP_ACCESS_KEY_ID')
 DCP_SECRET_ACCESS_KEY = os.getenv('DCP_SECRET_ACCESS_KEY')
 # us-east-1 for DU's stack. Set it explicitly: DCP grants

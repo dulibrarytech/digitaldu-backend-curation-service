@@ -62,9 +62,10 @@ class FakeS3:
     each listing (by prefix) and each HeadObject (by key).
     """
 
-    def __init__(self, objects=None, etags=None):
+    def __init__(self, objects=None, etags=None, page_size=None):
         self.objects = dict(objects or {})
         self.etags = dict(etags or {})
+        self.page_size = page_size
         self.puts = []
         self.calls = []
         self.lock = threading.Lock()
@@ -73,14 +74,20 @@ class FakeS3:
         with self.lock:
             self.calls.append(('list', Prefix))
             keys = sorted(k for (b, k) in self.objects if b == Bucket and k.startswith(Prefix))
-            return {
-                'IsTruncated': False,
+            start = int(ContinuationToken) if ContinuationToken else 0
+            page = keys[start:start + self.page_size] if self.page_size else keys
+            end = start + len(page)
+            resp = {
+                'IsTruncated': bool(self.page_size) and end < len(keys),
                 'Contents': [
                     {'Key': k, 'Size': len(self.objects[(Bucket, k)]),
                      'ETag': f'"{self.etag(Bucket, k)}"'}
-                    for k in keys
+                    for k in page
                 ],
             }
+            if resp['IsTruncated']:
+                resp['NextContinuationToken'] = str(end)
+            return resp
 
     def etag(self, bucket, key):
         return self.etags.get((bucket, key)) or md5(self.objects[(bucket, key)])

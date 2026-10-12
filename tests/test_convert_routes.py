@@ -261,6 +261,14 @@ def test_convert_short_dcp_read_is_500_naming_transit_truncation(client, tmp_pat
     assert list(tmp_path.iterdir()) == []
 
 
+def test_convert_with_a_key_but_no_dip_location_fails_naming_it(client, dcp_tiffs, monkeypatch):
+    # The key is the switch: a missing location is an error, never the API.
+    monkeypatch.setattr(config, 'DCP_DIP_LOCATION', None)
+    response = client.post('/api/v1/convert/tiff', json=PAYLOAD, headers=AUTH)
+    assert response.status_code == 500
+    assert 'DCP_DIP_LOCATION is not configured' in response.get_json()['message']
+
+
 def test_convert_without_a_dcp_key_reads_the_duracloud_api(client, tmp_path, monkeypatch):
     # The client fixture sets only the REST settings; conftest blanks DCP_*.
     monkeypatch.setattr(

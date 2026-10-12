@@ -655,7 +655,7 @@ class FakeDcp:
         self.gets.append({'Key': Key, 'Range': Range, 'IfMatch': IfMatch})
         if Key not in self.objects:
             raise _client_error('NoSuchKey', 404)
-        if IfMatch and IfMatch != self.etag:
+        if IfMatch and IfMatch.strip('"') != self.etag:
             raise _client_error('PreconditionFailed', 412)
         data = self.objects[Key]
         offset = int(Range[len('bytes='):-1]) if Range else 0
@@ -710,13 +710,24 @@ class DcpStreamReaderTests(unittest.TestCase):
         client = FakeDcp({DCP_KEY: self.DATA}, cuts={0: 5000, 1: 3000})
         self.assertEqual(self.drain(self.reader(client)), self.DATA)
         self.assertEqual([g['Range'] for g in client.gets], [None, 'bytes=5000-', 'bytes=8000-'])
-        self.assertEqual([g['IfMatch'] for g in client.gets], [None, client.etag, client.etag])
+        # Pinned to the ETag as S3 sent it, quotes included.
+        quoted = f'"{client.etag}"'
+        self.assertEqual([g['IfMatch'] for g in client.gets], [None, quoted, quoted])
 
-    def test_the_resume_budget_runs_out(self):
-        client = FakeDcp({DCP_KEY: self.DATA}, cuts={0: 100, 1: 100, 2: 100})
+    def test_the_resume_budget_runs_out_without_progress(self):
+        # Three breaks in a row at byte 100: the third is one too many.
+        client = FakeDcp({DCP_KEY: self.DATA}, cuts={0: 100, 1: 0, 2: 0})
         reader = self.reader(client, max_resumes=2)
-        with self.assertRaisesRegex(dc.DcpReadError, 'broke 3 times'):
+        with self.assertRaisesRegex(dc.DcpReadError, 'broke 3 times in a row at byte 100'):
             self.drain(reader)
+
+    def test_progress_renews_the_resume_budget(self):
+        # Ten breaks, each after fresh bytes: a 66 GB read may break more
+        # than max_resumes times over its hours and still finish.
+        client = FakeDcp({DCP_KEY: self.DATA}, cuts={n: 1000 for n in range(10)})
+        reader = self.reader(client, max_resumes=2)
+        self.assertEqual(self.drain(reader), self.DATA)
+        self.assertEqual(len(client.gets), 11)
 
     def test_an_object_replaced_mid_copy_is_refused_not_spliced(self):
         client = FakeDcp({DCP_KEY: self.DATA}, cuts={0: 5000})
@@ -795,15 +806,47 @@ class CopyFlowDcpTests(unittest.TestCase):
     def test_the_dcp_key_is_the_switch(self):
         self.assertTrue(dc.from_dcp())
         self.assertTrue(dc.is_configured())
-        # Without its location (or key), DCP isn't the source, and with no
-        # DuraCloud API settings either, nothing is.
-        with patch.object(config, 'DCP_AIP_LOCATION', None):
-            self.assertFalse(dc.from_dcp())
-            self.assertFalse(dc.is_configured())
+        # The key alone decides: without its location DCP is still the
+        # source (the copy then fails naming the setting), never the API.
+        with patch.multiple(config, DCP_AIP_LOCATION=None, DURACLOUD_API='dc.test.example',
+                            DURACLOUD_USER='u', DURACLOUD_PWD='p'):
+            self.assertTrue(dc.from_dcp())
+            self.assertTrue(dc.is_configured())
         with patch.multiple(config, DCP_ACCESS_KEY_ID='', DURACLOUD_API='dc.test.example',
                             DURACLOUD_USER='u', DURACLOUD_PWD='p'):
             self.assertFalse(dc.from_dcp())
             self.assertTrue(dc.is_configured())  # the API, until the key arrives
+
+    def test_a_key_without_the_aip_location_fails_naming_it_never_the_api(self):
+        with patch.multiple(config, DCP_AIP_LOCATION=None, DURACLOUD_API='dc.test.example',
+                            DURACLOUD_USER='u', DURACLOUD_PWD='p'), \
+                patch.object(dc.requests, 'get',
+                             return_value=self._am_meta(len(self.DATA))) as get, \
+                patch.object(wasabi, 'head_object',
+                             return_value={'exists': False, 'bucket': 'aip-bucket'}), \
+                patch.object(wasabi, 'upload_fileobj') as upload:
+            result = dc.copy_aip_from_duracloud(AIP_UUID, 'pid-1')
+        self.assertFalse(result['ok'])
+        self.assertIn('DCP_AIP_LOCATION is not configured', result['error'])
+        self.assertIsNone(
+            re.search(r'not found in (AM Storage Service|DuraCloud)', result['error'], re.I)
+        )
+        # One request: Archivematica's metadata. The DuraCloud API was never read.
+        self.assertEqual(get.call_count, 1)
+        upload.assert_not_called()
+
+    def test_a_still_chunked_aip_is_named_as_such(self):
+        self.dcp_client.objects = {
+            DCP_KEY + '.dura-manifest': b'<m/>',
+            DCP_KEY + '.dura-chunk-0000': b'x' * 10,
+        }
+        result, upload, _ = self.copy(self._am_meta(len(self.DATA)))
+        self.assertFalse(result['ok'])
+        self.assertIn('stored in chunks in DCP', result['error'])
+        self.assertIsNone(
+            re.search(r'not found in (AM Storage Service|DuraCloud)', result['error'], re.I)
+        )
+        upload.assert_not_called()
 
     def test_copies_the_aip_from_dcp(self):
         result, upload, delete = self.copy(self._am_meta(len(self.DATA)))
@@ -836,7 +879,8 @@ class CopyFlowDcpTests(unittest.TestCase):
         upload.assert_not_called()
 
     def test_a_read_that_keeps_breaking_fails_the_copy(self):
-        self.dcp_client.cuts = {n: 10 for n in range(10)}
+        # Breaks in a row at the same byte: progress would renew the budget.
+        self.dcp_client.cuts = {0: 10, **{n: 0 for n in range(1, 10)}}
         result, _, delete = self.copy(self._am_meta(len(self.DATA)))
         self.assertFalse(result['ok'])
         self.assertIn('duracloud preserve read failed', result['error'])
@@ -862,6 +906,74 @@ class CopyFlowDcpTests(unittest.TestCase):
         self.assertTrue(result['ok'], result.get('error'))
         self.assertEqual(result['key'], BASENAME)
         self.assertEqual(self.uploaded, self.DATA)
+
+
+class DcpReaderThroughS3TransferTests(unittest.TestCase):
+    """
+    DcpStreamReader feeding the real wasabi.upload_fileobj (s3transfer),
+    with the Wasabi client answered by a Stubber: the parts stay full-size
+    across a resume, every byte goes up once, and the reader's error
+    reaches the caller with its own type once the upload has started.
+    """
+
+    MIB = 1024 * 1024
+    DATA = bytes(range(256)) * (12 * MIB // 256)
+
+    def _wasabi(self, ops):
+        import boto3
+        from botocore.config import Config
+        from botocore.stub import Stubber
+        client = boto3.client(
+            's3', region_name='us-east-1', aws_access_key_id='AK',
+            aws_secret_access_key='SK', endpoint_url='https://s3.test.example',
+            config=Config(retries={'max_attempts': 1}),
+        )
+        stub = Stubber(client)
+        for op in ops:
+            if op == 'create':
+                stub.add_response('create_multipart_upload', {'UploadId': 'u1'})
+            elif op == 'part':
+                stub.add_response('upload_part', {'ETag': '"p"'})
+            elif op == 'complete':
+                stub.add_response('complete_multipart_upload', {})
+            elif op == 'abort':
+                stub.add_response('abort_multipart_upload', {})
+        parts = []
+
+        def capture(params, **kwargs):
+            # Before the stubber answers the call (its before-call handler
+            # ends that emission): the Body s3transfer hands upload_part.
+            body = params.get('Body')
+            parts.append(body.read() if hasattr(body, 'read') else body)
+
+        client.meta.events.register('before-parameter-build.s3.UploadPart', capture)
+        return client, stub, parts
+
+    def _upload(self, fake, ops, max_resumes=5):
+        from boto3.s3.transfer import TransferConfig
+        client, stub, parts = self._wasabi(ops)
+        reader = dc.DcpStreamReader('dcp-test-aip-store', DCP_KEY, fake, max_resumes=max_resumes)
+        transfer = TransferConfig(multipart_threshold=5 * self.MIB,
+                                  multipart_chunksize=5 * self.MIB, max_concurrency=1)
+        with patch.object(wasabi, '_make_client', return_value=client), \
+                patch.object(wasabi, '_transfer_config_for', return_value=transfer), stub:
+            wasabi.upload_fileobj(reader, BASENAME, expected_bytes=len(self.DATA),
+                                  bucket_config='s3://aip-bucket/aip-store/')
+        return reader, parts
+
+    def test_resumes_inside_the_real_upload_keep_the_parts_whole(self):
+        fake = FakeDcp({DCP_KEY: self.DATA}, cuts={0: 3 * self.MIB, 1: 2 * self.MIB})
+        reader, parts = self._upload(fake, ['create', 'part', 'part', 'part', 'complete'])
+        self.assertEqual([len(p) for p in parts], [5 * self.MIB, 5 * self.MIB, 2 * self.MIB])
+        self.assertEqual(b''.join(parts), self.DATA)
+        self.assertTrue(reader.done)
+        self.assertEqual([g['Range'] for g in fake.gets],
+                         [None, f'bytes={3 * self.MIB}-', f'bytes={5 * self.MIB}-'])
+
+    def test_the_readers_error_reaches_the_caller_once_the_upload_has_started(self):
+        fake = FakeDcp({DCP_KEY: self.DATA}, cuts={0: 6 * self.MIB, 1: 0, 2: 0, 3: 0})
+        with self.assertRaises(dc.DcpReadError):
+            self._upload(fake, ['create', 'part', 'abort'], max_resumes=2)
 
 
 class CopyFromDuracloudRouteTests(unittest.TestCase):

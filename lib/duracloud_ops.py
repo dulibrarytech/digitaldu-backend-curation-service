@@ -19,12 +19,12 @@ Archivematica replicates every AIP to DuraCloud's `aip-store` space.
 When AM Storage Service's own /download/ endpoint cannot serve a large
 AIP, this module copies the SAME bytes to Wasabi from DuraCloud instead.
 
-Once curation has its DCP key (DCP_* and DCP_AIP_LOCATION), it reads
-DuraCloud Preserve (plain S3, lib/dcp.py) instead: the AIP is one object
+Once curation has its DCP key (DCP_*), it reads DuraCloud Preserve (plain
+S3, lib/dcp.py) instead, and DCP_AIP_LOCATION must then be set: a missing
+location is an error, never a fallback to the API. The AIP is one object
 at <DCP_AIP_LOCATION prefix><uuid-pairs>/<basename>, copied through
-DcpStreamReader. The
-layout facts below are the REST source's; its manifest and chunk code
-goes once DCP is the only source.
+DcpStreamReader. The layout facts below are the REST source's; its
+manifest and chunk code goes once DCP is the only source.
 
 Layout facts:
 
@@ -87,12 +87,15 @@ SETTINGS_HINT = (
 
 
 def from_dcp():
-    """True when curation has its DCP key: then DCP is the source."""
-    return dcp.is_configured() and bool(config.DCP_AIP_LOCATION)
+    """
+    True when curation has its DCP key: DCP is the source, and a missing
+    DCP_AIP_LOCATION fails the copy rather than falling back to the API.
+    """
+    return dcp.is_configured()
 
 
 def is_configured():
-    """DCP, or failing that the DuraCloud API, is configured."""
+    """DCP when the key is set; otherwise the DuraCloud API, if set."""
     return from_dcp() or bool(
         config.DURACLOUD_API and config.DURACLOUD_USER and config.DURACLOUD_PWD
     )
@@ -473,7 +476,9 @@ class DcpStreamReader:
     manifest. A stream that drops or ends short resumes from the exact
     byte with a ranged GET pinned to the first response's ETag (IfMatch),
     so a replaced object answers 412 instead of splicing in other bytes.
-    The bytes read must add up to the object's size. (S3 serves the stored
+    The bytes read must add up to the object's size. The resume budget
+    (max_resumes) bounds breaks in a row at one byte; progress renews it,
+    so a long read may break more than that and still finish. (S3 serves the stored
     bytes as they are, so the REST path's Content-Encoding guard has no
     counterpart here.)
 
@@ -489,12 +494,14 @@ class DcpStreamReader:
         self._client = client
         self._max_resumes = max_resumes
         self._resumes = 0
+        self._last_break = 0
         self.done = False
         self.bytes_read = 0
         resp = dcp.open_range(bucket, key, 0, client=client)
         self._body = resp['Body']
         self.size = resp.get('ContentLength')
-        self.etag = (resp.get('ETag') or '').strip('"')
+        # As S3 sent it, quotes included: the form If-Match is defined for.
+        self.etag = resp.get('ETag') or ''
 
     def read(self, size=-1):
         if size is None or size < 0:
@@ -530,9 +537,13 @@ class DcpStreamReader:
         if self.size is not None and self.bytes_read >= self.size:
             self._finish()
             return
+        if self.bytes_read > self._last_break:
+            # Progress since the last break renews the budget.
+            self._resumes = 0
+        self._last_break = self.bytes_read
         if self._resumes >= self._max_resumes:
             raise DcpReadError(
-                f'{self._key}: the read broke {self._resumes + 1} times, last at byte '
+                f'{self._key}: the read broke {self._resumes + 1} times in a row at byte '
                 f'{self.bytes_read} of {self.size}: {err}'
             )
         self._resumes += 1
@@ -654,6 +665,14 @@ def _resolve_key_from_dcp(pairs):
     return basenames.pop(), None, None
 
 
+def _dcp_has_chunks(client, bucket, key):
+    """True when DCP holds the AIP only as `<key>.dura-*` chunk artifacts."""
+    try:
+        return any(True for _ in dcp.iter_objects(bucket, key + '.dura-', client=client))
+    except (ClientError, BotoCoreError):
+        return False
+
+
 def _copy_aip_from_dcp(aip_uuid, key, expected_bytes, bucket_name, out, done):
     """
     The DCP half of copy_aip_from_duracloud (from_dcp()), after the
@@ -665,7 +684,9 @@ def _copy_aip_from_dcp(aip_uuid, key, expected_bytes, bucket_name, out, done):
         bucket, prefix = dcp.location('DCP_AIP_LOCATION')
         client = dcp.make_client()
     except RuntimeError as e:
-        return done(str(e))
+        # The key is set, so DCP is the source: a missing location is an
+        # error here, never a fallback to the DuraCloud API.
+        return done(f'{e}: set it in the curation service .env and restart')
     dcp_key = f'{prefix}{uuid_pairs(aip_uuid)}/{key}'
     try:
         reader = DcpStreamReader(bucket, dcp_key, client)
@@ -677,6 +698,11 @@ def _copy_aip_from_dcp(aip_uuid, key, expected_bytes, bucket_name, out, done):
             # long budget ends in AM_NOT_FOUND, an orphan the backfill
             # skips. A miss is retried as a normal failure, then shows on
             # the AIPs dashboard as failed.
+            if _dcp_has_chunks(client, bucket, dcp_key):
+                return done(
+                    f'AIP stored in chunks in DCP, which this copy does not '
+                    f'support: s3://{bucket}/{dcp_key}.dura-manifest'
+                )
             return done(f'AIP missing from DCP: s3://{bucket}/{dcp_key}')
         return done(f'duracloud preserve read failed ({code}): {e}')
     except (DcpReadError, dcp.RangeError, BotoCoreError) as e:
