@@ -14,8 +14,8 @@
 
 """
 The DIP copy core: DuraCloud Preserve (DCP) to Wasabi, for the files the
-public site serves. scripts/dip_backfill.py uses it for the backfill; the
-ingest route will use it for each new DIP.
+public site serves. scripts/dip_backfill.py uses it for the backfill, and
+routes/dip.py calls copy_dip() for each new DIP at ingest.
 
 What is copied, under a DIP folder (<eight 4-hex-digit segments>/<folder>/):
   - everything in thumbnails/
@@ -317,23 +317,22 @@ def copy_file(item, dcp_client, wasabi_client, locs, execute=True, existing=None
     return result
 
 
-def check_complete(dip_path, expected_size, dcp_client, sip_uuid=None):
+def check_complete(objects, folder, expected_size, sip_uuid=None):
     """
     Is the whole DIP in DCP? The ingest gate: every file in the folder
     (served or not, chunk artifacts excluded) must add up to
     Archivematica's recorded size, and the METS must be there (named
-    METS.<sip_uuid>.xml when `sip_uuid` is given). `dip_path` is relative
-    to DCP_DIP_LOCATION's prefix; only DCP is read.
+    METS.<sip_uuid>.xml when `sip_uuid` is given). `objects` is the DCP
+    listing of the folder (dcp.iter_objects items) and `folder` its full
+    key prefix, ending in '/'.
 
     Returns {'complete', 'dcp_bytes', 'expected_bytes', 'files', 'mets'}.
     """
-    bucket, prefix = dcp.location('DCP_DIP_LOCATION')
-    folder = prefix + dip_path.strip('/') + '/'
     total = 0
     files = 0
     mets = False
     mets_name = f'METS.{sip_uuid}.xml' if sip_uuid else None
-    for item in dcp.iter_objects(bucket, folder, client=dcp_client):
+    for item in objects:
         name = item['key'][len(folder):]
         if _CHUNK_RE.search(name):
             continue
@@ -348,3 +347,80 @@ def check_complete(dip_path, expected_size, dcp_client, sip_uuid=None):
         'files': files,
         'mets': mets,
     }
+
+
+def copy_dip(dip_path, expected_size, sip_uuid=None):
+    """
+    Copy one new DIP's served files, once the whole DIP is in DCP: the P3
+    ingest copy behind POST /api/v2/dip/copy-to-wasabi, which returns this
+    dict as its body. `dip_path` is the folder relative to the location
+    prefix and `expected_size` is Archivematica's recorded size for the DIP
+    package. One DCP listing serves both the check and the copy; the files
+    are copied one at a time, so at most one is spooled to disk.
+
+    Returns {'ok', 'status', 'dcp_bytes', 'expected_bytes', 'mets',
+    'files', 'bytes', 'verified', 'failures', 'error'}, where status is
+      'incomplete' check_complete didn't pass; nothing was copied, and the
+                   caller asks again later. `error` names the shortfall.
+      'copied'     every served file is in Wasabi, now or from before
+                   (ok=true).
+      'failed'     at least one file failed (`failures`: key and error,
+                   the first 10). The others were copied; a retry skips
+                   them.
+    Raises RuntimeError for a missing setting, and ClientError or
+    BotoCoreError when a listing fails.
+    """
+    locs = locations()
+    (dcp_bucket, dcp_prefix), _ = locs
+    rel_folder = dip_path.strip('/') + '/'
+    dcp_client = dcp.make_client()
+    listing = list(dcp.iter_objects(dcp_bucket, dcp_prefix + rel_folder, client=dcp_client))
+    check = check_complete(listing, dcp_prefix + rel_folder, expected_size, sip_uuid)
+    out = {
+        'ok': False,
+        'status': 'incomplete',
+        'dcp_bytes': check['dcp_bytes'],
+        'expected_bytes': check['expected_bytes'],
+        'mets': check['mets'],
+        'files': {'total': 0, 'copied': 0, 'skipped': 0, 'failed': 0},
+        'bytes': {'total': 0, 'copied': 0},
+        'verified': {'md5': 0, 'parts': 0, 'size': 0},
+        'failures': [],
+        'error': None,
+    }
+    if not check['complete']:
+        if check['dcp_bytes'] != check['expected_bytes']:
+            out['error'] = (
+                f"DCP holds {check['dcp_bytes']:,} of {check['expected_bytes']:,} bytes"
+            )
+        else:
+            out['error'] = f"{f'METS.{sip_uuid}.xml' if sip_uuid else 'The METS'} is not in DCP"
+        return out
+
+    wasabi_client = wasabi._make_client()
+    existing = wasabi_copies(wasabi_client, locs, [rel_folder])
+    for item in served_keys(listing, dcp_prefix):
+        result = copy_file(item, dcp_client, wasabi_client, locs,
+                           existing=existing.get(item['rel']))
+        outcome = result['outcome']
+        logger.info('dip copy %s %s verified=%s', outcome, result['key'], result['verified'])
+        out['files']['total'] += 1
+        out['files'][outcome] += 1
+        out['bytes']['total'] += item.get('size') or 0
+        if outcome == 'copied':
+            out['bytes']['copied'] += result['bytes'] or 0
+            out['verified'][result['verified']] += 1
+        elif outcome == 'failed' and len(out['failures']) < 10:
+            out['failures'].append({'key': result['key'], 'error': result['error']})
+
+    if out['files']['failed']:
+        out['status'] = 'failed'
+        first = out['failures'][0]
+        out['error'] = (
+            f"{out['files']['failed']} of {out['files']['total']} files failed; "
+            f"first: {first['key']}: {first['error']}"
+        )
+    else:
+        out['status'] = 'copied'
+        out['ok'] = True
+    return out

@@ -407,62 +407,40 @@ class CopyFileTests(unittest.TestCase):
 
 
 class CheckCompleteTests(unittest.TestCase):
+    """check_complete over a DCP listing: no S3 calls of its own."""
 
     SIP = '4b3db494-e0ec-2017-2508-000000000000'
+    PREFIX = f'dip-store/{FOLDER}/'
 
-    def setUp(self):
-        self.dcp = s3_client()
-        self.stub = Stubber(self.dcp)
-        self.stub.activate()
-        self.addCleanup(self.stub.deactivate)
-        patcher = patch.multiple(
-            config,
-            WASABI_DIP_BUCKET=f's3://{WASABI_LOC[0]}/{WASABI_LOC[1]}',
-            DCP_DIP_LOCATION=f's3://{DCP_LOC[0]}/{DCP_LOC[1]}',
-        )
-        patcher.start()
-        self.addCleanup(patcher.stop)
-
-    def listing(self, names_sizes):
-        self.stub.add_response(
-            'list_objects_v2',
-            {
-                'IsTruncated': False,
-                'Contents': [
-                    {'Key': f'dip-store/{FOLDER}/{name}', 'Size': size}
-                    for name, size in names_sizes
-                ],
-            },
-            {'Bucket': DCP_LOC[0], 'Prefix': f'dip-store/{FOLDER}/'},
-        )
+    def check(self, names_sizes, expected=1010, sip_uuid=SIP):
+        listing = [{'key': self.PREFIX + name, 'size': size} for name, size in names_sizes]
+        return dip_ops.check_complete(listing, self.PREFIX, expected, sip_uuid)
 
     def test_complete_when_the_total_matches_and_the_mets_is_there(self):
-        self.listing([
+        out = self.check([
             (f'METS.{self.SIP}.xml', 100),
             ('objects/a.tif', 900),
             ('thumbnails/a.jpg', 10),
             ('objects/a.tif.dura-chunk-0000', 5000),
         ])
-        out = dip_ops.check_complete(FOLDER, 1010, self.dcp, sip_uuid=self.SIP)
         self.assertEqual(out, {'complete': True, 'dcp_bytes': 1010,
                                'expected_bytes': 1010, 'files': 3, 'mets': True})
 
     def test_incomplete_while_bytes_are_missing(self):
-        self.listing([(f'METS.{self.SIP}.xml', 100), ('objects/a.tif', 400)])
-        out = dip_ops.check_complete(FOLDER, 1010, self.dcp, sip_uuid=self.SIP)
+        out = self.check([(f'METS.{self.SIP}.xml', 100), ('objects/a.tif', 400)])
         self.assertFalse(out['complete'])
         self.assertEqual((out['dcp_bytes'], out['expected_bytes']), (500, 1010))
 
     def test_incomplete_without_the_mets(self):
-        self.listing([('objects/a.tif', 1010)])
-        out = dip_ops.check_complete(FOLDER, 1010, self.dcp, sip_uuid=self.SIP)
+        out = self.check([('objects/a.tif', 1010)])
         self.assertFalse(out['complete'])
         self.assertFalse(out['mets'])
 
     def test_the_mets_must_name_the_sip_when_one_is_given(self):
-        self.listing([('METS.other-sip.xml', 100), ('objects/a.tif', 910)])
-        out = dip_ops.check_complete(FOLDER, 1010, self.dcp, sip_uuid=self.SIP)
-        self.assertFalse(out['mets'])
+        self.assertFalse(self.check([('METS.other-sip.xml', 100), ('objects/a.tif', 910)])['mets'])
+        self.assertTrue(
+            self.check([('METS.other-sip.xml', 100), ('objects/a.tif', 910)], sip_uuid=None)['mets']
+        )
 
 
 if __name__ == '__main__':

@@ -114,8 +114,10 @@ DURACLOUD_PWD = os.getenv('DURACLOUD_PWD')
 # Lyrasis replaced the DuraCloud REST API with plain AWS S3; lib/dcp.py
 # builds the client. Explicit keys and region only — never boto3's
 # default credential chain. Optional: unset = /health/dcp reports "not
-# configured"; the service reads DCP nowhere else yet (the backfill
-# script does).
+# configured", the DIP copy route refuses, and the large-AIP copies and
+# conversions read the DuraCloud API (DURACLOUD_* above). Set, they read
+# DCP (lib/duracloud_ops.py, lib/convert_ops.py), as do the backfill
+# script and the DIP copy route: the key is the switch.
 DCP_ACCESS_KEY_ID = os.getenv('DCP_ACCESS_KEY_ID')
 DCP_SECRET_ACCESS_KEY = os.getenv('DCP_SECRET_ACCESS_KEY')
 # us-east-1 for DU's stack. Set it explicitly: DCP grants

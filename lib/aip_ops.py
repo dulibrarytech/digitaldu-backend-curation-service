@@ -358,9 +358,8 @@ def copy_aip_to_wasabi(aip_uuid, repo_uuid):
         logger.warning(
             'copy_aip_to_wasabi: aip %s is %s bytes (>= %s) but DuraCloud '
             'is not configured — falling back to the AM download path, '
-            'which is unreliable at this size. Set DURACLOUD_* in the '
-            'curation .env.',
-            aip_uuid, expected_bytes, threshold,
+            'which is unreliable at this size. Set %s in the curation .env.',
+            aip_uuid, expected_bytes, threshold, duracloud_ops.SETTINGS_HINT,
         )
 
     # --- Step 2: Idempotency probe --------------------------------------

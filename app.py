@@ -29,6 +29,7 @@ from routes.astools import astools_bp
 from routes.aip import aip_bp
 from routes.archive import archive_bp
 from routes.convert import convert_bp
+from routes.dip import dip_bp
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +54,7 @@ def create_app():
     app.register_blueprint(aip_bp)
     app.register_blueprint(archive_bp)
     app.register_blueprint(convert_bp)
+    app.register_blueprint(dip_bp)
 
     @app.route('/')
     def index():

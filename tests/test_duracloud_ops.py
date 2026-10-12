@@ -14,8 +14,12 @@ Run:
 
 import hashlib
 import io
+import re
 import unittest
 from unittest.mock import patch
+
+from botocore.exceptions import ClientError
+from botocore.response import StreamingBody
 
 import config
 from lib import aip_ops
@@ -625,6 +629,239 @@ class CopyFlowTests(unittest.TestCase):
 
         self.assertTrue(result['ok'], result.get('error'))
         self.assertEqual(result['key'], BASENAME)
+
+
+def _client_error(code, status, op='GetObject'):
+    return ClientError({'Error': {'Code': code, 'Message': code},
+                        'ResponseMetadata': {'HTTPStatusCode': status}}, op)
+
+
+class FakeDcp:
+    """
+    Just enough of a DCP (S3) client: get_object with Range and IfMatch,
+    and list_objects_v2. `cuts` maps a GET's number (0 = the first) to
+    the bytes its body delivers before it ends short; botocore then
+    raises IncompleteReadError, as it does for a dropped connection.
+    """
+
+    def __init__(self, objects, etag='a' * 32 + '-9', cuts=None):
+        self.objects = dict(objects)
+        self.etag = etag
+        self.cuts = dict(cuts or {})
+        self.gets = []
+
+    def get_object(self, Bucket, Key, Range=None, IfMatch=None):
+        number = len(self.gets)
+        self.gets.append({'Key': Key, 'Range': Range, 'IfMatch': IfMatch})
+        if Key not in self.objects:
+            raise _client_error('NoSuchKey', 404)
+        if IfMatch and IfMatch != self.etag:
+            raise _client_error('PreconditionFailed', 412)
+        data = self.objects[Key]
+        offset = int(Range[len('bytes='):-1]) if Range else 0
+        if offset >= len(data):
+            raise _client_error('InvalidRange', 416)
+        rest = data[offset:]
+        delivered = rest[:self.cuts[number]] if number in self.cuts else rest
+        resp = {
+            'Body': StreamingBody(io.BytesIO(delivered), len(rest)),
+            'ContentLength': len(rest),
+            'ETag': f'"{self.etag}"',
+            'ResponseMetadata': {'HTTPStatusCode': 206 if Range else 200},
+        }
+        if Range:
+            resp['ContentRange'] = f'bytes {offset}-{len(data) - 1}/{len(data)}'
+        return resp
+
+    def list_objects_v2(self, Bucket, Prefix, ContinuationToken=None):
+        keys = sorted(k for k in self.objects if k.startswith(Prefix))
+        return {'IsTruncated': False, 'Contents': [
+            {'Key': k, 'Size': len(self.objects[k]), 'ETag': f'"{self.etag}"'} for k in keys
+        ]}
+
+
+DCP_KEY = f'aip-store/{PAIRS}/{BASENAME}'
+
+
+class DcpStreamReaderTests(unittest.TestCase):
+    DATA = bytes(range(256)) * 64  # 16 KiB
+
+    def reader(self, client, **kwargs):
+        return dc.DcpStreamReader('dcp-test-aip-store', DCP_KEY, client, **kwargs)
+
+    def drain(self, reader, size=4096):
+        out = b''
+        while True:
+            piece = reader.read(size)
+            if not piece:
+                return out
+            if not reader.done:
+                # Only the last read may come back short.
+                self.assertEqual(len(piece), size)
+            out += piece
+
+    def test_reads_the_whole_object(self):
+        reader = self.reader(FakeDcp({DCP_KEY: self.DATA}))
+        self.assertEqual(reader.read(), self.DATA)
+        self.assertTrue(reader.done)
+        self.assertEqual((reader.bytes_read, reader.size), (len(self.DATA), len(self.DATA)))
+
+    def test_a_dropped_stream_resumes_at_the_exact_byte_pinned_to_the_etag(self):
+        client = FakeDcp({DCP_KEY: self.DATA}, cuts={0: 5000, 1: 3000})
+        self.assertEqual(self.drain(self.reader(client)), self.DATA)
+        self.assertEqual([g['Range'] for g in client.gets], [None, 'bytes=5000-', 'bytes=8000-'])
+        self.assertEqual([g['IfMatch'] for g in client.gets], [None, client.etag, client.etag])
+
+    def test_the_resume_budget_runs_out(self):
+        client = FakeDcp({DCP_KEY: self.DATA}, cuts={0: 100, 1: 100, 2: 100})
+        reader = self.reader(client, max_resumes=2)
+        with self.assertRaisesRegex(dc.DcpReadError, 'broke 3 times'):
+            self.drain(reader)
+
+    def test_an_object_replaced_mid_copy_is_refused_not_spliced(self):
+        client = FakeDcp({DCP_KEY: self.DATA}, cuts={0: 5000})
+        reader = self.reader(client)
+        reader.read(4096)
+        client.etag = 'b' * 32 + '-9'  # a new upload replaced it
+        with self.assertRaisesRegex(dc.DcpReadError, 'PreconditionFailed'):
+            self.drain(reader)
+
+    def test_a_missing_object_raises_the_client_error(self):
+        with self.assertRaises(ClientError):
+            self.reader(FakeDcp({}))
+
+
+class CopyFlowDcpTests(unittest.TestCase):
+    """copy_aip_from_duracloud with a DCP key and no REST settings."""
+
+    DATA = b'7z-aip-bytes' * 1000
+
+    def setUp(self):
+        patches = [
+            patch.multiple(
+                config,
+                DURACLOUD_API=None,
+                WASABI_AIP_BUCKET='s3://aip-bucket/aip-store/',
+                DCP_ACCESS_KEY_ID='AKIATEST',
+                DCP_SECRET_ACCESS_KEY='test-secret',
+                DCP_REGION='us-east-1',
+                DCP_AIP_LOCATION='s3://dcp-test-aip-store/aip-store/',
+                ARCHIVEMATICA_STORAGE_API='https://am:8000/api',
+                ARCHIVEMATICA_STORAGE_USERNAME='u',
+                ARCHIVEMATICA_STORAGE_API_KEY='k',
+            ),
+            patch.object(aip_ops, 'write_copy_progress'),
+            patch.object(aip_ops, 'clear_copy_progress'),
+        ]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+        self.dcp_client = FakeDcp({DCP_KEY: self.DATA})
+        p = patch.object(dc.dcp, 'make_client', return_value=self.dcp_client)
+        p.start()
+        self.addCleanup(p.stop)
+        self.uploaded = None
+
+    def _am_meta(self, size):
+        class MetaRes:
+            status_code = 200
+
+            @staticmethod
+            def json():
+                return {'status': 'UPLOADED', 'size': size, 'current_path': f'/store/{BASENAME}'}
+        return MetaRes()
+
+    def _upload(self, reader, key, expected_bytes=None, bucket_config=None, progress_hook=None):
+        # s3transfer reads part-sized pieces until an empty read.
+        self.uploaded = b''
+        while True:
+            piece = reader.read(4096)
+            if not piece:
+                break
+            self.uploaded += piece
+        return {'bucket': 'aip-bucket', 'key': key, 'bytes': expected_bytes}
+
+    def copy(self, am_meta=None, am_error=None):
+        get = patch.object(dc.requests, 'get', side_effect=am_error) if am_error else \
+            patch.object(dc.requests, 'get', return_value=am_meta)
+        with get, \
+                patch.object(wasabi, 'head_object',
+                             return_value={'exists': False, 'bucket': 'aip-bucket'}), \
+                patch.object(wasabi, 'upload_fileobj', side_effect=self._upload) as upload, \
+                patch.object(wasabi, 'delete_object') as delete:
+            result = dc.copy_aip_from_duracloud(AIP_UUID, 'pid-1')
+        return result, upload, delete
+
+    def test_the_dcp_key_is_the_switch(self):
+        self.assertTrue(dc.from_dcp())
+        self.assertTrue(dc.is_configured())
+        # Without its location (or key), DCP isn't the source, and with no
+        # DuraCloud API settings either, nothing is.
+        with patch.object(config, 'DCP_AIP_LOCATION', None):
+            self.assertFalse(dc.from_dcp())
+            self.assertFalse(dc.is_configured())
+        with patch.multiple(config, DCP_ACCESS_KEY_ID='', DURACLOUD_API='dc.test.example',
+                            DURACLOUD_USER='u', DURACLOUD_PWD='p'):
+            self.assertFalse(dc.from_dcp())
+            self.assertTrue(dc.is_configured())  # the API, until the key arrives
+
+    def test_copies_the_aip_from_dcp(self):
+        result, upload, delete = self.copy(self._am_meta(len(self.DATA)))
+        self.assertTrue(result['ok'], result.get('error'))
+        self.assertEqual((result['key'], result['bytes']), (BASENAME, len(self.DATA)))
+        self.assertEqual(result['source'], 'duracloud')
+        self.assertEqual(self.uploaded, self.DATA)
+        self.assertEqual(self.dcp_client.gets[0]['Key'], DCP_KEY)
+        delete.assert_not_called()
+
+    def test_a_missing_dcp_object_is_a_plain_failure_not_an_orphan(self):
+        self.dcp_client.objects.clear()
+        result, upload, _ = self.copy(self._am_meta(len(self.DATA)))
+        self.assertFalse(result['ok'])
+        self.assertEqual(
+            result['error'], f'AIP missing from DCP: s3://dcp-test-aip-store/{DCP_KEY}'
+        )
+        # repo-backend-v2's Stage 6 (_is_am_not_found_error) gives this
+        # pattern a long budget that ends in AM_NOT_FOUND, an orphan the
+        # backfill skips. A DCP miss must not match it.
+        self.assertIsNone(
+            re.search(r'not found in (AM Storage Service|DuraCloud)', result['error'], re.I)
+        )
+        upload.assert_not_called()
+
+    def test_a_size_archivematica_disagrees_with_copies_nothing(self):
+        result, upload, _ = self.copy(self._am_meta(len(self.DATA) + 1))
+        self.assertFalse(result['ok'])
+        self.assertIn('Archivematica records', result['error'])
+        upload.assert_not_called()
+
+    def test_a_read_that_keeps_breaking_fails_the_copy(self):
+        self.dcp_client.cuts = {n: 10 for n in range(10)}
+        result, _, delete = self.copy(self._am_meta(len(self.DATA)))
+        self.assertFalse(result['ok'])
+        self.assertIn('duracloud preserve read failed', result['error'])
+        delete.assert_not_called()
+
+    def test_an_upload_that_stops_reading_early_is_deleted(self):
+        def stop_early(reader, key, **kwargs):
+            reader.read(4096)
+            return {'bucket': 'aip-bucket', 'key': key, 'bytes': None}
+
+        with patch.object(dc.requests, 'get', return_value=self._am_meta(len(self.DATA))), \
+                patch.object(wasabi, 'head_object',
+                             return_value={'exists': False, 'bucket': 'aip-bucket'}), \
+                patch.object(wasabi, 'upload_fileobj', side_effect=stop_early), \
+                patch.object(wasabi, 'delete_object') as delete:
+            result = dc.copy_aip_from_duracloud(AIP_UUID, 'pid-1')
+        self.assertFalse(result['ok'])
+        self.assertIn(f'the upload stopped at byte 4096 of {len(self.DATA)}', result['error'])
+        delete.assert_called_once_with(BASENAME, bucket_config=config.WASABI_AIP_BUCKET)
+
+    def test_am_down_falls_back_to_the_dcp_listing(self):
+        result, _, _ = self.copy(am_error=dc.requests.ConnectionError('AM is down'))
+        self.assertTrue(result['ok'], result.get('error'))
+        self.assertEqual(result['key'], BASENAME)
+        self.assertEqual(self.uploaded, self.DATA)
 
 
 class CopyFromDuracloudRouteTests(unittest.TestCase):

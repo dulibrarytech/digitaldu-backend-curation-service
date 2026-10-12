@@ -102,6 +102,19 @@ class LargeAipRoutingTests(unittest.TestCase):
         head.assert_called_once()
         self.assertTrue(result['ok'])
 
+    def test_a_dcp_key_routes_without_the_rest_settings(self):
+        with patch.multiple(
+            config,
+            DURACLOUD_API=None,
+            DCP_ACCESS_KEY_ID='AKIATEST',
+            DCP_SECRET_ACCESS_KEY='test-secret',
+            DCP_REGION='us-east-1',
+            DCP_AIP_LOCATION='s3://dcp-test-aip-store/aip-store/',
+        ):
+            _result, dc_copy, head = self._run(66_163_797_416)
+        dc_copy.assert_called_once_with(UUID, 'pid-1')
+        head.assert_not_called()
+
     def test_deleted_am_status_is_terminal_not_retry(self):
         class DeletedMeta:
             status_code = 200

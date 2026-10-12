@@ -19,6 +19,13 @@ Archivematica replicates every AIP to DuraCloud's `aip-store` space.
 When AM Storage Service's own /download/ endpoint cannot serve a large
 AIP, this module copies the SAME bytes to Wasabi from DuraCloud instead.
 
+Once curation has its DCP key (DCP_* and DCP_AIP_LOCATION), it reads
+DuraCloud Preserve (plain S3, lib/dcp.py) instead: the AIP is one object
+at <DCP_AIP_LOCATION prefix><uuid-pairs>/<basename>, copied through
+DcpStreamReader. The
+layout facts below are the REST source's; its manifest and chunk code
+goes once DCP is the only source.
+
 Layout facts:
 
   - contentId = `aip-store/<uuid-pairs-of-AIP-uuid>/<basename>` where
@@ -57,10 +64,11 @@ import time
 import xml.etree.ElementTree as ET
 
 import requests
-from botocore.exceptions import ClientError
+from botocore.exceptions import BotoCoreError, ClientError
 
 import config
 from lib import aip_ops
+from lib import dcp
 from lib import wasabi
 
 logger = logging.getLogger(__name__)
@@ -71,8 +79,23 @@ logger = logging.getLogger(__name__)
 _DC_TIMEOUT = (30, 300)
 
 
+# What to set when neither source is configured.
+SETTINGS_HINT = (
+    'DCP_ACCESS_KEY_ID / DCP_SECRET_ACCESS_KEY / DCP_REGION / DCP_AIP_LOCATION '
+    '(DuraCloud Preserve), or DURACLOUD_API / DURACLOUD_USER / DURACLOUD_PWD'
+)
+
+
+def from_dcp():
+    """True when curation has its DCP key: then DCP is the source."""
+    return dcp.is_configured() and bool(config.DCP_AIP_LOCATION)
+
+
 def is_configured():
-    return bool(config.DURACLOUD_API and config.DURACLOUD_USER and config.DURACLOUD_PWD)
+    """DCP, or failing that the DuraCloud API, is configured."""
+    return from_dcp() or bool(
+        config.DURACLOUD_API and config.DURACLOUD_USER and config.DURACLOUD_PWD
+    )
 
 
 def _dc_host():
@@ -438,6 +461,112 @@ def _open_dc_stream(content_id, offset=0):
     return response
 
 
+class DcpReadError(RuntimeError):
+    """A DCP read failed, or kept breaking past the resume budget."""
+
+
+class DcpStreamReader:
+    """
+    File-like reader over one DuraCloud Preserve object, for
+    wasabi.upload_fileobj: the large-AIP copy once curation has a DCP key.
+    DCP is plain S3, so it is a plain ranged copy, with no chunks and no
+    manifest. A stream that drops or ends short resumes from the exact
+    byte with a ranged GET pinned to the first response's ETag (IfMatch),
+    so a replaced object answers 412 instead of splicing in other bytes.
+    The bytes read must add up to the object's size. (S3 serves the stored
+    bytes as they are, so the REST path's Content-Encoding guard has no
+    counterpart here.)
+
+    read(n) fills n bytes across resumes: s3transfer builds each part from
+    one read() call (see ChunkStreamReader.read).
+    """
+
+    _READ_SIZE = 8 * 1024 * 1024
+
+    def __init__(self, bucket, key, client, max_resumes=5):
+        self._bucket = bucket
+        self._key = key
+        self._client = client
+        self._max_resumes = max_resumes
+        self._resumes = 0
+        self.done = False
+        self.bytes_read = 0
+        resp = dcp.open_range(bucket, key, 0, client=client)
+        self._body = resp['Body']
+        self.size = resp.get('ContentLength')
+        self.etag = (resp.get('ETag') or '').strip('"')
+
+    def read(self, size=-1):
+        if size is None or size < 0:
+            pieces = []
+            while True:
+                piece = self.read(self._READ_SIZE)
+                if not piece:
+                    return b''.join(pieces)
+                pieces.append(piece)
+        pieces = []
+        remaining = size
+        while remaining > 0 and not self.done:
+            try:
+                data = self._body.read(remaining)
+            except (BotoCoreError, OSError) as err:
+                # botocore: IncompleteReadError (short body),
+                # ResponseStreamingError, ReadTimeoutError.
+                self._resume(err)
+                continue
+            if not data:
+                if self.size is not None and self.bytes_read < self.size:
+                    self._resume('stream ended early')
+                    continue
+                self._finish()
+                break
+            self.bytes_read += len(data)
+            pieces.append(data)
+            remaining -= len(data)
+        return b''.join(pieces)
+
+    def _resume(self, err):
+        self._body.close()
+        if self.size is not None and self.bytes_read >= self.size:
+            self._finish()
+            return
+        if self._resumes >= self._max_resumes:
+            raise DcpReadError(
+                f'{self._key}: the read broke {self._resumes + 1} times, last at byte '
+                f'{self.bytes_read} of {self.size}: {err}'
+            )
+        self._resumes += 1
+        logger.warning(
+            'dcp read of %s broke at byte %d — resuming (%d/%d): %s',
+            self._key, self.bytes_read, self._resumes, self._max_resumes, err,
+        )
+        try:
+            resp = dcp.open_range(
+                self._bucket, self._key, self.bytes_read,
+                client=self._client, if_match=self.etag or None,
+            )
+        except ClientError as e:
+            code = e.response.get('Error', {}).get('Code', 'unknown')
+            raise DcpReadError(
+                f'{self._key}: resuming at byte {self.bytes_read} failed ({code}; '
+                f'PreconditionFailed = the object changed during the copy): {e}'
+            ) from e
+        except (dcp.RangeError, BotoCoreError) as e:
+            raise DcpReadError(f'{self._key}: resuming at byte {self.bytes_read} failed: {e}') from e
+        self._body = resp['Body']
+
+    def _finish(self):
+        self.done = True
+        self._body.close()
+        if self.size is not None and self.bytes_read != int(self.size):
+            raise ChunkVerificationError(
+                f'read {self.bytes_read} of the {self.size} bytes DCP reports'
+            )
+
+    def close(self):
+        self._body.close()
+
+
 def _resolve_key_and_size(aip_uuid):
     """
     (wasabi_key, expected_bytes, error) — key + size for the AIP.
@@ -471,6 +600,8 @@ def _resolve_key_and_size(aip_uuid):
     pairs = uuid_pairs(aip_uuid)
     if not pairs:
         return None, None, f'{aip_uuid} is not a valid AIP uuid'
+    if from_dcp():
+        return _resolve_key_from_dcp(pairs)
     prefix = f'aip-store/{pairs}/'
     try:
         listing = requests.get(
@@ -501,6 +632,114 @@ def _resolve_key_and_size(aip_uuid):
             f'expected exactly one AIP under {prefix}, found {sorted(basenames)}'
         )
     return basenames.pop(), None, None
+
+
+def _resolve_key_from_dcp(pairs):
+    """The DCP half of _resolve_key_and_size's fallback: list the AIP's prefix."""
+    try:
+        bucket, root = dcp.location('DCP_AIP_LOCATION')
+        prefix = f'{root}{pairs}/'
+        keys = [obj['key'] for obj in dcp.iter_objects(bucket, prefix)]
+    except (RuntimeError, ClientError, BotoCoreError) as e:
+        return None, None, f'DuraCloud Preserve listing failed: {e}'
+    basenames = {
+        k[len(prefix):].split('.dura-')[0] for k in keys if k.startswith(prefix)
+    }
+    basenames.discard('')
+    if len(basenames) != 1:
+        return None, None, (
+            f'expected exactly one AIP under s3://{bucket}/{prefix}, '
+            f'found {sorted(basenames)}'
+        )
+    return basenames.pop(), None, None
+
+
+def _copy_aip_from_dcp(aip_uuid, key, expected_bytes, bucket_name, out, done):
+    """
+    The DCP half of copy_aip_from_duracloud (from_dcp()), after the
+    shared Wasabi probe: copy <DCP_AIP_LOCATION prefix><uuid pairs>/<key>
+    to the Wasabi key through DcpStreamReader. Fills `out` and returns
+    through `done`, with the REST path's error texts.
+    """
+    try:
+        bucket, prefix = dcp.location('DCP_AIP_LOCATION')
+        client = dcp.make_client()
+    except RuntimeError as e:
+        return done(str(e))
+    dcp_key = f'{prefix}{uuid_pairs(aip_uuid)}/{key}'
+    try:
+        reader = DcpStreamReader(bucket, dcp_key, client)
+    except ClientError as e:
+        code = e.response.get('Error', {}).get('Code', 'unknown')
+        if code in ('NoSuchKey', 'NotFound', '404'):
+            # Worded so repo-backend-v2's Stage 6 doesn't take it for its
+            # ambiguous "not found in AM Storage Service|DuraCloud", whose
+            # long budget ends in AM_NOT_FOUND, an orphan the backfill
+            # skips. A miss is retried as a normal failure, then shows on
+            # the AIPs dashboard as failed.
+            return done(f'AIP missing from DCP: s3://{bucket}/{dcp_key}')
+        return done(f'duracloud preserve read failed ({code}): {e}')
+    except (DcpReadError, dcp.RangeError, BotoCoreError) as e:
+        return done(f'duracloud preserve read failed: {e}')
+
+    if expected_bytes is not None and reader.size is not None \
+            and int(reader.size) != int(expected_bytes):
+        reader.close()
+        return done(
+            f'the DCP object is {reader.size} bytes, but Archivematica records '
+            f'{expected_bytes}: s3://{bucket}/{dcp_key}'
+        )
+    total = expected_bytes if expected_bytes is not None else reader.size
+    if total:
+        aip_ops.write_copy_progress(aip_uuid, 0, total)
+    try:
+        uploaded = wasabi.upload_fileobj(
+            reader, key,
+            expected_bytes=total,
+            bucket_config=config.WASABI_AIP_BUCKET,
+            progress_hook=lambda sent, t: aip_ops.write_copy_progress(aip_uuid, sent, t),
+        )
+        if not reader.done:
+            # The reader returns short only at the end, so the upload
+            # stopped reading early.
+            raise ChunkVerificationError(
+                f'the upload stopped at byte {reader.bytes_read} of {reader.size}'
+            )
+    except ChunkVerificationError as e:
+        logger.error(
+            'copy_aip_from_duracloud VERIFICATION_FAILED key=%s err=%s — '
+            'deleting uploaded object', key, e,
+        )
+        try:
+            wasabi.delete_object(key, bucket_config=config.WASABI_AIP_BUCKET)
+        except Exception as del_err:
+            logger.error(
+                'copy_aip_from_duracloud cleanup delete failed key=%s err=%s',
+                key, del_err,
+            )
+        return done(f'verification failed: {e}')
+    except DcpReadError as e:
+        return done(f'duracloud preserve read failed: {e}')
+    except ClientError as e:
+        code = e.response.get('Error', {}).get('Code', 'unknown')
+        return done(f'wasabi upload ClientError {code}: {e}')
+    except Exception as e:
+        return done(f'copy failed: {e}')
+    finally:
+        reader.close()
+        aip_ops.clear_copy_progress(aip_uuid)
+
+    out.update({
+        'ok': True,
+        'bucket': uploaded.get('bucket') or bucket_name,
+        'key': key,
+        'bytes': reader.bytes_read,
+    })
+    logger.info(
+        'copy_aip_from_duracloud OK (dcp) aip_uuid=%s key=%s bytes=%s',
+        aip_uuid, key, out['bytes'],
+    )
+    return done()
 
 
 def copy_aip_from_duracloud(aip_uuid, repo_uuid):
@@ -539,8 +778,8 @@ def copy_aip_from_duracloud(aip_uuid, repo_uuid):
         )
     if not is_configured():
         return done(
-            'DuraCloud is not configured. Set DURACLOUD_API / DURACLOUD_USER '
-            '/ DURACLOUD_PWD in the curation service .env and restart.'
+            f'DuraCloud is not configured. Set {SETTINGS_HINT} in the curation '
+            f'service .env and restart.'
         )
 
     key, expected_bytes, resolve_error = _resolve_key_and_size(aip_uuid)
@@ -604,6 +843,9 @@ def copy_aip_from_duracloud(aip_uuid, repo_uuid):
                 )
             except Exception as e:
                 return done(f'wasabi delete of stale object failed: {e}')
+
+    if from_dcp():
+        return _copy_aip_from_dcp(aip_uuid, key, expected_bytes, bucket_name, out, done)
 
     # --- Resolve the DuraCloud shape: single object or chunked ----------
     manifest = None
