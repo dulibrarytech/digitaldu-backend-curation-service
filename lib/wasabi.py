@@ -139,7 +139,7 @@ def _wasabi_keys():
     Return (access_key_id, secret_access_key, region) for Wasabi, or None.
 
     The role-named WASABI_* pair wins over the generic AWS_* pair, which is
-    read only as a one-release fallback. A pair is always taken from ONE
+    read only as a fallback. A pair is always taken from ONE
     family, never an id from one and a secret from the other. The region
     is WASABI_REGION, else AWS_DEFAULT_REGION, else None.
     """

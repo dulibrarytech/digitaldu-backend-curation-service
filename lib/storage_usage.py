@@ -13,12 +13,15 @@
 # limitations under the License.
 
 """
-Wasabi bucket storage-utilization readout.
+Storage-utilization readout: the Wasabi buckets and, once curation has
+its DCP key, DuraCloud Preserve's DIP and AIP locations (repo-backend-v2's
+home-page storage cards read those two).
 
 S3 has no "bucket size" call — usage is a full ListObjectsV2 walk
 summing object sizes. The AIP store is quick (~21k objects ≈ 21 pages)
 but the batch-backup bucket can hold hundreds of thousands of objects,
-so a walk is far too slow for a dashboard request. Instead:
+and DCP's DIP location ~266k, so a walk is far too slow for a dashboard
+request. Instead:
 
   - Results are computed in a BACKGROUND thread and cached to a small
     JSON file (same cross-gunicorn-worker file pattern as the AIP
@@ -44,7 +47,7 @@ import threading
 import time
 
 import config
-from lib import wasabi
+from lib import dcp, wasabi
 
 logger = logging.getLogger(__name__)
 
@@ -65,23 +68,33 @@ def _ttl_seconds():
 
 def _targets():
     """
-    (label, env_value) pairs for the buckets to measure. Unset env
-    values are skipped — the readout shows what is configured.
+    (label, env_value, make_client, setting) for the stores to measure. An
+    unset Wasabi bucket is skipped — the readout shows what is configured.
+    The DCP locations are measured with the DCP client once its key is
+    set, and an unset one is then recorded as an error naming its
+    `setting`: with the key, DCP is the source for whatever reads that
+    location (/health/dcp reports it the same way).
     """
-    return [
-        ('batch_backups', config.WASABI_BUCKET),
-        ('aip_store', config.WASABI_AIP_BUCKET),
+    targets = [
+        ('batch_backups', config.WASABI_BUCKET, wasabi._make_client, None),
+        ('aip_store', config.WASABI_AIP_BUCKET, wasabi._make_client, None),
     ]
+    if dcp.is_configured():
+        targets += [
+            ('dcp_dip_store', config.DCP_DIP_LOCATION, dcp.make_client, 'DCP_DIP_LOCATION'),
+            ('dcp_aip_store', config.DCP_AIP_LOCATION, dcp.make_client, 'DCP_AIP_LOCATION'),
+        ]
+    return targets
 
 
-def _measure_bucket(raw_bucket_value):
+def _measure_bucket(raw_bucket_value, make_client):
     """
     Walk one bucket (scoped to its base prefix) and sum sizes.
     Returns {'bucket', 'prefix', 'objects', 'bytes', 'duration_ms'}.
     """
     started = time.monotonic()
     bucket, base_prefix = wasabi._parse_bucket(raw_bucket_value)
-    client = wasabi._make_client()
+    client = make_client()
     objects = 0
     total_bytes = 0
     paginator = client.get_paginator('list_objects_v2')
@@ -105,11 +118,13 @@ def compute_usage():
     bucket doesn't hide the other's result. Returns the cache dict.
     """
     buckets = {}
-    for label, raw in _targets():
+    for label, raw, make_client, setting in _targets():
         if not raw:
+            if setting:
+                buckets[label] = {'error': f'{setting} is not configured'}
             continue
         try:
-            buckets[label] = _measure_bucket(raw)
+            buckets[label] = _measure_bucket(raw, make_client)
         except Exception as e:
             logger.warning('bucket usage failed for %s: %s', label, e)
             buckets[label] = {'error': str(e)[:500]}
@@ -176,19 +191,33 @@ def trigger_recompute(force=False):
     return True
 
 
+def _missing_targets(cache):
+    """
+    Labels of configured targets the cache has no entry for: a cache
+    written before the DCP key went in holds no DCP locations until the
+    next walk. A failed walk leaves an error entry, which counts.
+    """
+    buckets = (cache or {}).get('buckets') or {}
+    return [
+        label for label, raw, _, setting in _targets()
+        if (raw or setting) and label not in buckets
+    ]
+
+
 def get_usage(trigger_if_stale=True):
     """
     The dashboard read: cached usage + freshness flags.
         { 'usage': <cache dict or None>,
           'computing': bool,
           'stale': bool }
-    When the cache is missing or older than the TTL (and
-    trigger_if_stale), a background recompute is kicked off — the
-    caller renders whatever is cached NOW and polls for the update.
+    When the cache is missing, older than the TTL, or without an entry
+    for a configured location (and trigger_if_stale), a background
+    recompute is kicked off — the caller renders whatever is cached NOW
+    and polls for the update.
     """
     cache = _read_cache()
     age = time.time() - cache['computed_at'] if cache else None
-    stale = cache is None or age > _ttl_seconds()
+    stale = cache is None or age > _ttl_seconds() or bool(_missing_targets(cache))
     if stale and trigger_if_stale:
         trigger_recompute()
     return {

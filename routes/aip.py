@@ -159,8 +159,9 @@ def copy_from_duracloud():
 @require_api_key_qa
 def bucket_usage():
     """
-    Cached storage-utilization readout for both Wasabi buckets
-    (batch backups + AIP store). Serves the cache instantly; when the
+    Cached storage-utilization readout for the Wasabi buckets (batch
+    backups, AIP store) and, once curation has its DCP key, DCP's DIP
+    and AIP locations. Serves the cache instantly; when the
     cache is missing or older than WASABI_USAGE_TTL_SECONDS (24h
     default) a background recompute starts and `computing: true`
     tells the caller to poll. Completed objects only — multipart

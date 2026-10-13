@@ -69,9 +69,9 @@ AWS_DEFAULT_REGION = os.getenv('AWS_DEFAULT_REGION')
 
 # --- Wasabi credentials (role-named) -----------------------------------------
 # Preferred over the generic AWS_* names above, which lib/wasabi.py still
-# reads as a fallback for one release so a host can switch without a
-# coordinated cutover. The generic names become ambiguous once DuraCloud
-# Preserve (real AWS) credentials live in the same process.
+# reads as a fallback, so a host can switch without a coordinated cutover.
+# The generic names become ambiguous once DuraCloud Preserve (real AWS)
+# credentials live in the same process.
 WASABI_ACCESS_KEY_ID = os.getenv('WASABI_ACCESS_KEY_ID')
 WASABI_SECRET_ACCESS_KEY = os.getenv('WASABI_SECRET_ACCESS_KEY')
 WASABI_REGION = os.getenv('WASABI_REGION')
