@@ -28,6 +28,20 @@ dotenv_path = join(dirname(__file__), '.env')
 load_dotenv(dotenv_path)
 
 
+def _dir_path(value):
+    """A directory setting with exactly one trailing '/'.
+
+    lib/archivematica_ops.py builds paths under READY_PATH and INGEST_PATH
+    by string concatenation (`ready_path + folder + '/' + package`), so a
+    value without the slash lists `/data/readyfolder` and creates
+    `/data/ingest<uuid>` beside the staging root. Unset or empty passes
+    through unchanged, and '/' stays '/'.
+    """
+    if not value:
+        return value
+    return value.rstrip('/') + '/'
+
+
 # --- Auth (shared) -----------------------------------------------------------
 API_KEY = os.getenv('API_KEY')
 
@@ -36,8 +50,9 @@ APP_PORT = os.getenv('APP_PORT', '8185')
 APP_VERSION = os.getenv('APP_VERSION', 'curation-api 1.0.0')
 
 # --- Archivematica side (was Service A / qa-service) -------------------------
-READY_PATH = os.getenv('READY_PATH')
-INGEST_PATH = os.getenv('INGEST_PATH')
+# The two staging roots work with or without a trailing '/' (_dir_path).
+READY_PATH = _dir_path(os.getenv('READY_PATH'))
+INGEST_PATH = _dir_path(os.getenv('INGEST_PATH'))
 INGESTED_PATH = os.getenv('INGESTED_PATH')
 SFTP_HOST = os.getenv('SFTP_HOST')
 SFTP_ID = os.getenv('SFTP_ID')

@@ -882,22 +882,26 @@ def get_package_file_count(collection_folder, package):
     Gets package count in batch
     @param: collection_folder
     @param: package
-    @returns: count
+    @returns: count, or None when the package folder can't be listed
     """
 
+    dir_path = None
     try:
         dir_path = ready_path + collection_folder + '/' + package
         count = 0
         # Iterate directory
         for path in os.listdir(dir_path):
-           # check if current path is a directory
-           if os.path.isfile(os.path.join(dir_path, path)):
-               count += 1
-        logger.info('Package count:', count)
+            # check if current path is a directory
+            if os.path.isfile(os.path.join(dir_path, path)):
+                count += 1
+        logger.info('Package count: %s', count)
 
         return count
     except Exception as e:
-        logger.info(e)
+        # The route turns None into a 404. Name the path, so a wrong
+        # READY_PATH or an unmounted share shows here and not only as
+        # "Package not found" in repov2.
+        logger.warning('Package count failed for %s: %s', dir_path, e)
 
 
 def move_to_ingest(uuid, folder, package):

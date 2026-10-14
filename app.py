@@ -17,6 +17,7 @@ DigitalDU Curation API — entry point.
 """
 
 import logging
+import os
 import threading
 
 from flask import Flask
@@ -45,6 +46,10 @@ def create_app():
     # the SFTP and local-fs endpoints work without Wasabi. Look for
     # `wasabi probe OK` in journald to confirm cred + bucket auth on boot.
     _probe_wasabi_at_startup()
+
+    # Staging roots: a wrong READY_PATH / INGEST_PATH shows at boot as
+    # `staging paths: ... MISSING` instead of as a 404 on the first ingest.
+    _log_staging_paths_at_startup()
 
     app = Flask(__name__)
     CORS(app, resources={r'/api/*': {'origins': '*'}})
@@ -123,6 +128,32 @@ def _probe_wasabi_at_startup():
         # Belt-and-braces; health_check itself is supposed to catch
         # everything but we don't want a regression there to block boot.
         logger.warning('wasabi probe threw unexpectedly: %s', e)
+
+
+def _log_staging_paths_at_startup():
+    """
+    Log READY_PATH and INGEST_PATH once at startup, each marked ok,
+    MISSING or unset, so a mistyped or unmounted staging root shows in
+    journald at boot instead of as "Package not found" on the first
+    ingest. Log only: the service starts either way.
+    """
+    try:
+        parts = []
+        all_ok = True
+        for name in ('READY_PATH', 'INGEST_PATH'):
+            value = getattr(config, name)
+            if not value:
+                parts.append('%s unset' % name)
+                all_ok = False
+                continue
+            ok = os.path.isdir(value)
+            all_ok = all_ok and ok
+            parts.append('%s=%s %s' % (name, value, 'ok' if ok else 'MISSING'))
+        log = logger.info if all_ok else logger.warning
+        log('staging paths: %s', ', '.join(parts))
+    except Exception as e:  # noqa: BLE001
+        # Same belt-and-braces as the probes: never break boot.
+        logger.warning('staging path check threw unexpectedly: %s', e)
 
 
 def _probe_dcp_at_startup():
