@@ -205,10 +205,6 @@ class CheckSftpFailureTests(_IngestTmpMixin):
         self.assertEqual(res.get('local_package_size_bytes'), 100)
 
 
-if __name__ == '__main__':
-    unittest.main()
-
-
 class UploadCancelTests(_IngestTmpMixin):
     """Cancel + single-flight guards on the background put (2026-07-30:
     'Halt entire batch' left daemon-thread puts running, and duplicate
@@ -298,3 +294,162 @@ class UploadCancelTests(_IngestTmpMixin):
                     ops._do_sftp_put(self.PID)  # bows out silently
             finally:
                 os.close(fd)
+
+
+class PerPackagePutTests(_IngestTmpMixin):
+    """The 2026-10-14 scoping: with `package`, the put and check_sftp work on
+    002-ingest/<pid>/<package> only. A leftover sibling (a package whose
+    Wasabi archive failed) must be neither re-sent nor counted."""
+
+    PKG = 'U201.01.0001'
+    REMOTE = '/remote/ingest'
+
+    def setUp(self):
+        super().setUp()
+        self.pkg_dir = os.path.join(self.tmp, self.PID, self.PKG)
+        os.makedirs(self.pkg_dir)
+        with open(os.path.join(self.pkg_dir, 'a.bin'), 'wb') as f:
+            f.write(b'x' * 100)
+        # A leftover sibling from an earlier package of the same collection.
+        os.makedirs(os.path.join(self.tmp, self.PID, 'leftover'))
+        with open(os.path.join(self.tmp, self.PID, 'leftover', 'b.bin'), 'wb') as f:
+            f.write(b'y' * 50)
+
+    def pkg_marker_path(self):
+        return os.path.join(self.tmp, self.PID, ops.UPLOAD_ERROR_MARKER + '--' + self.PKG)
+
+    def _fake_sftp(self, listing):
+        """listdir answers from `listing` (path -> names)."""
+        class FakeSftp:
+            def listdir(self, path):
+                return listing.get(path, [])
+
+            def close(self):
+                pass
+        return FakeSftp()
+
+    def test_put_uploads_only_the_package_folder(self):
+        puts = []
+
+        def fake_put_r(sftp, local, remote, preserve_mtime=True, should_abort=None):
+            puts.append((local, remote))
+
+        listing = {self.REMOTE + '/' + self.PID: [self.PKG, 'leftover']}
+        with mock.patch.object(ops, '_open_sftp', lambda: (_FakeClient(), self._fake_sftp(listing))), \
+                mock.patch.object(ops, '_sftp_put_r', fake_put_r):
+            ops._do_sftp_put(self.PID, self.PKG)
+
+        self.assertEqual(puts, [(self.pkg_dir, self.REMOTE + '/' + self.PID + '/' + self.PKG)])
+        self.assertFalse(os.path.exists(self.pkg_marker_path()))
+        self.assertFalse(os.path.exists(self.marker_path()))
+
+    def test_missing_package_folder_fails_without_opening_sftp(self):
+        def explode():
+            raise AssertionError('must not open SFTP for a package that is not staged')
+
+        with mock.patch.object(ops, '_open_sftp', explode):
+            ops._do_sftp_put(self.PID, 'not-staged')
+
+        marker = os.path.join(self.tmp, self.PID, ops.UPLOAD_ERROR_MARKER + '--not-staged')
+        with open(marker) as fh:
+            self.assertIn('not found in 002-ingest', fh.read())
+        # The failure is that package's alone.
+        self.assertFalse(os.path.exists(self.marker_path()))
+        self.assertFalse(os.path.exists(self.pkg_marker_path()))
+
+    def test_package_missing_from_the_remote_listing_is_a_failure(self):
+        listing = {self.REMOTE + '/' + self.PID: ['leftover']}
+        with mock.patch.object(ops, '_open_sftp', lambda: (_FakeClient(), self._fake_sftp(listing))), \
+                mock.patch.object(ops, '_sftp_put_r', lambda *a, **k: None):
+            ops._do_sftp_put(self.PID, self.PKG)
+
+        with open(self.pkg_marker_path()) as fh:
+            self.assertIn('not found on sftp after put', fh.read())
+
+    def test_check_sftp_measures_the_package_only(self):
+        walked = []
+
+        def fake_walk(sftp, remote_dir, on_file=None, on_dir=None, on_other=None):
+            walked.append(remote_dir)
+            on_file(remote_dir + '/a.bin')
+
+        sized = []
+
+        def fake_dir_size(sftp, remote_dir):
+            sized.append(remote_dir)
+            return 60
+
+        with mock.patch.object(ops, '_open_sftp', lambda: (_FakeClient(), self._fake_sftp({}))), \
+                mock.patch.object(ops, '_sftp_walk', fake_walk), \
+                mock.patch.object(ops, '_sftp_dir_size', fake_dir_size):
+            in_progress = ops.check_sftp(self.PID, 2, self.PKG)
+            complete = ops.check_sftp(self.PID, 1, self.PKG)
+
+        remote_pkg = self.REMOTE + '/' + self.PID + '/' + self.PKG
+        self.assertEqual(walked, [remote_pkg, remote_pkg])
+        self.assertEqual(sized, [remote_pkg, remote_pkg])
+        self.assertEqual(in_progress['message'], 'in_progress')
+        self.assertEqual(in_progress['remote_file_count'], 1)
+        self.assertEqual(in_progress['remote_package_size_bytes'], 60)
+        # The local total is the package's 100 bytes, not the folder's 150.
+        self.assertEqual(in_progress['local_package_size_bytes'], 100)
+        self.assertEqual(complete['message'], 'upload_complete')
+
+    def test_error_marker_is_read_for_that_package_only(self):
+        with open(self.pkg_marker_path(), 'w') as fh:
+            fh.write('disk full on sftp host')
+
+        def fake_walk(sftp, remote_dir, **kwargs):
+            pass
+
+        with mock.patch.object(ops, '_open_sftp', lambda: (_FakeClient(), self._fake_sftp({}))), \
+                mock.patch.object(ops, '_sftp_walk', fake_walk), \
+                mock.patch.object(ops, '_sftp_dir_size', lambda *a: 0):
+            failed = ops.check_sftp(self.PID, 1, self.PKG)
+            other = ops.check_sftp(self.PID, 1, 'leftover')
+            legacy = ops.check_sftp(self.PID, 1)
+
+        self.assertEqual(failed['message'], 'upload_failed')
+        self.assertIn('disk full', failed['error'])
+        self.assertEqual(other['message'], 'in_progress')
+        self.assertEqual(legacy['message'], 'in_progress')
+
+    def test_cancel_flag_is_per_package(self):
+        res = ops.request_upload_cancel(self.PID, self.PKG)
+        self.assertEqual(res['message'], 'cancel_requested')
+        self.assertTrue(os.path.exists(
+            os.path.join(self.tmp, self.PID, ops.UPLOAD_CANCEL_MARKER + '--' + self.PKG)
+        ))
+        self.assertFalse(os.path.exists(os.path.join(self.tmp, self.PID, ops.UPLOAD_CANCEL_MARKER)))
+        self.assertEqual(ops.request_upload_cancel(self.PID, 'not-staged')['message'], 'no_staging_dir')
+
+    def test_put_honours_its_own_cancel_flag(self):
+        put_files = []
+
+        def fake_put_r(sftp, local, remote, preserve_mtime=True, should_abort=None):
+            put_files.append('f1')
+            ops.request_upload_cancel(self.PID, self.PKG)
+            if should_abort and should_abort():
+                raise ops.UploadCancelled()
+            put_files.append('f2')
+
+        listing = {self.REMOTE + '/' + self.PID: [self.PKG]}
+        with mock.patch.object(ops, '_open_sftp', lambda: (_FakeClient(), self._fake_sftp(listing))), \
+                mock.patch.object(ops, '_sftp_put_r', fake_put_r):
+            ops._do_sftp_put(self.PID, self.PKG)
+
+        self.assertEqual(put_files, ['f1'])
+        self.assertFalse(os.path.exists(self.pkg_marker_path()))
+        self.assertFalse(os.path.exists(
+            os.path.join(self.tmp, self.PID, ops.UPLOAD_CANCEL_MARKER + '--' + self.PKG)
+        ))
+
+    def test_put_lock_is_per_package(self):
+        self.assertNotEqual(ops._put_lock_path(ops._put_key(self.PID, 'A')),
+                            ops._put_lock_path(ops._put_key(self.PID, 'B')))
+        self.assertEqual(ops._put_lock_path(ops._put_key(self.PID)), ops._put_lock_path(self.PID))
+        self.assertNotIn('/', os.path.basename(ops._put_lock_path(ops._put_key(self.PID, 'A'))))
+
+
+if __name__ == '__main__':
+    unittest.main()

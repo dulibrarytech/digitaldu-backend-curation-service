@@ -139,6 +139,36 @@ class QaRouteValidationTests(unittest.TestCase):
             m1.assert_not_called()
             m2.assert_not_called()
 
+    def test_upload_routes_reject_bad_uuid_and_package(self):
+        routes = ('move-to-sftp?uuid=%s', 'upload-status?total_batch_file_count=1&uuid=%s',
+                  'cancel-upload?uuid=%s')
+        with patch.object(ops, 'move_to_sftp') as m1, patch.object(ops, 'check_sftp') as m2, \
+             patch.object(ops, 'request_upload_cancel') as m3:
+            for route in routes:
+                for bad in ('../x', 'a/b', '-flag'):
+                    r = self._get('/api/v2/qa/' + route % bad)
+                    self.assertEqual(r.status_code, 400, route % bad)
+                    r = self._get('/api/v2/qa/' + route % 'ok' + '&package=' + bad)
+                    self.assertEqual(r.status_code, 400, route % 'ok' + bad)
+            m1.assert_not_called()
+            m2.assert_not_called()
+            m3.assert_not_called()
+
+    def test_upload_routes_pass_the_optional_package_to_ops(self):
+        with patch.object(ops, 'move_to_sftp', return_value={'message': 'upload_started'}) as m1, \
+             patch.object(ops, 'check_sftp', return_value={'message': 'in_progress'}) as m2, \
+             patch.object(ops, 'request_upload_cancel', return_value={'message': 'cancel_requested'}) as m3:
+            self.assertEqual(self._get('/api/v2/qa/move-to-sftp?uuid=u&package=p').status_code, 200)
+            self.assertEqual(self._get('/api/v2/qa/move-to-sftp?uuid=u').status_code, 200)
+            self.assertEqual(
+                self._get('/api/v2/qa/upload-status?uuid=u&total_batch_file_count=3&package=p').status_code,
+                200)
+            self.assertEqual(self._get('/api/v2/qa/cancel-upload?uuid=u&package=p').status_code, 200)
+            self.assertEqual(self._get('/api/v2/qa/cancel-upload?uuid=u').status_code, 200)
+        self.assertEqual([c.args for c in m1.call_args_list], [('u', 'p'), ('u', None)])
+        m2.assert_called_once_with('u', '3', 'p')
+        self.assertEqual([c.args for c in m3.call_args_list], [('u', 'p'), ('u', None)])
+
     def test_auth_still_required(self):
         # No X-API-Key header -> 403 (unchanged behavior), not a validation 400.
         r = self.client.get('/api/v2/qa/reset_permissions?folder=new_coll')

@@ -1127,42 +1127,63 @@ def move_from_ingest_to_ready(uuid, folder, package, actor=None):
 UPLOAD_ERROR_MARKER = '.upload_error'
 
 
-def _upload_error_marker_path(pid):
-    """Path of the per-package upload-error sentinel (see UPLOAD_ERROR_MARKER)."""
-    return os.path.join(ingest_path + pid, UPLOAD_ERROR_MARKER)
+def _staging_dir(pid, package=None):
+    """002-ingest/<pid>, or 002-ingest/<pid>/<package> for one package."""
+    root = ingest_path + pid
+    return root if package is None else os.path.join(root, package)
+
+
+def _marker_path(pid, marker, package=None):
+    """Where a put's sentinel lives: in 002-ingest/<pid>/, BESIDE the
+    package folder rather than inside it, so a per-package put never
+    uploads it. One sentinel per package (`<marker>--<package>`); the
+    legacy whole-tree put keeps the bare name."""
+    name = marker if package is None else '%s--%s' % (marker, package)
+    return os.path.join(ingest_path + pid, name)
+
+
+def _upload_error_marker_path(pid, package=None):
+    """Path of the upload-error sentinel (see UPLOAD_ERROR_MARKER)."""
+    return _marker_path(pid, UPLOAD_ERROR_MARKER, package)
 
 
 UPLOAD_CANCEL_MARKER = '.upload_cancel'
 
 
-def _upload_cancel_marker_path(pid):
+def _upload_cancel_marker_path(pid, package=None):
     """Path of the cancel-request sentinel. A FILE, not memory: the put
     thread and the cancel request can land on different gunicorn
     workers, so the filesystem is the cross-process signal."""
-    return os.path.join(ingest_path + pid, UPLOAD_CANCEL_MARKER)
+    return _marker_path(pid, UPLOAD_CANCEL_MARKER, package)
 
 
-def request_upload_cancel(pid):
-    """Ask an in-flight put for `pid` to stop.
+def request_upload_cancel(pid, package=None):
+    """Ask an in-flight put for `pid` (one package of it, with `package`) to stop.
 
     Best-effort and idempotent: writes the sentinel; the put checks it
     per file and every ~8 MB within a file. Returns message='no_staging_dir'
     when there is no staging dir (nothing can be uploading from it)."""
-    staging = ingest_path + pid
-    if not os.path.isdir(staging):
+    key = _put_key(pid, package)
+    if not os.path.isdir(_staging_dir(pid, package)):
         return dict(message='no_staging_dir')
     try:
-        with open(_upload_cancel_marker_path(pid), 'w') as fh:
+        with open(_upload_cancel_marker_path(pid, package), 'w') as fh:
             fh.write('cancel requested')
-        logger.info('request_upload_cancel: flag written for %s', pid)
+        logger.info('request_upload_cancel: flag written for %s', key)
         return dict(message='cancel_requested')
     except OSError as e:
-        logger.error('request_upload_cancel failed for %s: %s', pid, e)
+        logger.error('request_upload_cancel failed for %s: %s', key, e)
         return dict(message='cancel_flag_write_failed', error=str(e))
 
 
-def _put_lock_path(pid):
-    return os.path.join(SFTP_LOCK_DIR, 'put-%s.lock' % pid)
+def _put_key(pid, package=None):
+    """Single-flight key of a put: the pid, or `<pid>/<package>` for one
+    package (a validated package never contains '/')."""
+    return pid if package is None else pid + '/' + package
+
+
+def _put_lock_path(key):
+    return os.path.join(SFTP_LOCK_DIR, 'put-%s.lock' % key.replace('/', '--'))
 
 
 # Per-package single-flight registry for THIS process: a second
@@ -1173,32 +1194,37 @@ _sftp_puts_in_flight = set()
 _sftp_puts_lock = threading.Lock()
 
 
-def _do_sftp_put(pid):
+def _do_sftp_put(pid, package=None):
     """Background worker: the actual recursive SFTP put.
 
     Runs in the daemon thread started by move_to_sftp, and opens its own
-    SFTP connection. On failure it writes the .upload_error marker into
-    the local staging dir; check_sftp reports that to the poller, which
-    halts the row.
+    SFTP connection. With `package` it uploads 002-ingest/<pid>/<package>
+    to <sftp_path>/<pid>/<package> — that package only, so a leftover
+    sibling (a package whose Wasabi archive failed) is neither re-sent
+    nor counted toward this upload. Without `package` it is the legacy
+    whole-tree put of 002-ingest to <sftp_path>. On failure it writes the
+    .upload_error marker into the local staging dir; check_sftp reports
+    that to the poller, which halts the row.
     """
-    marker = _upload_error_marker_path(pid)
+    key = _put_key(pid, package)
+    marker = _upload_error_marker_path(pid, package)
 
     # HOST-wide single-flight: if another process already holds the put
-    # lock for this pid, bow out and let that put finish. Concurrent puts
-    # of one tree corrupt each other (paramiko's post-put verify reports
-    # "size mismatch in put!").
+    # lock for this package, bow out and let that put finish. Concurrent
+    # puts of one tree corrupt each other (paramiko's post-put verify
+    # reports "size mismatch in put!").
     os.makedirs(SFTP_LOCK_DIR, exist_ok=True)
-    put_lock_fd = os.open(_put_lock_path(pid), os.O_CREAT | os.O_RDWR, 0o644)
+    put_lock_fd = os.open(_put_lock_path(key), os.O_CREAT | os.O_RDWR, 0o644)
     try:
         fcntl.flock(put_lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
         os.close(put_lock_fd)
         logger.info(
-            '_do_sftp_put: another process is already uploading %s — bowing out', pid,
+            '_do_sftp_put: another process is already uploading %s — bowing out', key,
         )
         return
 
-    cancel_flag = _upload_cancel_marker_path(pid)
+    cancel_flag = _upload_cancel_marker_path(pid, package)
 
     def _cancelled():
         return os.path.exists(cancel_flag)
@@ -1211,15 +1237,24 @@ def _do_sftp_put(pid):
             pass
 
     try:
+        if package is None:
+            local_root, remote_root = ingest_path, sftp_path
+            remote_parent, expected = sftp_path, pid
+        else:
+            local_root = _staging_dir(pid, package)
+            remote_parent = posixpath.join(sftp_path, pid)
+            remote_root = posixpath.join(remote_parent, package)
+            expected = package
+            if not os.path.isdir(local_root):
+                raise RuntimeError('package folder not found in 002-ingest: %s' % local_root)
         client, sftp = _open_sftp()
         try:
             _sftp_put_r(
-                sftp, ingest_path, sftp_path,
+                sftp, local_root, remote_root,
                 preserve_mtime=True, should_abort=_cancelled,
             )
-            packages = sftp.listdir(sftp_path)
-            if pid not in packages:
-                raise RuntimeError('package %s not found on sftp after put' % pid)
+            if expected not in sftp.listdir(remote_parent):
+                raise RuntimeError('package %s not found on sftp after put' % expected)
         finally:
             sftp.close()
             client.close()
@@ -1228,25 +1263,25 @@ def _do_sftp_put(pid):
         # (the queue row is already CANCELLED_BY_USER and nobody polls);
         # the partial remote tree is cleaned up by the rollback's
         # clean_up_sftp step.
-        logger.info('move_to_sftp: upload for %s cancelled by staff request', pid)
+        logger.info('move_to_sftp: upload for %s cancelled by staff request', key)
         try:
             os.remove(cancel_flag)
         except OSError:
             pass
     except Exception as e:  # noqa: BLE001
-        logger.error('move_to_sftp background put failed for %s: %s', pid, e)
+        logger.error('move_to_sftp background put failed for %s: %s', key, e)
         try:
             with open(marker, 'w') as fh:
                 fh.write(str(e)[:1000])
         except OSError as marker_err:
-            logger.error('could not write upload-error marker for %s: %s', pid, marker_err)
+            logger.error('could not write upload-error marker for %s: %s', key, marker_err)
     finally:
         with _sftp_puts_lock:
-            _sftp_puts_in_flight.discard(pid)
+            _sftp_puts_in_flight.discard(key)
         os.close(put_lock_fd)  # drops the flock
 
 
-def move_to_sftp(pid):
+def move_to_sftp(pid, package=None):
     """Kick off the recursive SFTP put in a BACKGROUND thread; return at once.
 
     Fire-and-don't-wait: the caller gets a response immediately and the
@@ -1256,33 +1291,41 @@ def move_to_sftp(pid):
     byte-accurate %. Failure surfaces through the .upload_error marker.
 
     Single-flight per package: if this process already has a put running
-    for `pid`, no second put is started.
+    for `pid` + `package`, no second put is started. Two packages of one
+    collection may upload side by side; the legacy call without `package`
+    is keyed by the pid alone.
 
     @param: pid
+    @param: package  one package folder under 002-ingest/<pid> (the Node
+                     worker always sends it); None = the whole tree
     @returns: Dictionary (message='upload_started'|'upload_already_running')
     """
+    key = _put_key(pid, package)
     with _sftp_puts_lock:
-        if pid in _sftp_puts_in_flight:
-            logger.info('move_to_sftp: put already in flight for %s — not starting another', pid)
+        if key in _sftp_puts_in_flight:
+            logger.info('move_to_sftp: put already in flight for %s — not starting another', key)
             return dict(message='upload_already_running')
-        _sftp_puts_in_flight.add(pid)
-    thread = threading.Thread(target=_do_sftp_put, args=(pid,), daemon=True)
+        _sftp_puts_in_flight.add(key)
+    thread = threading.Thread(target=_do_sftp_put, args=(pid, package), daemon=True)
     thread.start()
     return dict(message='upload_started')
 
 
-def check_sftp(uuid, local_file_count):
+def check_sftp(uuid, local_file_count, package=None):
     """
     checks upload status on archivematica sftp
     @param: pid
     @param: local_file_count
+    @param: package  the package the put was started for: the remote walk,
+                     the byte sums and the error marker are then that
+                     package's alone; None = the legacy whole-folder check
     @returns: Dictionary
     """
 
     # If the background SFTP put (move_to_sftp) died, surface it at once so
     # the Node poller halts the row instead of waiting out the upload
     # timeout. Cheap local check before any SFTP round-trip.
-    marker = _upload_error_marker_path(uuid)
+    marker = _upload_error_marker_path(uuid, package)
     if os.path.exists(marker):
         try:
             with open(marker) as fh:
@@ -1307,6 +1350,8 @@ def check_sftp(uuid, local_file_count):
     client, sftp = _open_sftp()
     try:
         remote_package = sftp_path + '/' + uuid
+        if package is not None:
+            remote_package += '/' + package
         try:
             _sftp_walk(sftp, remote_package, on_file=store_files_name, on_dir=store_dir_name, on_other=store_other_file_types)
         except IOError:
@@ -1320,10 +1365,10 @@ def check_sftp(uuid, local_file_count):
         remote_package_size_bytes = _sftp_dir_size(sftp, remote_package)
         remote_package_size = _human_size(remote_package_size_bytes)
 
-        # Local total for the same uuid staging dir. 0 when the dir is
-        # gone or unreadable — the caller reads that as "unknown total"
-        # and falls back to the file-count readout.
-        local_package_size_bytes = _local_dir_size(ingest_path + uuid)
+        # Local total for the same staging dir. 0 when the dir is gone
+        # or unreadable — the caller reads that as "unknown total" and
+        # falls back to the file-count readout.
+        local_package_size_bytes = _local_dir_size(_staging_dir(uuid, package))
 
         if int(local_file_count) == remote_file_count:
             return dict(message='upload_complete', data=[file_names, remote_file_count])
