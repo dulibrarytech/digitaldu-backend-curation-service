@@ -22,10 +22,12 @@ import json
 import os
 
 import pytest
+from botocore.exceptions import ClientError
+from botocore.response import StreamingBody
 from PIL import Image
 
 import config
-from lib import convert_ops
+from lib import convert_ops, dcp
 
 
 AUTH = {'X-API-Key': 'test-key'}
@@ -184,6 +186,100 @@ def test_convert_short_fetch_is_500_naming_transit_truncation(client, tmp_path, 
     assert response.status_code == 500
     assert 'truncated in transit' in response.get_json()['message']
     assert list(tmp_path.iterdir()) == []
+
+
+# ---- POST /api/v1/convert/tiff, reading DuraCloud Preserve ------------------
+
+class FakeDcpTiffs:
+    """A DCP client holding TIFFs by key; `cut` ends every body short."""
+
+    def __init__(self, objects=None, cut=None):
+        self.objects = dict(objects or {})
+        self.cut = cut
+        self.keys = []
+
+    def get_object(self, Bucket, Key, **kwargs):
+        self.keys.append((Bucket, Key))
+        if Key not in self.objects:
+            raise ClientError({'Error': {'Code': 'NoSuchKey', 'Message': 'no'},
+                               'ResponseMetadata': {'HTTPStatusCode': 404}}, 'GetObject')
+        data = self.objects[Key]
+        delivered = data[:self.cut] if self.cut is not None else data
+        return {
+            'Body': StreamingBody(io.BytesIO(delivered), len(data)),
+            'ContentLength': len(data),
+            'ETag': '"e"',
+            'ResponseMetadata': {'HTTPStatusCode': 200},
+        }
+
+
+DCP_TIFF_KEY = 'dip-store/' + PAYLOAD['full_path']
+
+
+@pytest.fixture()
+def dcp_tiffs(monkeypatch):
+    # The REST settings stay set (the client fixture): the DCP key wins.
+    monkeypatch.setattr(config, 'DCP_ACCESS_KEY_ID', 'AKIATEST')
+    monkeypatch.setattr(config, 'DCP_SECRET_ACCESS_KEY', 'test-secret')
+    monkeypatch.setattr(config, 'DCP_REGION', 'us-east-1')
+    monkeypatch.setattr(config, 'DCP_DIP_LOCATION', 's3://dcp-test-dip-store/dip-store/')
+    store = FakeDcpTiffs()
+    monkeypatch.setattr(dcp, 'make_client', lambda probe=False: store)
+    monkeypatch.setattr(
+        convert_ops.requests, 'get',
+        lambda *a, **k: pytest.fail('the DuraCloud API was called though DCP has a key'),
+    )
+    return store
+
+
+def test_convert_reads_the_tiff_from_dcp(client, tmp_path, dcp_tiffs):
+    dcp_tiffs.objects[DCP_TIFF_KEY] = tiny_tiff_bytes()
+    response = client.post('/api/v1/convert/tiff', json=PAYLOAD, headers=AUTH)
+    assert response.status_code == 200
+    assert dcp_tiffs.keys == [('dcp-test-dip-store', DCP_TIFF_KEY)]
+    assert Image.open(tmp_path / '8a5cee8f-B463.00001.jpg').format == 'JPEG'
+
+
+def test_convert_missing_dcp_source_is_404(client, dcp_tiffs):
+    response = client.post('/api/v1/convert/tiff', json=PAYLOAD, headers=AUTH)
+    assert response.status_code == 404
+
+
+def test_convert_dcp_source_over_cap_is_400(client, dcp_tiffs, monkeypatch):
+    monkeypatch.setattr(config, 'DERIVATIVE_MAX_SOURCE_BYTES', 4)
+    dcp_tiffs.objects[DCP_TIFF_KEY] = b'0123456789'
+    response = client.post('/api/v1/convert/tiff', json=PAYLOAD, headers=AUTH)
+    assert response.status_code == 400
+
+
+def test_convert_short_dcp_read_is_500_naming_transit_truncation(client, tmp_path, dcp_tiffs):
+    dcp_tiffs.objects[DCP_TIFF_KEY] = tiny_tiff_bytes()
+    dcp_tiffs.cut = 10
+    response = client.post('/api/v1/convert/tiff', json=PAYLOAD, headers=AUTH)
+    assert response.status_code == 500
+    assert 'truncated in transit' in response.get_json()['message']
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_convert_with_a_key_but_no_dip_location_fails_naming_it(client, dcp_tiffs, monkeypatch):
+    # The key is the switch: a missing location is an error, never the API.
+    monkeypatch.setattr(config, 'DCP_DIP_LOCATION', None)
+    response = client.post('/api/v1/convert/tiff', json=PAYLOAD, headers=AUTH)
+    assert response.status_code == 500
+    assert 'DCP_DIP_LOCATION is not configured' in response.get_json()['message']
+
+
+def test_convert_without_a_dcp_key_reads_the_duracloud_api(client, tmp_path, monkeypatch):
+    # The client fixture sets only the REST settings; conftest blanks DCP_*.
+    monkeypatch.setattr(
+        dcp, 'make_client', lambda probe=False: pytest.fail('DCP was read without a key'),
+    )
+    monkeypatch.setattr(
+        convert_ops.requests, 'get', lambda *a, **k: FakeResponse(data=tiny_tiff_bytes()),
+    )
+    response = client.post('/api/v1/convert/tiff', json=PAYLOAD, headers=AUTH)
+    assert response.status_code == 200
+    assert Image.open(tmp_path / '8a5cee8f-B463.00001.jpg').format == 'JPEG'
 
 
 # ---- GET /api/v1/image ------------------------------------------------------

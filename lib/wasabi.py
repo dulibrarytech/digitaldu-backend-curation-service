@@ -17,7 +17,8 @@ Wasabi S3 operations (boto3).
 
 Directory and stream uploads, presigned GETs, and the read-only listing
 helpers the archive-browser routes use. Auth comes from
-AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY or WASABI_PROFILE, against
+WASABI_ACCESS_KEY_ID + WASABI_SECRET_ACCESS_KEY (or the older generic
+AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY) or WASABI_PROFILE, against
 WASABI_ENDPOINT / WASABI_BUCKET.
 """
 
@@ -27,6 +28,7 @@ import posixpath
 import time
 
 import boto3
+import botocore.session
 from boto3.s3.transfer import TransferConfig
 from botocore.config import Config
 from botocore.exceptions import (
@@ -42,7 +44,8 @@ logger = logging.getLogger(__name__)
 
 # Retry config applied to every S3 API call. Adaptive mode adds
 # client-side backoff on top of the standard exponential retry; 5
-# attempts caps a transient flake's recovery at roughly 30s.
+# retries (six attempts in all) caps a transient flake's recovery at
+# roughly 30s.
 _RETRY_CONFIG = Config(
     retries={'max_attempts': 5, 'mode': 'adaptive'},
     # Above boto3's 60s default — large multipart uploads can be slow
@@ -72,10 +75,34 @@ def _parse_bucket(raw):
     return bucket, prefix.strip('/') + '/'
 
 
-# These env vars must be popped while a Session is built from explicit
-# keys: set, they make boto3 load a named profile from ~/.aws/config even
-# when keys are passed, and raise ProfileNotFound if it is absent.
-_PROFILE_ENV_VARS = ('AWS_PROFILE', 'AWS_DEFAULT_PROFILE')
+def _session_from_keys(access_key_id, secret_access_key, region=None,
+                       read_aws_config=True):
+    """
+    A boto3 Session for an explicit key pair that never reads a profile
+    name from AWS_PROFILE / AWS_DEFAULT_PROFILE (set, those make boto3
+    load a named profile even when keys are passed, and raise
+    ProfileNotFound when it is absent). The `profile` session variable is
+    overridden instead of popping the environment, so any number of
+    threads can build clients at once.
+
+    read_aws_config=False also ignores ~/.aws/config and
+    ~/.aws/credentials, so nothing in a [default] profile (addressing
+    style, signature version) reaches the client: the DCP client's choice.
+    The Wasabi client keeps reading the files, as it always has.
+    """
+    session_vars = {'profile': (None, None, None, None)}
+    if not read_aws_config:
+        session_vars['config_file'] = (None, None, os.devnull, None)
+        session_vars['credentials_file'] = (None, None, os.devnull, None)
+    core = botocore.session.Session(session_vars=session_vars)
+    session_kwargs = {
+        'botocore_session': core,
+        'aws_access_key_id': access_key_id,
+        'aws_secret_access_key': secret_access_key,
+    }
+    if region:
+        session_kwargs['region_name'] = region
+    return boto3.Session(**session_kwargs)
 
 
 def _make_client():
@@ -84,54 +111,96 @@ def _make_client():
 
     Three credential paths, in priority order:
 
-      1. AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY (plus optional
-         AWS_DEFAULT_REGION).
+      1. An access key + secret, from WASABI_ACCESS_KEY_ID +
+         WASABI_SECRET_ACCESS_KEY or else the older AWS_ACCESS_KEY_ID +
+         AWS_SECRET_ACCESS_KEY (see _wasabi_keys).
       2. WASABI_PROFILE, a named profile in `~/.aws/config`. Used only
-         when the keys above are unset.
+         when no key pair is set.
       3. Neither — RuntimeError. There is deliberately no fallback to
          instance metadata or ambient host credentials.
     """
     if not config.WASABI_ENDPOINT:
         raise RuntimeError('WASABI_ENDPOINT is not configured')
 
-    if config.AWS_ACCESS_KEY_ID and config.AWS_SECRET_ACCESS_KEY:
-        return _client_from_keys()
+    keys = _wasabi_keys()
+    if keys:
+        return _client_from_keys(*keys)
     if config.WASABI_PROFILE:
         return _client_from_profile()
     raise RuntimeError(
-        'No Wasabi credentials configured. Set AWS_ACCESS_KEY_ID + '
-        'AWS_SECRET_ACCESS_KEY (preferred) or WASABI_PROFILE in '
-        'the service env.'
+        'No Wasabi credentials configured. Set WASABI_ACCESS_KEY_ID + '
+        'WASABI_SECRET_ACCESS_KEY (preferred), AWS_ACCESS_KEY_ID + '
+        'AWS_SECRET_ACCESS_KEY, or WASABI_PROFILE in the service env.'
     )
 
 
-def _client_from_keys():
+def _wasabi_keys():
     """
-    Build an S3 client from explicit access-key + secret.
+    Return (access_key_id, secret_access_key, region) for Wasabi, or None.
 
-    _PROFILE_ENV_VARS stay popped across BOTH `boto3.Session()` AND
-    `session.client()` — client construction re-enters the same
-    profile-loading machinery, so popping around Session alone still
-    raises ProfileNotFound. The env vars are restored on return, and
-    the built client no longer needs them.
+    The role-named WASABI_* pair wins over the generic AWS_* pair, which is
+    read only as a fallback. A pair is always taken from ONE
+    family, never an id from one and a secret from the other. The region
+    is WASABI_REGION, else AWS_DEFAULT_REGION, else None.
     """
-    session_kwargs = {
-        'aws_access_key_id': config.AWS_ACCESS_KEY_ID,
-        'aws_secret_access_key': config.AWS_SECRET_ACCESS_KEY,
-    }
-    if config.AWS_DEFAULT_REGION:
-        session_kwargs['region_name'] = config.AWS_DEFAULT_REGION
-
-    saved = {k: os.environ.pop(k) for k in _PROFILE_ENV_VARS if k in os.environ}
-    try:
-        session = boto3.Session(**session_kwargs)
-        return session.client(
-            's3',
-            endpoint_url=config.WASABI_ENDPOINT,
-            config=_RETRY_CONFIG,
+    region = config.WASABI_REGION or config.AWS_DEFAULT_REGION or None
+    if config.WASABI_ACCESS_KEY_ID and config.WASABI_SECRET_ACCESS_KEY:
+        return (
+            config.WASABI_ACCESS_KEY_ID,
+            config.WASABI_SECRET_ACCESS_KEY,
+            region,
         )
-    finally:
-        os.environ.update(saved)
+    if config.AWS_ACCESS_KEY_ID and config.AWS_SECRET_ACCESS_KEY:
+        return config.AWS_ACCESS_KEY_ID, config.AWS_SECRET_ACCESS_KEY, region
+    return None
+
+
+def credential_source():
+    """
+    Which settings the Wasabi key comes from, in _make_client's order:
+    'WASABI_*', 'AWS_* (fallback)', 'WASABI_PROFILE', or None. Logged at
+    startup, so a key move that didn't take effect is visible.
+    """
+    if config.WASABI_ACCESS_KEY_ID and config.WASABI_SECRET_ACCESS_KEY:
+        return 'WASABI_*'
+    if config.AWS_ACCESS_KEY_ID and config.AWS_SECRET_ACCESS_KEY:
+        return 'AWS_* (fallback)'
+    if config.WASABI_PROFILE:
+        return 'WASABI_PROFILE'
+    return None
+
+
+def half_set_key_pairs():
+    """
+    Key pairs with exactly one name set, as 'WASABI_ACCESS_KEY_ID without
+    WASABI_SECRET_ACCESS_KEY'. _wasabi_keys skips such a pair silently,
+    which would hide a typo in a key move; the startup log warns instead.
+    """
+    pairs = (
+        ('WASABI_ACCESS_KEY_ID', config.WASABI_ACCESS_KEY_ID,
+         'WASABI_SECRET_ACCESS_KEY', config.WASABI_SECRET_ACCESS_KEY),
+        ('AWS_ACCESS_KEY_ID', config.AWS_ACCESS_KEY_ID,
+         'AWS_SECRET_ACCESS_KEY', config.AWS_SECRET_ACCESS_KEY),
+    )
+    out = []
+    for id_name, id_value, secret_name, secret_value in pairs:
+        if bool(id_value) == bool(secret_value):
+            continue
+        if id_value:
+            out.append(f'{id_name} without {secret_name}')
+        else:
+            out.append(f'{secret_name} without {id_name}')
+    return out
+
+
+def _client_from_keys(access_key_id, secret_access_key, region=None):
+    """Build an S3 client from explicit keys (see _session_from_keys)."""
+    session = _session_from_keys(access_key_id, secret_access_key, region)
+    return session.client(
+        's3',
+        endpoint_url=config.WASABI_ENDPOINT,
+        config=_RETRY_CONFIG,
+    )
 
 
 def _client_from_profile():
@@ -482,17 +551,18 @@ def upload_fileobj(file_obj, key, expected_bytes=None, bucket_config=None,
 def head_object(key, bucket_config=None):
     """
     HEAD a Wasabi object. Returns:
-        {'exists': bool, 'bucket': str, 'key': str,
-         'content_length': int | None}
+        {'exists': bool | None, 'bucket': str, 'key': str,
+         'content_length': int | None, 'forbidden': True (403 only)}
 
     Used by aip_ops as the idempotency probe before a copy — a key
     that already exists at the expected size means we can skip the
     upload entirely.
 
     Distinguishes "not there" (returns exists=False, no raise) from
-    transport / auth errors (raises). 403 Forbidden is treated as
-    "exists but not accessible" → exists=True with content_length=None
-    so the caller can choose to skip or warn rather than re-upload.
+    transport / auth errors (raises). A 403 proves nothing either way (a
+    policy without bucket-wide s3:ListBucket answers a MISSING key with
+    403, and so does a denied request), so it returns exists=None with
+    forbidden=True; the AIP copies fail fast on it.
 
     `bucket_config` mirrors upload_fileobj — AIP callers pass
     config.WASABI_AIP_BUCKET; otherwise we fall back to
@@ -520,13 +590,11 @@ def head_object(key, bucket_config=None):
                 'key': full_key,
                 'content_length': None,
             }
-        # 403 — bucket policy issue or temporary auth glitch. We
-        # surface the assertion that something IS there (defensive
-        # default) but with no size info; the caller can decide
-        # whether that's enough to skip the upload.
+        # 403: can't tell whether the key exists (see docstring).
         if code == '403':
             return {
-                'exists': True,
+                'exists': None,
+                'forbidden': True,
                 'bucket': bucket,
                 'key': full_key,
                 'content_length': None,

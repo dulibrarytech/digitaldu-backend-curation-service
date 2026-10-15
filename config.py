@@ -52,6 +52,10 @@ WASABI_BUCKET = os.getenv('WASABI_BUCKET')
 # WASABI_AIP_BUCKET is REQUIRED by /api/v2/aip/*; unset, those routes
 # refuse with ok=false rather than writing AIPs to the batch bucket.
 WASABI_AIP_BUCKET = os.getenv('WASABI_AIP_BUCKET')
+# The served copy of each DIP (thumbnails, METS, JPG/PDF access files),
+# conventionally s3://library-repository/dip-store/. lib/dip_ops.py and
+# scripts/dip_backfill.py write here; repov2's dip-store gateway reads it.
+WASABI_DIP_BUCKET = os.getenv('WASABI_DIP_BUCKET')
 WASABI_PROFILE = os.getenv('WASABI_PROFILE')
 # Numeric gid of the shared staff group (e.g. `domain users`) that
 # reset_permissions restores on 001-ready batch folders. UID is retired:
@@ -59,10 +63,18 @@ WASABI_PROFILE = os.getenv('WASABI_PROFILE')
 GID = os.getenv('GID')
 ERRORS_FILE = os.getenv('ERRORS_FILE')
 BATCH_SIZE_LIMIT = os.getenv('BATCH_SIZE_LIMIT')
-AWS_DEFAULT_PROFILE = os.getenv('AWS_DEFAULT_PROFILE')
 AWS_ACCESS_KEY_ID = os.getenv('AWS_ACCESS_KEY_ID')
 AWS_SECRET_ACCESS_KEY = os.getenv('AWS_SECRET_ACCESS_KEY')
 AWS_DEFAULT_REGION = os.getenv('AWS_DEFAULT_REGION')
+
+# --- Wasabi credentials (role-named) -----------------------------------------
+# Preferred over the generic AWS_* names above, which lib/wasabi.py still
+# reads as a fallback, so a host can switch without a coordinated cutover.
+# The generic names become ambiguous once DuraCloud Preserve (real AWS)
+# credentials live in the same process.
+WASABI_ACCESS_KEY_ID = os.getenv('WASABI_ACCESS_KEY_ID')
+WASABI_SECRET_ACCESS_KEY = os.getenv('WASABI_SECRET_ACCESS_KEY')
+WASABI_REGION = os.getenv('WASABI_REGION')
 
 # --- Archivematica Storage Service (AIP retrieval) ---------------------------
 # Used by lib/aip_ops.py to fetch AM-produced AIPs and pipe them to Wasabi.
@@ -97,6 +109,28 @@ except ValueError:
 DURACLOUD_API = os.getenv('DURACLOUD_API')
 DURACLOUD_USER = os.getenv('DURACLOUD_USER')
 DURACLOUD_PWD = os.getenv('DURACLOUD_PWD')
+
+# --- DuraCloud Preserve (AWS S3) --------------------------------------------
+# Lyrasis replaced the DuraCloud REST API with plain AWS S3; lib/dcp.py
+# builds the client. Explicit keys and region only — never boto3's
+# default credential chain. Optional: unset = /health/dcp reports "not
+# configured", the DIP copy route refuses, and the large-AIP copies and
+# conversions read the DuraCloud API (DURACLOUD_* above). Set, they read
+# DCP (lib/duracloud_ops.py, lib/convert_ops.py), as do the backfill
+# script and the DIP copy route: the key is the switch, and both locations
+# must then be set (a missing one is an error, never a fallback to the API).
+DCP_ACCESS_KEY_ID = os.getenv('DCP_ACCESS_KEY_ID')
+DCP_SECRET_ACCESS_KEY = os.getenv('DCP_SECRET_ACCESS_KEY')
+# us-east-1 for DU's stack. Set it explicitly: DCP grants
+# GetBucketLocation only temporarily, so the region can't be discovered.
+DCP_REGION = os.getenv('DCP_REGION')
+# Optional endpoint override, e.g. a local MinIO for tests. Blank = AWS.
+DCP_ENDPOINT_URL = os.getenv('DCP_ENDPOINT_URL')
+# Bucket + key prefix in the WASABI_AIP_BUCKET form, e.g.
+# s3://dcp-archivesdu-dip-store/dip-store/ and
+# s3://dcp-archivesdu-aip-store/aip-store/.
+DCP_DIP_LOCATION = os.getenv('DCP_DIP_LOCATION')
+DCP_AIP_LOCATION = os.getenv('DCP_AIP_LOCATION')
 
 # AIPs at or above this size are copied FROM DURACLOUD BY DEFAULT
 # (Artefactual's recommendation: download large AIPs

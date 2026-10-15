@@ -32,7 +32,7 @@ All other content is released under [CC-BY-4.0](https://creativecommons.org/lice
 * **System libraries** (RHEL 8.10):
   * `libmagic` (for `python-magic`): `dnf install file-libs`
   * `gcc` + `python3.12-devel` if a wheel falls through to a source build (rare on x86_64 — boto3 / paramiko / cryptography all ship binary wheels)
-* **Wasabi credentials** — either `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY` in the service env (preferred; no dependency on `~/.aws/*` files), or an AWS CLI profile at `~/.aws/config` for the service user matching `WASABI_PROFILE`. See [Wasabi credentials](#wasabi-credentials) for the resolution order.
+* **Wasabi credentials** — either `WASABI_ACCESS_KEY_ID` + `WASABI_SECRET_ACCESS_KEY` in the service env (preferred; no dependency on `~/.aws/*` files; the older `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY` names still work as a fallback), or an AWS CLI profile at `~/.aws/config` for the service user matching `WASABI_PROFILE`. See [Wasabi credentials](#wasabi-credentials) for the resolution order.
 * **Network egress** to the Archivematica SFTP host and the Wasabi endpoint. Optional (full functionality): ArchivesSpace for the digital-object CLI. Endpoint and health routes work without it.
 
 **Install and configure**
@@ -89,7 +89,10 @@ Fill in:
 - `SFTP_HOST`, `SFTP_ID`, `SFTP_PWD`, `SFTP_REMOTE_PATH` — Archivematica SFTP daemon address + credentials.
 - `WASABI_ENDPOINT`, `WASABI_BUCKET` — Wasabi endpoint + the **batch archive** bucket (completed ingests' source packages). `WASABI_BUCKET` accepts the legacy `s3://bucket-name/` form (an optional path becomes a base key prefix) OR the bare `name` form.
 - `WASABI_AIP_BUCKET` — the **AIP store** bucket/prefix (e.g. `s3://bucket-name/aip-store/`) used by the `/api/v2/aip/*` routes. Required for those routes; they refuse cleanly if unset rather than falling back to the batch bucket.
-- `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` (+ optional `AWS_DEFAULT_REGION`) — Wasabi credentials, preferred form. Alternatively `WASABI_PROFILE` naming a profile in `~/.aws/config` for the service user (used only when the explicit keys are unset).
+- `WASABI_DIP_BUCKET` — the **DIP store** prefix (`s3://library-repository/dip-store/` in production): the Wasabi copy of each DIP's served files (thumbnails, the METS, JPG/PDF objects), which repo-backend-v2 reads. Written by `/api/v2/dip/copy-to-wasabi` and `scripts/dip_backfill.py`; both refuse if it is unset.
+- `WASABI_ACCESS_KEY_ID`, `WASABI_SECRET_ACCESS_KEY` (+ optional `WASABI_REGION`) — Wasabi credentials, preferred form. The older `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY` (+ `AWS_DEFAULT_REGION`) names are read as a fallback; move the key to the `WASABI_*` names before the `DCP_*` (real AWS) credentials are added, so the generic names can't be confused. Alternatively `WASABI_PROFILE` naming a profile in `~/.aws/config` for the service user (used only when no key pair is set). The startup log reports which names the key came from (`wasabi credentials: WASABI_*`).
+- `DCP_ACCESS_KEY_ID`, `DCP_SECRET_ACCESS_KEY`, `DCP_REGION`, `DCP_DIP_LOCATION`, `DCP_AIP_LOCATION` — DuraCloud Preserve (plain AWS S3, `lib/dcp.py`), read-only. **The key is the switch:** set, the large-AIP copies (`/api/v2/aip/*`) and the conversions (`/api/v1/convert/tiff`) read DCP instead of the DuraCloud API (both locations must then be set: a missing one fails those reads and `GET /health/dcp` reports it, never a fallback to the API), and the DIP copy route works; unset, `GET /health/dcp` reports "not configured" and the DIP copy route refuses. `DCP_ENDPOINT_URL` overrides the endpoint for a local MinIO.
+- `DURACLOUD_API`, `DURACLOUD_USER`, `DURACLOUD_PWD` — the old DuraCloud API: the source for the large-AIP copies and the conversions until the DCP key is set. Retired with it.
 - `WORKSPACE`, `ASPACE_USERNAME`, `ASPACE_PASSWORD`, `SCRIPT_PATH`, `LOG_PATH` — ArchivesSpace-side config.
 - `DEFAULT_URL` — ArchivesSpace API base URL, read straight from the environment by `lib/make_digital_object.py`. Required: without it that script exits 1 during validation and `/api/v1/astools/make-digital-objects` returns a 500 on every call. Optional companions: `TESTING_URL` (used when a request sets `test=true`; falls back to `DEFAULT_URL`, so test runs otherwise hit production) and `ASPACE_REPOSITORY_ID` (default `2`).
 
@@ -100,8 +103,8 @@ Fill in:
 
 Credential resolution order (`lib/wasabi._make_client`):
 
-1. **Explicit env vars** — `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY` (+ optional `AWS_DEFAULT_REGION`) from the service env. Preferred: no dependency on `~/.aws/*` existing for whichever user the process runs as.
-2. **Named profile** — `WASABI_PROFILE` from `~/.aws/config` / `~/.aws/credentials`, used only when the env keys are unset:
+1. **Explicit env vars** — `WASABI_ACCESS_KEY_ID` + `WASABI_SECRET_ACCESS_KEY` (+ optional `WASABI_REGION`), or else the older `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY` (+ optional `AWS_DEFAULT_REGION`), from the service env. A pair is always taken from one family, never mixed; a half-set pair is skipped, and the startup log warns about it. Preferred: no dependency on `~/.aws/*` existing for whichever user the process runs as. `AWS_PROFILE` / `AWS_DEFAULT_PROFILE` are never read on this path.
+2. **Named profile** — `WASABI_PROFILE` from `~/.aws/config` / `~/.aws/credentials`, used only when no key pair is set:
 
    ```ini
    # ~/.aws/config
@@ -220,6 +223,9 @@ A Flask application (blueprints + gunicorn under systemd) exposing a private HTT
                            |  | Wasabi S3:       | |
                            |  |  batch backup    | |
                            |  |  aip-store       | |
+                           |  |  dip-store       | |
+                           |  | DuraCloud        | |
+                           |  |  Preserve (read) | |
                            |  +------------------+ |
                            |  +------ local fs --+ |
                            |  | workspace        | |
@@ -237,6 +243,9 @@ A Flask application (blueprints + gunicorn under systemd) exposing a private HTT
 | **Archivematica SFTP daemon** | Ingest drop target. Staged batches are pushed to the `internal-sftp` subsystem via paramiko; cleanup removes a package's files and parent dir after success. |
 | **Wasabi S3 — batch backup** | Post-ingest backup of the `002-ingest` staging copy (`WASABI_BUCKET`). |
 | **Wasabi S3 — AIP store** | Storage tier for Archivematica AIPs (`WASABI_AIP_BUCKET`), plus the presigned download URLs the dashboard serves. |
+| **Wasabi S3 — DIP store** | The copy of each DIP's served files (`WASABI_DIP_BUCKET`) that repo-backend-v2 serves to the public site. |
+| **DuraCloud Preserve** (AWS S3) | Archivematica's storage after the switch, read-only here (`DCP_*`): DIP folders for the DIP copy and the conversions' TIFFs, AIPs for the large-AIP copies. |
+| **DuraCloud** (API) | Archivematica's storage before the switch: the large-AIP copies and conversions read it until the DCP key is set (`DURACLOUD_*`). |
 | **ArchivesSpace** | Digital-object creation via the bundled `lib/make_digital_object.py` CLI; `uri.txt` per package is the output. |
 | **Local filesystem** | `WORKSPACE` (staff-assembled batches), `READY_PATH` (`001-ready`), `INGEST_PATH` (`002-ingest`). |
 
@@ -247,6 +256,8 @@ Where this service sits in `repo-backend-v2`'s six-stage pipeline:
 ```
 Pre-ingest workspace → /api/v1/astools/*  (batch listing, structure QA, Make Digital Objects)
 Stage 2 (upload)     → /api/v2/qa/*       (move-to-ingest, move-to-sftp, upload-status)
+Stage 4 (ingest)     → /api/v2/dip/*      (copy-to-wasabi: the new DIP's served files,
+                                           once repo-backend-v2's DIP_COPY_ENABLED is on)
 Stage 5 (repository) → /api/v2/qa/*       (cleanup_sftp, move-to-ingested → batch archive)
 Stage 6 (aip_store)  → /api/v2/aip/*      (copy-to-wasabi, presigned-url)
 ```
@@ -260,6 +271,7 @@ At the end of a successful ingest, the batch's `002-ingest` staging copy is back
 | `GET /` | Returns `APP_VERSION` |
 | `GET /health` | `{"status": "ok", "version": ...}` |
 | `GET /health/wasabi` | On-demand Wasabi `head_bucket` probe |
+| `GET /health/dcp` | On-demand DuraCloud Preserve probe: lists one key under each configured `DCP_*` location (one attempt each). Always 200; `ok` is the signal, and an empty listing is reported as not ok |
 
 <a name="batch-structure-qa"></a>
 ### Batch structure QA
@@ -316,6 +328,15 @@ r = c.list_objects_v2(Bucket=b, Prefix=p + '<folder>/', MaxKeys=25); \
 ```
 
 For a full per-file audit of a batch, use `scripts/reconcile_ingested_wasabi.py --batch <folder>` instead. Companion scripts under `scripts/`: `sync_missing_to_wasabi.py` (re-upload what's missing), `restore_ingested_from_wasabi.py` (pull an archived batch back to disk), and `abort_stale_multipart_uploads.py` (clear orphaned multipart parts).
+
+### DIP store (DuraCloud Preserve → Wasabi)
+
+The DIP store is filled two ways, both through `lib/dip_ops.py` and both safe to re-run (files already there are skipped, nothing is deleted, every copy is checked against DCP's ETag and sent with `Content-MD5`):
+
+- **Once, for everything already in DCP:** `scripts/dip_backfill.py` (dry run by default, `--execute` to copy; its docstring has the usage, and the plan's §5 the pilot and timing).
+- **Per new DIP at ingest:** `POST /api/v2/dip/copy-to-wasabi`, called by repo-backend-v2's Stage 4. It copies nothing until the DIP folder in DCP adds up to Archivematica's recorded size and holds its METS; files over 64 MiB are spooled to `TMPDIR` while verified, one at a time (up to 2.1 GB).
+
+Check what the public site requests against what's there with `repo/scripts/dcp_inventory.py check-served --inventory <dir>`. Design and runbooks: `repo/notes/DURACLOUD_PRESERVE_IMPLEMENTATION_PLAN.md`.
 
 ### Rebuild the venv from scratch
 

@@ -45,7 +45,7 @@ class LargeAipRoutingTests(unittest.TestCase):
             patch.object(config, 'ARCHIVEMATICA_STORAGE_API', 'https://am:8000/api'),
             patch.object(config, 'ARCHIVEMATICA_STORAGE_USERNAME', 'u'),
             patch.object(config, 'ARCHIVEMATICA_STORAGE_API_KEY', 'k'),
-            patch.object(config, 'DURACLOUD_API', 'archivesdu.duracloud.org/durastore/'),
+            patch.object(config, 'DURACLOUD_API', 'duracloud.test.example/durastore/'),
             patch.object(config, 'DURACLOUD_USER', 'u'),
             patch.object(config, 'DURACLOUD_PWD', 'p'),
             patch.object(config, 'AIP_DURACLOUD_THRESHOLD_BYTES', 1_000_000_000),
@@ -101,6 +101,33 @@ class LargeAipRoutingTests(unittest.TestCase):
         dc_copy.assert_not_called()
         head.assert_called_once()
         self.assertTrue(result['ok'])
+
+    def test_a_dcp_key_routes_without_the_rest_settings(self):
+        with patch.multiple(
+            config,
+            DURACLOUD_API=None,
+            DCP_ACCESS_KEY_ID='AKIATEST',
+            DCP_SECRET_ACCESS_KEY='test-secret',
+            DCP_REGION='us-east-1',
+            DCP_AIP_LOCATION='s3://dcp-test-aip-store/aip-store/',
+        ):
+            _result, dc_copy, head = self._run(66_163_797_416)
+        dc_copy.assert_called_once_with(UUID, 'pid-1')
+        head.assert_not_called()
+
+    def test_a_dcp_key_without_the_aip_location_still_routes_to_dcp(self):
+        # Never the API once the key is set: the DCP path then fails
+        # naming the setting (test_duracloud_ops).
+        with patch.multiple(
+            config,
+            DCP_ACCESS_KEY_ID='AKIATEST',
+            DCP_SECRET_ACCESS_KEY='test-secret',
+            DCP_REGION='us-east-1',
+            DCP_AIP_LOCATION=None,
+        ):
+            _result, dc_copy, head = self._run(66_163_797_416)
+        dc_copy.assert_called_once_with(UUID, 'pid-1')
+        head.assert_not_called()
 
     def test_deleted_am_status_is_terminal_not_retry(self):
         class DeletedMeta:

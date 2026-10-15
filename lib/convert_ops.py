@@ -28,6 +28,12 @@ aip-store space, derivatives come from dip-store, whose content ids
 carry a leading 'dip-store/' segment (URL =
 /durastore/dip-store/dip-store/<path> — verified against the live
 store).
+
+Once curation has its DCP key (DCP_*), the TIFF comes from DuraCloud
+Preserve instead, and DCP_DIP_LOCATION must then be set (a missing
+location is an error, never a fallback to the API): the object
+<DCP_DIP_LOCATION prefix><full_path>, read over S3 (lib/dcp.py), with the
+same size cap and short-read check.
 """
 
 import io
@@ -37,9 +43,11 @@ import time
 from urllib.parse import quote
 
 import requests
+from botocore.exceptions import BotoCoreError, ClientError
 from PIL import Image
 
 import config
+from lib import dcp
 
 logger = logging.getLogger(__name__)
 
@@ -143,7 +151,10 @@ def fetch_tiff(full_path):
     equal entity bytes. The size cap (DERIVATIVE_MAX_SOURCE_BYTES)
     aborts oversized downloads early; DuraCloud chunks objects >1GB
     into .dura-chunk-* parts that cannot be fetched raw anyway.
+    With a DCP key it reads DCP instead (_fetch_tiff_from_dcp).
     """
+    if dcp.is_configured():
+        return _fetch_tiff_from_dcp(full_path)
     if not (config.DURACLOUD_API and config.DURACLOUD_USER and config.DURACLOUD_PWD):
         raise ConvertError('DuraCloud is not configured (DURACLOUD_* env)')
 
@@ -195,6 +206,70 @@ def fetch_tiff(full_path):
     if declared and len(data) != declared:
         # A short body that urllib3 didn't reject: distinguish in-transit
         # truncation from corruption at rest before anyone diffs bytes.
+        raise ConvertError(
+            'dip-store fetch truncated in transit for %s: received %d of '
+            '%d declared bytes — retry may succeed' % (full_path, len(data), declared)
+        )
+    return data
+
+
+def _fetch_tiff_from_dcp(full_path):
+    """
+    fetch_tiff from DuraCloud Preserve: GET <DCP_DIP_LOCATION
+    prefix><full_path>. NoSuchKey -> SourceNotFound; over the cap ->
+    InvalidRequest; a body that ends short (botocore raises at the end)
+    -> ConvertError naming in-transit truncation, so a retry may succeed.
+    """
+    try:
+        bucket, prefix = dcp.location('DCP_DIP_LOCATION')
+    except RuntimeError as e:
+        # The key is set, so DCP is the source: never the API instead.
+        raise ConvertError(f'{e}: set it in the curation service .env and restart')
+    client = dcp.make_client()
+    key = prefix + str(full_path).lstrip('/')
+    max_bytes = int(getattr(config, 'DERIVATIVE_MAX_SOURCE_BYTES', 0) or 0)
+    try:
+        resp = dcp.open_range(bucket, key, 0, client=client)
+    except ClientError as e:
+        code = e.response.get('Error', {}).get('Code', 'unknown')
+        if code in ('NoSuchKey', 'NotFound', '404'):
+            raise SourceNotFound('Source not found in dip-store: %s' % full_path)
+        raise ConvertError('dip-store GET failed (%s) for %s' % (code, full_path))
+    except BotoCoreError as e:
+        raise ConvertError('dip-store GET failed for %s: %s' % (full_path, e))
+
+    body = resp['Body']
+    declared = int(resp.get('ContentLength') or 0)
+    buffer = io.BytesIO()
+    try:
+        if max_bytes and declared > max_bytes:
+            raise InvalidRequest(
+                'Source is %d bytes, over the %d-byte conversion cap '
+                '(DERIVATIVE_MAX_SOURCE_BYTES)' % (declared, max_bytes)
+            )
+        while True:
+            chunk = body.read(_FETCH_CHUNK_BYTES)
+            if not chunk:
+                break
+            buffer.write(chunk)
+            if max_bytes and buffer.tell() > max_bytes:
+                raise InvalidRequest(
+                    'Source exceeded the %d-byte conversion cap mid-stream'
+                    % max_bytes
+                )
+    except (BotoCoreError, OSError) as e:
+        raise ConvertError(
+            'dip-store fetch truncated in transit for %s: received %d of %d '
+            'declared bytes (%s) — retry may succeed'
+            % (full_path, buffer.tell(), declared, e)
+        )
+    finally:
+        body.close()
+
+    data = buffer.getvalue()
+    if not data:
+        raise ConvertError('dip-store returned an empty body for %s' % full_path)
+    if declared and len(data) != declared:
         raise ConvertError(
             'dip-store fetch truncated in transit for %s: received %d of '
             '%d declared bytes — retry may succeed' % (full_path, len(data), declared)

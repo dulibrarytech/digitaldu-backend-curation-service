@@ -31,3 +31,10 @@ os.environ.setdefault('API_KEY', 'test-key')
 os.environ.setdefault('WASABI_ENDPOINT', 'https://s3.test.example')
 os.environ.setdefault('WASABI_BUCKET', 's3://test-bucket/')
 os.environ.setdefault('WASABI_PROFILE', 'test-profile')
+
+# Blank DCP_* (set, not setdefault, so a host env or .env can't win):
+# importing `app` starts the DCP probe thread, which must never send a
+# real listing, and a DCP key would make DCP the source for AIP copies and
+# conversions. Tests that need a configured DCP patch `config`.
+for _name in ('DCP_ACCESS_KEY_ID', 'DCP_SECRET_ACCESS_KEY', 'DCP_REGION'):
+    os.environ[_name] = ''
