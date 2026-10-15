@@ -85,7 +85,7 @@ $EDITOR .env
 Fill in:
 
 - `API_KEY` — shared secret for the Node side; any high-entropy string. Generate with `openssl rand -hex 32`.
-- `READY_PATH`, `INGEST_PATH` — local filesystem staging directories (`001-ready`, `002-ingest`).
+- `READY_PATH`, `INGEST_PATH` — local filesystem staging directories (`001-ready`, `002-ingest`). Either form works: a missing trailing `/` is added at startup. The startup log reports both paths and whether they exist (`staging paths: READY_PATH=… ok, INGEST_PATH=… ok`; `MISSING` or `unset` means the value is wrong).
 - `SFTP_HOST`, `SFTP_ID`, `SFTP_PWD`, `SFTP_REMOTE_PATH` — Archivematica SFTP daemon address + credentials.
 - `WASABI_ENDPOINT`, `WASABI_BUCKET` — Wasabi endpoint + the **batch archive** bucket (completed ingests' source packages). `WASABI_BUCKET` accepts the legacy `s3://bucket-name/` form (an optional path becomes a base key prefix) OR the bare `name` form.
 - `WASABI_AIP_BUCKET` — the **AIP store** bucket/prefix (e.g. `s3://bucket-name/aip-store/`) used by the `/api/v2/aip/*` routes. Required for those routes; they refuse cleanly if unset rather than falling back to the batch bucket.

@@ -190,6 +190,24 @@ class MoveToSftpSingleFlightTests(unittest.TestCase):
                 with ops._sftp_puts_lock:
                     ops._sftp_puts_in_flight.discard('pid-single')
 
+    def test_two_packages_of_one_collection_upload_side_by_side(self):
+        """The single-flight key is pid + package (2026-10-14), so a second
+        package of the same collection is not refused as a duplicate."""
+        started = []
+        fake_thread_cls = MagicMock(side_effect=lambda **kw: started.append(kw) or MagicMock())
+        with patch.object(ops.threading, 'Thread', fake_thread_cls):
+            try:
+                self.assertEqual(ops.move_to_sftp('pid-two', 'A')['message'], 'upload_started')
+                self.assertEqual(ops.move_to_sftp('pid-two', 'B')['message'], 'upload_started')
+                self.assertEqual(ops.move_to_sftp('pid-two', 'A')['message'],
+                                 'upload_already_running')
+                self.assertEqual([kw['args'] for kw in started],
+                                 [('pid-two', 'A'), ('pid-two', 'B')])
+            finally:
+                with ops._sftp_puts_lock:
+                    ops._sftp_puts_in_flight.discard('pid-two/A')
+                    ops._sftp_puts_in_flight.discard('pid-two/B')
+
 
 class ConnectPacingTests(unittest.TestCase):
 

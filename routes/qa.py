@@ -249,13 +249,31 @@ def move_from_ingest_to_ready():
     return json.dumps(results), status
 
 
+def _validate_upload_params(uuid, package):
+    """The upload routes join `uuid` and the optional `package` onto
+    INGEST_PATH and SFTP_REMOTE_PATH: both must be safe single segments."""
+    err = validate_segment(uuid, 'uuid')
+    if not err and package is not None:
+        err = validate_segment(package, 'package')
+    return err
+
+
 @qa_bp.route('/move-to-sftp', methods=['GET'])
 @require_api_key_qa
 def move_to_sftp():
+    """
+    Start the background SFTP put. `package` (the Node worker always
+    sends it) limits the put to 002-ingest/<uuid>/<package>; without
+    it the whole staging tree is uploaded, the pre-2026-10 behaviour.
+    """
     uuid = request.args.get('uuid')
+    package = request.args.get('package')
     if uuid is None:
         return json.dumps(['Bad Request: Missing pid param.']), 400
-    ops.move_to_sftp(uuid)
+    err = _validate_upload_params(uuid, package)
+    if err:
+        return json.dumps(['Bad Request: ' + err]), 400
+    ops.move_to_sftp(uuid, package)
     return json.dumps(dict(message='Uploading packages to Archivematica sftp')), 200
 
 
@@ -267,22 +285,36 @@ def cancel_upload():
     kept uploading. Best-effort + idempotent — see
     ops.request_upload_cancel."""
     uuid = request.args.get('uuid')
+    package = request.args.get('package')
     if uuid is None:
         return json.dumps(['Bad Request: Missing uuid param.']), 400
-    result = ops.request_upload_cancel(uuid)
+    err = _validate_upload_params(uuid, package)
+    if err:
+        return json.dumps(['Bad Request: ' + err]), 400
+    result = ops.request_upload_cancel(uuid, package)
     return json.dumps(result), 200
 
 
 @qa_bp.route('/upload-status', methods=['GET'])
 @require_api_key_qa
 def check_sftp():
+    """
+    Upload progress for the Node poller. With `package` the remote walk,
+    the byte sums and the error marker are that package's alone (the
+    same package move-to-sftp was given); without it, the whole
+    <uuid> folder's.
+    """
     uuid = request.args.get('uuid')
     total_batch_file_count = request.args.get('total_batch_file_count')
+    package = request.args.get('package')
     if uuid is None:
         return json.dumps(['Bad Request: Missing uuid param.']), 400
+    err = _validate_upload_params(uuid, package)
+    if err:
+        return json.dumps(['Bad Request: ' + err]), 400
     if total_batch_file_count is None:
         return json.dumps(dict(message='File count not found.', data=[])), 200
-    results = ops.check_sftp(uuid, total_batch_file_count)
+    results = ops.check_sftp(uuid, total_batch_file_count, package)
     return json.dumps(results), 200
 
 
